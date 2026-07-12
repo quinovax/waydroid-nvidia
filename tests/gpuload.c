@@ -171,7 +171,35 @@ int main(int argc, char **argv)
    EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
    EGLint maj, min;
    if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &maj, &min)) {
-      fprintf(stderr, "EGL init failed\n"); return 1;
+#ifndef __ANDROID__
+      /* headless host: EGL device platform (NVIDIA/Mesa), pick arg-selected
+       * or first device that initializes
+       */
+      typedef EGLBoolean (*QueryDevs)(EGLint, void **, EGLint *);
+      typedef EGLDisplay (*GetPlatDpy)(EGLenum, void *, const EGLint *);
+      QueryDevs query_devs =
+         (QueryDevs)eglGetProcAddress("eglQueryDevicesEXT");
+      GetPlatDpy get_plat =
+         (GetPlatDpy)eglGetProcAddress("eglGetPlatformDisplayEXT");
+      void *devs[16];
+      EGLint ndev = 0;
+      dpy = EGL_NO_DISPLAY;
+      if (query_devs && get_plat && query_devs(16, devs, &ndev)) {
+         for (EGLint i = 0; i < ndev; i++) {
+            EGLDisplay d = get_plat(0x313F /* EGL_PLATFORM_DEVICE_EXT */,
+                                    devs[i], NULL);
+            if (d != EGL_NO_DISPLAY && eglInitialize(d, &maj, &min)) {
+               dpy = d;
+               break;
+            }
+         }
+      }
+      if (dpy == EGL_NO_DISPLAY)
+#endif
+      {
+         fprintf(stderr, "EGL init failed\n");
+         return 1;
+      }
    }
    static const EGLint cfg_attrs[] = {
       EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,

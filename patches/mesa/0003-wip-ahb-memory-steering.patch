@@ -28,7 +28,7 @@ index c8a1bbf..c7c1dba 100644
  #define VCMD_GET_PARAM_SIZE 1
  #define VCMD_GET_PARAM_PARAM 0
 diff --git a/src/virtio/vulkan/vn_android.c b/src/virtio/vulkan/vn_android.c
-index eaa82bc..9c2390e 100644
+index eaa82bc..9d8025c 100644
 --- a/src/virtio/vulkan/vn_android.c
 +++ b/src/virtio/vulkan/vn_android.c
 @@ -8,6 +8,7 @@
@@ -116,7 +116,7 @@ index eaa82bc..9c2390e 100644
  
        mem_reqs = img->requirements[0].memory.memoryRequirements;
        mem_reqs.memoryTypeBits &= mem_type_bits;
-@@ -206,8 +238,10 @@ vn_android_device_import_ahb(struct vn_device *dev,
+@@ -206,11 +238,21 @@ vn_android_device_import_ahb(struct vn_device *dev,
        mem_reqs.memoryTypeBits = mem_type_bits;
     }
  
@@ -126,9 +126,22 @@ index eaa82bc..9c2390e 100644
        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 +   }
  
-    if (!((1 << mem_vk->memory_type_index) & mem_reqs.memoryTypeBits))
-       mem_vk->memory_type_index = ffs(mem_reqs.memoryTypeBits) - 1;
-@@ -239,6 +273,9 @@ vn_android_device_import_ahb(struct vn_device *dev,
+-   if (!((1 << mem_vk->memory_type_index) & mem_reqs.memoryTypeBits))
+-      mem_vk->memory_type_index = ffs(mem_reqs.memoryTypeBits) - 1;
++   /* Always import into the LOWEST type of the real host mask, ignoring the
++    * app's pick: the app chooses against UMA-stamped flags (host-visible
++    * types advertise DEVICE_LOCAL for it), but NVIDIA rejects actual dmabuf
++    * imports into some advertised types (host-visible-cached observed
++    * failing on 610.172), and with async allocation that failure surfaces
++    * later as a fatal CS error on vkBindImageMemory2. Type 0 (plain sysmem)
++    * always imports; CPU access goes through the dma_buf fd mmap, never
++    * vkMapMemory, so the type's host-visibility is irrelevant.
++    */
++   mem_vk->memory_type_index = ffs(mem_reqs.memoryTypeBits) - 1;
+ 
+    mem_vk->size = mem_reqs.size;
+ 
+@@ -239,6 +281,9 @@ vn_android_device_import_ahb(struct vn_device *dev,
     result =
        vn_device_memory_import_dma_buf(dev, mem, &local_alloc_info, dup_fd);
     if (result != VK_SUCCESS) {
@@ -344,7 +357,7 @@ index 5d4f916..0b8ec64 100644
  
  #include "venus-protocol/vn_protocol_driver_image.h"
 diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
-index 7ee58ac..36795f9 100644
+index 7ee58ac..19d8461 100644
 --- a/src/virtio/vulkan/vn_physical_device.c
 +++ b/src/virtio/vulkan/vn_physical_device.c
 @@ -8,8 +8,11 @@
@@ -359,26 +372,34 @@ index 7ee58ac..36795f9 100644
  #include <stdio.h>
  
  #include "git_sha1.h"
-@@ -1018,6 +1021,18 @@ vn_physical_device_init_memory_properties(
+@@ -1018,6 +1021,26 @@ vn_physical_device_init_memory_properties(
        props->memoryTypes[first_coherent].propertyFlags |=
           VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     }
 +
-+   /* Advertise every memory type as DEVICE_LOCAL (UMA-style), like
-+    * integrated GPUs do. Android clients (ANGLE AHB imports, HWUI) demand
-+    * DEVICE_LOCAL for gralloc memory, but our CPU-mappable gralloc buffers
-+    * (udmabuf) import only into host-visible sysmem types on NVIDIA.
++   /* Advertise HOST_VISIBLE memory types as DEVICE_LOCAL too (UMA-style,
++    * like integrated GPUs). Android clients (ANGLE AHB imports, HWUI)
++    * demand DEVICE_LOCAL for gralloc memory, but our CPU-mappable gralloc
++    * buffers import only into host-visible sysmem types on NVIDIA — their
++    * import masks always include a host-visible type, which this covers.
++    *
++    * Deliberately NOT stamped on non-host-visible sysmem types (NVIDIA
++    * type 0, heap 1, flags NONE): it precedes the real VRAM type, and
++    * first-fit DEVICE_LOCAL pickers would place every render target and
++    * texture in system RAM — measured 60-240x slower (PCIe-bound; see
++    * tests/gpuload.c and STATE.md 2026-07-12).
 +    */
 +   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
-+      props->memoryTypes[i].propertyFlags |=
-+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++      VkMemoryPropertyFlags *flags = &props->memoryTypes[i].propertyFlags;
++      if (*flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
++         *flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 +   }
 +   for (uint32_t i = 0; i < props->memoryHeapCount; i++)
 +      props->memoryHeaps[i].flags |= VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
  }
  
  static void
-@@ -2713,9 +2728,18 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
+@@ -2713,9 +2736,18 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
     /* Only advertise support for optimal tiling since venus is unable to
      * detiling if the AHB allocated outside is tiled. Internally venus always
      * overrides the tiling to VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT.
@@ -398,7 +419,7 @@ index 7ee58ac..36795f9 100644
  
     /* No need to support AHB + VK_EXT_separate_stencil_usage. */
     if (vk_find_struct_const(info->pNext, IMAGE_STENCIL_USAGE_CREATE_INFO))
-@@ -2734,8 +2758,12 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
+@@ -2734,8 +2766,12 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
      */
     VkResult result = vk_android_get_ahb_image_properties(
        vn_physical_device_to_handle(physical_dev), info, props);
@@ -412,7 +433,7 @@ index 7ee58ac..36795f9 100644
  
     /* Now properly fill all the default props. */
  
-@@ -2880,6 +2908,14 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+@@ -2880,6 +2916,14 @@ vn_GetPhysicalDeviceImageFormatProperties2(
        }
     }
  
