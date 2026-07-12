@@ -109,19 +109,79 @@ index eaa82bc..9c2390e 100644
        close(dup_fd);
        return result;
     }
+diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
+index f7a1f1c..5475de8 100644
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -553,6 +553,8 @@ vn_device_init(struct vn_device *dev,
+    simple_mtx_init(&dev->mutex, mtx_plain);
+    list_inithead(&dev->chains);
+ 
++   simple_mtx_init(&dev->dma_buf_props_cache.mutex, mtx_plain);
++
+    return VK_SUCCESS;
+ 
+ out_feedback_cmd_pools_fini:
+@@ -641,6 +643,7 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
+ 
+    assert(list_is_empty(&dev->chains));
+    simple_mtx_destroy(&dev->mutex);
++   simple_mtx_destroy(&dev->dma_buf_props_cache.mutex);
+ 
+    vn_image_reqs_cache_fini(dev);
+    vn_buffer_reqs_cache_fini(dev);
+diff --git a/src/virtio/vulkan/vn_device.h b/src/virtio/vulkan/vn_device.h
+index e871564..a2c1382 100644
+--- a/src/virtio/vulkan/vn_device.h
++++ b/src/virtio/vulkan/vn_device.h
+@@ -18,6 +18,24 @@
+ #include "vn_feedback.h"
+ #include "vn_image.h"
+ 
++/* Cache of dma_buf memoryTypeBits keyed by the dma_buf's inode.  Each
++ * uncached vn_get_memory_dma_buf_properties costs three renderer roundtrips
++ * (bo import, ring roundtrip, ring call) and Android re-queries the same
++ * gralloc buffers every frame (AHB wrapping in ANGLE/HWUI).  dma_buf inode
++ * numbers come from a monotonic counter and are never reused, and a given
++ * buffer's memoryTypeBits are immutable, so cache hits are always sound.
++ */
++#define VN_DMA_BUF_PROPS_CACHE_SIZE 64
++struct vn_dma_buf_props_cache {
++   simple_mtx_t mutex;
++   struct {
++      uint64_t ino;
++      uint32_t mem_type_bits;
++   } entries[VN_DMA_BUF_PROPS_CACHE_SIZE];
++   uint32_t count; /* valid entries */
++   uint32_t next;  /* round-robin replacement cursor */
++};
++
+ struct vn_device {
+    struct vn_device_base base;
+ 
+@@ -44,6 +62,7 @@ struct vn_device {
+ 
+    struct vn_buffer_reqs_cache buffer_reqs_cache;
+    struct vn_image_reqs_cache image_reqs_cache;
++   struct vn_dma_buf_props_cache dma_buf_props_cache;
+ 
+    bool has_sync2;
+ 
 diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
-index 8b6eb4c..d07c2e4 100644
+index 8b6eb4c..38e1511 100644
 --- a/src/virtio/vulkan/vn_device_memory.c
 +++ b/src/virtio/vulkan/vn_device_memory.c
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,9 @@
   * Copyright © 2016 Bas Nieuwenhuizen
   */
  
++#include <sys/stat.h>
++
 +#include "util/log.h"
  #include "vn_device_memory.h"
  
  #include "venus-protocol/vn_protocol_driver_device_memory.h"
-@@ -374,6 +375,41 @@ vn_AllocateMemory(VkDevice device,
+@@ -374,6 +377,41 @@ vn_AllocateMemory(VkDevice device,
  {
     struct vn_device *dev = vn_device_from_handle(device);
  
@@ -163,6 +223,85 @@ index 8b6eb4c..d07c2e4 100644
     struct vn_device_memory *mem = vk_device_memory_create(
        &dev->base.vk, pAllocateInfo, pAllocator, sizeof(*mem));
     if (!mem)
+@@ -584,6 +622,54 @@ vn_GetMemoryFdKHR(VkDevice device,
+    return VK_SUCCESS;
+ }
+ 
++/* dma_buf inodes come from a monotonic counter (never reused) and a buffer's
++ * memoryTypeBits are immutable, so a cache hit is always sound.  Returns
++ * true on a hit; on a miss *out_ino is the fd's inode, or 0 when it could
++ * not be determined (don't cache).
++ */
++static bool
++vn_dma_buf_props_cache_lookup(struct vn_device *dev,
++                              int fd,
++                              uint32_t *out_mem_type_bits,
++                              uint64_t *out_ino)
++{
++   struct vn_dma_buf_props_cache *cache = &dev->dma_buf_props_cache;
++   struct stat st;
++
++   *out_ino = 0;
++   if (fstat(fd, &st))
++      return false;
++
++   simple_mtx_lock(&cache->mutex);
++   for (uint32_t i = 0; i < cache->count; i++) {
++      if (cache->entries[i].ino == st.st_ino) {
++         *out_mem_type_bits = cache->entries[i].mem_type_bits;
++         simple_mtx_unlock(&cache->mutex);
++         return true;
++      }
++   }
++   simple_mtx_unlock(&cache->mutex);
++
++   *out_ino = st.st_ino;
++   return false;
++}
++
++static void
++vn_dma_buf_props_cache_insert(struct vn_device *dev,
++                              uint64_t ino,
++                              uint32_t mem_type_bits)
++{
++   struct vn_dma_buf_props_cache *cache = &dev->dma_buf_props_cache;
++
++   simple_mtx_lock(&cache->mutex);
++   cache->entries[cache->next].ino = ino;
++   cache->entries[cache->next].mem_type_bits = mem_type_bits;
++   cache->next = (cache->next + 1) % VN_DMA_BUF_PROPS_CACHE_SIZE;
++   if (cache->count < VN_DMA_BUF_PROPS_CACHE_SIZE)
++      cache->count++;
++   simple_mtx_unlock(&cache->mutex);
++}
++
+ VkResult
+ vn_get_memory_dma_buf_properties(struct vn_device *dev,
+                                  int fd,
+@@ -591,6 +677,13 @@ vn_get_memory_dma_buf_properties(struct vn_device *dev,
+ {
+    VkDevice device = vn_device_to_handle(dev);
+ 
++   /* Android wraps the same gralloc buffers as AHBs every frame; the
++    * uncached query below costs three renderer roundtrips per call.
++    */
++   uint64_t ino;
++   if (vn_dma_buf_props_cache_lookup(dev, fd, out_mem_type_bits, &ino))
++      return VK_SUCCESS;
++
+    struct vn_renderer_bo *bo;
+    VkResult result = vn_renderer_bo_create_from_dma_buf(
+       dev->renderer, 0 /* size */, fd, 0 /* flags */, &bo);
+@@ -614,6 +707,9 @@ vn_get_memory_dma_buf_properties(struct vn_device *dev,
+ 
+    *out_mem_type_bits = props.memoryTypeBits;
+ 
++   if (ino)
++      vn_dma_buf_props_cache_insert(dev, ino, props.memoryTypeBits);
++
+    return VK_SUCCESS;
+ }
+ 
 diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
 index 5d4f916..0b8ec64 100644
 --- a/src/virtio/vulkan/vn_image.c

@@ -12,7 +12,7 @@ say "SurfaceFlinger renderer (want: ANGLE ... c1a25085dd9e over venus)"
 guest 'dumpsys SurfaceFlinger | grep -iE "GLES:|renderer"' 2>/dev/null | head -3 || true
 
 say "crashes since boot (want 0; 1 early hwc_binder_thread SIGABRT is known/benign)"
-n=$(guest 'logcat -d -b crash 2>/dev/null | grep -c Cmdline' 2>/dev/null || echo '?')
+n=$(guest 'logcat -d -b crash 2>/dev/null | grep -c Cmdline; :' 2>/dev/null || echo '?')
 echo "  crash Cmdline count: $n"
 
 say "hwc mode diagnostics (last few)"

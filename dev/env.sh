@@ -49,8 +49,14 @@ say()  { printf '\033[1;36m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!! %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31mxx %s\033[0m\n' "$*" >&2; exit 1; }
 
-# guest shell (root inside the container), env cleaned so exec sh never fails
-guest() { sudo -n lxc-attach $LXC --clear-env -v PATH=/system/bin -- /system/bin/sh -c "$*"; }
+# guest shell (root inside the container), env cleaned so exec sh never fails.
+# stdio goes through pipes, NOT the caller's fds: lxc-attach chowns its std
+# fds to the container root (attach.c fix_stdio_permissions), which turns any
+# redirect-target file into an unreadable root-owned 600 file.
+guest() {
+    sudo -n lxc-attach $LXC --clear-env -v PATH=/system/bin -- /system/bin/sh -c "$*" \
+        < /dev/null 2> >(cat >&2) | cat
+}
 
 # The waydroid-dev sudoers allowlist grants NOPASSWD for exactly the commands
 # the loop uses (lxc-attach/lxc-info/systemctl wd-container/wd-deploy) — probe

@@ -74,10 +74,20 @@ index c2bd278..387084f 100644
     'vtest.h'
  ]
 diff --git a/vtest/vtest.h b/vtest/vtest.h
-index fa74075..178e716 100644
+index fa74075..730ce10 100644
 --- a/vtest/vtest.h
 +++ b/vtest/vtest.h
-@@ -96,6 +96,7 @@ int vtest_sync_write(uint32_t length_dw);
+@@ -57,6 +57,9 @@ int vtest_get_context_poll_fd(struct vtest_context *ctx);
+ 
+ void vtest_set_current_context(struct vtest_context *ctx);
+ 
++/* VTEST_STATS instrumentation (vtest_server.c) */
++void vtest_stats_count_import(bool query_only);
++
+ int vtest_send_caps(uint32_t length_dw);
+ int vtest_send_caps2(uint32_t length_dw);
+ int vtest_create_resource(uint32_t length_dw);
+@@ -96,6 +99,7 @@ int vtest_sync_write(uint32_t length_dw);
  int vtest_sync_wait(uint32_t length_dw);
  int vtest_sync_export_sync_file(uint32_t length_dw);
  int vtest_resource_import_blob(uint32_t length_dw);
@@ -130,7 +140,7 @@ index 3a7381f..b8f9f4a 100644
     VCMD_SUBMIT_CMD2_FLAG_RING_IDX = 1 << 0,
     VCMD_SUBMIT_CMD2_FLAG_IN_FENCE_FD = 1 << 1,
 diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
-index f3212ad..8e5f6f5 100644
+index f3212ad..ab17a57 100644
 --- a/vtest/vtest_renderer.c
 +++ b/vtest/vtest_renderer.c
 @@ -53,6 +53,7 @@
@@ -141,7 +151,15 @@ index f3212ad..8e5f6f5 100644
  #include "vtest_protocol.h"
  #include "threadpool.h"
  
-@@ -2491,6 +2492,64 @@ int vtest_resource_import_blob(uint32_t length_dw)
+@@ -2439,6 +2440,7 @@ int vtest_resource_import_blob(uint32_t length_dw)
+    /* venus imports with size 0 when only querying memory properties (see
+     * vn_get_memory_dma_buf_properties); derive the size from the dmabuf
+     */
++   vtest_stats_count_import(size == 0);
+    if (!size) {
+       const off_t seek_size = lseek(fd, 0, SEEK_END);
+       if (seek_size < 0) {
+@@ -2491,6 +2493,64 @@ int vtest_resource_import_blob(uint32_t length_dw)
     return vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf)) >= 0 ? 0 : -1;
  }
  
@@ -207,10 +225,10 @@ index f3212ad..8e5f6f5 100644
  {
     struct vtest_context *ctx = vtest_get_current_context();
 diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
-index dcf1b19..9d867ea 100644
+index dcf1b19..fd5f335 100644
 --- a/vtest/vtest_server.c
 +++ b/vtest/vtest_server.c
-@@ -33,6 +33,7 @@
+@@ -33,12 +33,16 @@
  #include <stdlib.h>
  #include <sys/types.h>
  #include <sys/socket.h>
@@ -218,7 +236,57 @@ index dcf1b19..9d867ea 100644
  #include <netinet/in.h>
  #include <sys/un.h>
  #include <fcntl.h>
-@@ -426,6 +427,11 @@ static void vtest_server_open_socket(void)
+ #include <getopt.h>
+ #include <string.h>
+ 
++#include <inttypes.h>
++#include <time.h>
++
+ #include "util.h"
+ #include "util/list.h"
+ #include "util/u_math.h"
+@@ -52,6 +56,40 @@
+ #include <sys/select.h>
+ #endif
+ 
++/* VTEST_STATS=<seconds>: periodically log per-command dispatch counts and
++ * times (and context poll wakeups) to stderr, per client process.  Costs two
++ * clock_gettime per dispatched command when enabled, nothing when disabled.
++ */
++#define VTEST_STATS_MAX_CMDS 64
++static struct {
++   int period;        /* seconds; 0 = off, -1 = env not checked yet */
++   int64_t next_dump;
++   uint64_t count[VTEST_STATS_MAX_CMDS];
++   uint64_t ns[VTEST_STATS_MAX_CMDS];
++   uint64_t polls;
++} vtest_stats = { .period = -1 };
++
++static int64_t vtest_stats_now(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
++}
++
++static uint64_t vtest_stats_imports_query;
++static uint64_t vtest_stats_imports_real;
++
++/* called from vtest_resource_import_blob to split property-query imports
++ * (size == 0) from real buffer imports in the stats
++ */
++void vtest_stats_count_import(bool query_only)
++{
++   if (query_only)
++      vtest_stats_imports_query++;
++   else
++      vtest_stats_imports_real++;
++}
++
+ enum vtest_client_result {
+    VTEST_CLIENT_DISCONNECTED = 1,
+    VTEST_CLIENT_ERROR_INPUT_READ,
+@@ -426,6 +464,11 @@ static void vtest_server_open_socket(void)
        goto err;
     }
  
@@ -230,15 +298,48 @@ index dcf1b19..9d867ea 100644
     return;
  
  err:
-@@ -732,6 +738,7 @@ static const struct vtest_command {
+@@ -525,6 +568,7 @@ static void vtest_server_dispatch_clients(void)
+       int ret;
+ 
+       if (client->context_need_poll) {
++         vtest_stats.polls++;
+          vtest_poll_context(client->context);
+          client->context_need_poll = false;
+       }
+@@ -732,8 +776,32 @@ static const struct vtest_command {
     HANDLER(RESOURCE_EXPORT_FD,          resource_export_fd,        true   ),
     HANDLER(SYNC_EXPORT_SYNC_FILE,       sync_export_sync_file,     true   ),
     HANDLER(RESOURCE_IMPORT_BLOB,        resource_import_blob,      true   ),
 +   HANDLER(RESOURCE_ALLOC_GPU,          resource_alloc_gpu,        false  ),
  };
  
++static void vtest_stats_dump(void)
++{
++   fprintf(stderr, "vtest stats: polls %" PRIu64 ", imports query/real %" PRIu64
++           "/%" PRIu64 "\n", vtest_stats.polls,
++           vtest_stats_imports_query, vtest_stats_imports_real);
++   vtest_stats.polls = 0;
++   vtest_stats_imports_query = 0;
++   vtest_stats_imports_real = 0;
++
++   for (uint32_t i = 0; i < ARRAY_SIZE(vtest_commands) && i < VTEST_STATS_MAX_CMDS; i++) {
++      if (!vtest_stats.count[i])
++         continue;
++      fprintf(stderr, "vtest stats:   %-26s %7" PRIu64 " calls  avg %5" PRIu64
++              " us  total %" PRIu64 " us\n",
++              vtest_commands[i].name ? vtest_commands[i].name : "?",
++              vtest_stats.count[i],
++              vtest_stats.ns[i] / vtest_stats.count[i] / 1000,
++              vtest_stats.ns[i] / 1000);
++      vtest_stats.count[i] = 0;
++      vtest_stats.ns[i] = 0;
++   }
++}
++
  static int vtest_client_dispatch_commands(struct vtest_client *client)
-@@ -766,6 +773,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
+ {
+    TRACE_FUNC();
+@@ -766,6 +834,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
  
     vtest_poll_resource_busy_wait();
     if (header[1] <= 0 || header[1] >= ARRAY_SIZE(vtest_commands)) {
@@ -247,3 +348,35 @@ index dcf1b19..9d867ea 100644
        return VTEST_CLIENT_ERROR_COMMAND_ID;
     }
  
+@@ -785,8 +855,30 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
+ 
+    vtest_set_current_context(client->context);
+ 
++   if (vtest_stats.period < 0) {
++      const char *env = getenv("VTEST_STATS");
++      vtest_stats.period = env ? atoi(env) : 0;
++      if (vtest_stats.period > 0)
++         vtest_stats.next_dump =
++            vtest_stats_now() + (int64_t)vtest_stats.period * 1000000000;
++   }
++
+    void *trace_scope = TRACE_SCOPE_BEGIN(cmd->name);
+-   ret = cmd->dispatch(header[0]);
++   if (vtest_stats.period > 0) {
++      const int64_t t0 = vtest_stats_now();
++      ret = cmd->dispatch(header[0]);
++      const int64_t t1 = vtest_stats_now();
++      if (header[1] < VTEST_STATS_MAX_CMDS) {
++         vtest_stats.count[header[1]]++;
++         vtest_stats.ns[header[1]] += t1 - t0;
++      }
++      if (t1 >= vtest_stats.next_dump) {
++         vtest_stats_dump();
++         vtest_stats.next_dump = t1 + (int64_t)vtest_stats.period * 1000000000;
++      }
++   } else {
++      ret = cmd->dispatch(header[0]);
++   }
+    TRACE_SCOPE_END(trace_scope);
+ 
+    if (ret < 0) {
