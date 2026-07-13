@@ -57,14 +57,47 @@ All end up on NVIDIA via Venus:
 - `ro.hardware.vulkan=virtio` selects Venus; `mesa.vn.debug=vtest` +
   `mesa.vtest.socket.name=/dev/venus.sock` select the socket transport.
 
+## Display: native high refresh
+
+The guest display runs at the monitor's real refresh rate (tested at 500 Hz):
+
+- hwcomposer reports the rate from `persist.waydroid.refresh_rate` (up to
+  1000 Hz).
+- Stock SurfaceFlinger parks its vsync timer forever at periods ≤ 3 ms
+  (`kSnapToSameVsyncWithin` collapses all timeslots). The patched
+  SurfaceFlinger (`patches/lineage-20/`) makes the window tunable via
+  `debug.sf.snap_to_same_vsync_within_ns`; the config sets 1 ms, enabling
+  any refresh rate the display offers. Default behavior is unchanged when
+  the prop is unset.
+
+## Frame synchronization: all GPU-side
+
+- **Fences**: a per-context DRM timeline syncobj is shared between guest and
+  host once (the container shares the host kernel), so per-frame fence
+  export costs kernel ioctls only — zero socket roundtrips.
+- **Semaphores**: imported `sync_fd` wait semaphores (BufferQueue acquire
+  fences) are forwarded to the host driver as real semaphore imports instead
+  of being CPU-waited before submit.
+
+## ASTC texture emulation (Vulkan-native games)
+
+Android mandates `textureCompressionASTC_LDR`; desktop NVIDIA GPUs don't
+have it, so Vulkan-native games would sample garbage. The guest Venus driver
+emulates it: ASTC images are backed by RGBA host images, and
+`vkCmdCopyBufferToImage` uploads are transparently decoded by a compute
+shader (mesa's common `vk_texcompress_astc` decoder) recorded inline into
+the app's command buffer. Sampling, mips, arrays and sRGB all behave as
+native. Opt-out with `VN_NO_ASTC_EMU=1`. ETC2 is not yet emulated.
+
 ## Component map
 
 | Component | Repo (upstream) | Change |
 |---|---|---|
-| Guest Vulkan driver | Mesa `src/virtio/vulkan/` | vtest sync_fd + dma_buf transport; AHB memory steering; UMA memory flags |
+| Guest Vulkan driver | Mesa `src/virtio/vulkan/` | vtest sync_fd + dma_buf transport; timeline-fence path; semaphore sync_fd import; ASTC LDR emulation; AHB memory steering; UMA memory flags |
 | Host renderer | virglrenderer `vtest/`, `src/venus/` | sync_file export, dmabuf-import blob, gpu-alloc command, global-priority strip/retry |
 | gralloc | minigbm `gbm_mesa_driver/` | net-new `vtest_wrapper.c` allocating via `VCMD_RESOURCE_ALLOC_GPU` |
-| Display | android_hardware_waydroid (hwcomposer) | refresh override, single-window layer selection, bufferless-SKIP draw index |
+| Display | android_hardware_waydroid (hwcomposer) | refresh override; direct (subsurface) composition with compositor-compatibility gate; opaque-layer alpha handling; fence lifecycle fixes; single-window layer selection |
+| Guest SurfaceFlinger | LineageOS 20 `frameworks/native` | prop-tunable vsync snap window (enables >333 Hz) |
 | Integration | waydroid `lxc.py`, `hardware_manager.py` | emit mounts/props in generators; `suspend_action=none` |
 
 ## Waydroid integration points (`patches/waydroid`)

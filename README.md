@@ -37,16 +37,32 @@ extensions.
 
 ## Capabilities
 
-- Vulkan executes on the NVIDIA GPU through the socket (compute round-trip
-  verified identical to direct NVIDIA).
-- `sync_fd` fences and semaphores over the socket (`VK_KHR_external_*_fd`).
-- dma_buf import **and** host-side GPU allocation over the socket.
-- HWUI on `skiavk` (Vulkan), SurfaceFlinger RenderEngine and GL apps on **ANGLE**
-  (GL-on-Vulkan) — all reaching NVIDIA via Venus.
-- hwcomposer presents NVIDIA dmabufs through Wayland to KWin.
-- Google Play certified image; ARM app translation (libndk); real games run.
-- Configuration survives `waydroid upgrade` (mounts and props emitted by the
-  integration generators).
+- **Full NVIDIA acceleration, zero VM.** Every pixel Android draws — Vulkan,
+  GL (via ANGLE), UI, games — renders on the host NVIDIA GPU and displays
+  through KWin as native NVIDIA dmabufs.
+- **High refresh, low latency.** The guest runs a native high-refresh display
+  (500 Hz supported; SurfaceFlinger's stock scheduler caps at ~333 Hz — this
+  ships a one-line-tunable fix). All frame synchronization is GPU-side:
+  timeline-syncobj fences shared between guest and host (zero per-frame
+  socket roundtrips) and imported `sync_fd` semaphores (no CPU waits in
+  SurfaceFlinger). Measured: a translated ARM game runs 500 fps flat at
+  2 ms present-to-present on a 500 Hz monitor.
+- **The compositor path is direct.** SurfaceFlinger composites nothing in
+  steady state: app buffers attach straight to Wayland surfaces and KWin
+  displays them — a fullscreen game's buffer travels app → KWin untouched.
+  Layers the compositor can't take directly (software-rendered, solid-color)
+  fall back to SurfaceFlinger transparently.
+- **Vulkan-native Android games work on desktop GPUs.** Desktop NVIDIA has no
+  ASTC texture hardware (Android mandates it); the guest Venus driver
+  transparently decodes ASTC uploads with a compute shader, so Unity/Unreal
+  Vulkan titles render correctly instead of magenta placeholders.
+  (Opt-out: `VN_NO_ASTC_EMU=1`.)
+- **Real games, verified:** Minecraft Bedrock (native x86_64), Subway
+  Surfers, Arknights, Honkai: Star Rail — plus Google Play certification and
+  ARM translation via libhoudini.
+- **Survives updates.** Mounts and props are emitted by the integration
+  generators, so `waydroid upgrade` keeps everything working. A desktop
+  launcher entry health-checks and auto-recovers the whole stack on click.
 
 ## Repository layout
 
@@ -64,9 +80,12 @@ src/                net-new source dropped into the patched trees
   virglrenderer-vtest/  vtest_gpu_alloc.{c,h}   host NVIDIA allocator
   minigbm-vtest/        vtest_wrapper.c         gralloc backend over the socket
 build/              standalone build glue (hwcomposer NDK, hidl-gen, mesa cross, ANGLE args)
+build/lineage-20/   guest image / SurfaceFlinger build recipes (500 Hz patch)
+patches/lineage-20/ frameworks/native patch series (vsync snap window prop)
 dev/                dev-loop scripts (restart, status, logs)
 tests/              C probes used to de-risk each step
 docs/               architecture, transport design, dev workflow
+packaging/host/     host helper binaries (wd-deploy, wd-launch desktop launcher)
 packaging/aur/      PKGBUILD (planned)
 ```
 
@@ -88,19 +107,19 @@ Each `patches/<component>/BASE` pins the upstream commit and apply order. In out
 
 ## Roadmap
 
-Focus is smoothness and latency, then a self-contained image for packaging:
-
-- Combined submit + fence-export socket command (fewer roundtrips per frame).
-- Threaded RenderEngine on ANGLE.
-- Direct-overlay path for fullscreen game layers.
-- Shared-memory ring transport for Venus commands (the big latency win).
-- Native high-refresh: guest framework rebuild folding all pieces into one
-  image and retiring the runtime bind-mounts.
+- Self-contained guest image (all components folded in, bind-mounts retired)
+  published as an OTA channel + AUR package for one-command install.
+- ETC2 texture emulation (same mechanism as ASTC; needed by some GLES3
+  Vulkan ports).
+- Shared-memory ring transport for Venus commands.
 - Input-to-photon measurement and tuning.
-- AUR package.
 
 ## Limitations
 
+- ETC2-compressed textures are not yet emulated (ASTC is); affected games
+  show placeholder textures.
+- Reading back ASTC texture data from the GPU (rare; some tools) is not
+  supported — uploads and sampling are.
 - RGBA_FP16 buffer combination not yet supported by the gralloc format table.
 - dma_buf mmap read bandwidth is below native (affects readback paths, not the
   hot render path).
