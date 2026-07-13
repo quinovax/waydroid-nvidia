@@ -2,12 +2,31 @@
 
 **GPU-accelerated Waydroid on the NVIDIA proprietary driver — container-native, no VM.**
 
+[![build](https://github.com/Shiro836/waydroid-nvidia/actions/workflows/build.yml/badge.svg)](https://github.com/Shiro836/waydroid-nvidia/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/Shiro836/waydroid-nvidia?include_prereleases)](https://github.com/Shiro836/waydroid-nvidia/releases)
+[![AUR](https://img.shields.io/aur/version/waydroid-nvidia-bin)](https://aur.archlinux.org/packages/waydroid-nvidia-bin)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Waydroid runs Android in an LXC container. On a machine whose displays hang off
 an NVIDIA GPU, stock Waydroid can't use it for rendering. This project makes
 Android render on the NVIDIA GPU by **proxying Vulkan (Mesa Venus) over a unix
 socket** to a host-side renderer that issues the real Vulkan calls — keeping the
 host's proprietary NVIDIA userspace (CUDA / NVENC / full performance) intact and
 the whole thing inside a container.
+
+- [How it works](#how-it-works)
+- [Capabilities](#capabilities)
+- [Installation](#installation)
+  - [Requirements](#requirements)
+  - [Arch Linux (AUR)](#arch-linux-aur)
+  - [Other distros (manual)](#other-distros-manual)
+  - [Verifying downloads](#verifying-downloads)
+- [Building from source](#building-from-source)
+- [Repository layout](#repository-layout)
+- [Roadmap](#roadmap)
+- [Limitations](#limitations)
+- [Prior art & references](#prior-art--references)
+- [License](#license)
 
 ## How it works
 
@@ -64,10 +83,137 @@ extensions.
   generators, so `waydroid upgrade` keeps everything working. A desktop
   launcher entry health-checks and auto-recovers the whole stack on click.
 
+## Installation
+
+### Requirements
+
+- NVIDIA proprietary driver (tested on 610.x; anything recent with
+  `VK_EXT_image_drm_format_modifier` and SYNC_FD fence support works) with
+  **`nvidia-drm.modeset=1`**.
+- A Wayland session (tested on KWin / Plasma 6).
+- The usual Waydroid kernel bits: binder (in-kernel binder or binderfs —
+  default on Arch/zen and most modern kernels).
+- For the manual path: host binaries are CI-built on Ubuntu 24.04
+  (glibc ≥ 2.39) and link `libepoxy`, `libdrm`, `libgbm`, `libX11`, `expat`,
+  plus the Vulkan loader at runtime.
+
+### Arch Linux (AUR)
+
+```sh
+yay -S waydroid-nvidia-bin        # provides/conflicts: waydroid
+waydroid init                     # download an Android image, as usual
+sudo waydroid-nvidia-setup        # add --refresh <hz> to match your monitor
+sudo systemctl enable --now waydroid-container.service
+systemctl --user enable --now wd-venus.service
+waydroid session start            # or launch Waydroid from the app menu
+```
+
+`waydroid-nvidia-setup` copies the guest driver stack into
+`/var/lib/waydroid`, writes the required properties into `waydroid.cfg`, and
+regenerates the container config. It is safe to re-run (e.g. after a package
+upgrade or `waydroid upgrade`). `--refresh` above 240 Hz also enables the
+patched SurfaceFlinger that lifts the stock ~333 Hz scheduler ceiling.
+
+Verify it worked:
+
+```sh
+sudo waydroid shell dumpsys SurfaceFlinger | grep GLES
+# GLES: ... ANGLE (NVIDIA, Vulkan ... Venus (NVIDIA GeForce ...))
+```
+
+### Other distros (manual)
+
+The same binaries install anywhere systemd + Waydroid's dependencies exist.
+From a checkout of this repo:
+
+1. **Patched waydroid** (two small patches: the config generator emits this
+   stack's bind-mounts so `waydroid upgrade` keeps working, and
+   `suspend_action = none` support):
+
+   ```sh
+   git clone https://github.com/waydroid/waydroid.git && cd waydroid
+   git checkout a33a5c0b31d89d6ce687381104b30aff4dd2d330   # patches/waydroid/BASE
+   git apply ../patches/waydroid/0001-nvidia-integration.patch
+   sudo make install USE_NFTABLES=1     # =0 if your firewall is iptables
+   cd ..
+   ```
+
+2. **Download and verify the release binaries** (see
+   [Verifying downloads](#verifying-downloads)):
+
+   ```sh
+   V=v0.1.0-rc1
+   B=https://github.com/Shiro836/waydroid-nvidia/releases/download/$V
+   curl -LO $B/waydroid-nvidia-host-x86_64-$V.tar.zst
+   curl -LO $B/waydroid-nvidia-guest-android-x86_64-$V.tar.zst
+   curl -LO $B/waydroid-nvidia-guest-prebuilts-$V.tar.zst
+   curl -LO $B/SHA256SUMS
+   sha256sum -c --ignore-missing SHA256SUMS
+   ```
+
+3. **Install them** (paths must match the unit/setup script):
+
+   ```sh
+   sudo mkdir -p /usr/lib/waydroid-nvidia/guest
+   sudo tar --zstd -xf waydroid-nvidia-host-x86_64-$V.tar.zst          -C /usr/lib/waydroid-nvidia
+   sudo tar --zstd -xf waydroid-nvidia-guest-android-x86_64-$V.tar.zst -C /usr/lib/waydroid-nvidia/guest
+   sudo tar --zstd -xf waydroid-nvidia-guest-prebuilts-$V.tar.zst      -C /usr/lib/waydroid-nvidia/guest
+   ```
+
+4. **Units, tmpfiles, setup helper:**
+
+   ```sh
+   P=packaging/aur/waydroid-nvidia-bin
+   sudo install -Dm644 $P/wd-venus.service        /etc/systemd/user/wd-venus.service
+   sudo install -Dm644 $P/waydroid-venus.tmpfiles /etc/tmpfiles.d/waydroid-venus.conf
+   sudo install -Dm755 $P/waydroid-nvidia-setup   /usr/local/bin/waydroid-nvidia-setup
+   sudo systemd-tmpfiles --create /etc/tmpfiles.d/waydroid-venus.conf
+   ```
+
+5. **Initialize and start** — same as the AUR steps from `waydroid init`
+   onward (the container unit is `waydroid-container.service`, installed by
+   `make install` in step 1).
+
+### Verifying downloads
+
+`SHA256SUMS` covers integrity. For **provenance** — proof an asset was built
+by this repo's CI workflow from this source — the CI-built tarballs
+(`host-x86_64`, `guest-android-x86_64`) carry SLSA attestations:
+
+```sh
+gh attestation verify waydroid-nvidia-host-x86_64-<tag>.tar.zst --repo Shiro836/waydroid-nvidia
+```
+
+The `guest-prebuilts` tarball (hwcomposer, ANGLE, patched SurfaceFlinger) is
+**not CI-attested yet** — those components' build provisioning isn't scripted
+in CI (an ANGLE build needs a ~16 GB checkout, SurfaceFlinger a ~154 GB AOSP
+tree). Their recipes live in `build/` and their sums are in the release; see
+[`packaging/aur/PREREQS.md`](packaging/aur/PREREQS.md) for the honest gap
+list and plan.
+
+## Building from source
+
+Each `patches/<component>/BASE` pins the upstream commit and apply order; one
+build recipe per component lives in `build/<component>/build.sh`, and
+[`packaging/aur/reproduce.sh`](packaging/aur/reproduce.sh) validates the full
+clone → apply → build path (it's what CI runs). In outline:
+
+1. **Host renderer** — clone virglrenderer at `patches/virglrenderer/BASE`, apply
+   the series, copy `src/virglrenderer-vtest/*` into `vtest/`, `meson` + `ninja`.
+   Runs as a systemd user unit serving the venus socket.
+2. **Guest Mesa Venus** — clone mesa at `patches/mesa/BASE`, apply, cross-build
+   for `android-x86_64` (NDK; cross file in `build/mesa/`).
+3. **gralloc backend** — build `src/minigbm-vtest/vtest_wrapper.c` against
+   minigbm; deploy as the `libgbm_mesa_wrapper` replacement.
+4. **hwcomposer** — apply `patches/hwcomposer`, build standalone with
+   `build/hwcomposer/build.sh` (no AOSP tree needed).
+5. **waydroid** — apply `patches/waydroid`; the generators emit the bind-mounts
+   and props so they survive `waydroid upgrade`.
+
 ## Repository layout
 
 This repo is **patches + net-new source + build glue**, not vendored upstream
-trees. A build clones pinned upstream and applies the patches (AUR-friendly).
+trees. A build clones pinned upstream and applies the patches.
 
 ```
 patches/            per-component patch series; each dir has a BASE (pinned commit)
@@ -86,29 +232,16 @@ dev/                dev-loop scripts (restart, status, logs)
 tests/              C probes used to de-risk each step
 docs/               architecture, transport design, dev workflow
 packaging/host/     host helper binaries (wd-deploy, wd-launch desktop launcher)
-packaging/aur/      PKGBUILD (planned)
+packaging/aur/      PKGBUILD (waydroid-nvidia-bin), CI/release docs, reproduce.sh
+packaging/ci/       pinned upstream SHAs consumed by .github/workflows/build.yml
 ```
-
-## Building & deploying
-
-Each `patches/<component>/BASE` pins the upstream commit and apply order. In outline:
-
-1. **Host renderer** — clone virglrenderer at `patches/virglrenderer/BASE`, apply
-   the series, copy `src/virglrenderer-vtest/*` into `vtest/`, `meson` + `ninja`.
-   Runs as a systemd user unit serving the venus socket.
-2. **Guest Mesa Venus** — clone mesa at `patches/mesa/BASE`, apply, cross-build
-   for `android-x86_64` (NDK; cross file in `build/mesa/`).
-3. **gralloc backend** — build `src/minigbm-vtest/vtest_wrapper.c` against
-   minigbm; deploy as the `libgbm_mesa_wrapper` replacement.
-4. **hwcomposer** — apply `patches/hwcomposer`, build standalone with
-   `build/hwcomposer/build.sh` (no AOSP tree needed).
-5. **waydroid** — apply `patches/waydroid`; the generators emit the bind-mounts
-   and props so they survive `waydroid upgrade`.
 
 ## Roadmap
 
 - Self-contained guest image (all components folded in, bind-mounts retired)
-  published as an OTA channel + AUR package for one-command install.
+  published as an OTA channel.
+- CI provisioning for hwcomposer (then ANGLE/SurfaceFlinger) so every shipped
+  binary is attested.
 - ETC2 texture emulation (same mechanism as ASTC; needed by some GLES3
   Vulkan ports).
 - Shared-memory ring transport for Venus commands.
