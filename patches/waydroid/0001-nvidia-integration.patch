@@ -1,8 +1,8 @@
 diff --git a/tools/helpers/lxc.py b/tools/helpers/lxc.py
-index d3f6c24..d5d0510 100644
+index d3f6c24..44647a2 100644
 --- a/tools/helpers/lxc.py
 +++ b/tools/helpers/lxc.py
-@@ -124,6 +124,17 @@ def generate_nodes_lxc_config(args):
+@@ -124,6 +124,20 @@ def generate_nodes_lxc_config(args):
      # NFC config
      make_entry("/system/etc/libnfc-nci.conf", options="bind,optional 0 0")
  
@@ -16,6 +16,9 @@ index d3f6c24..d5d0510 100644
 +    nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libEGL_angle.so vendor/lib64/egl/libEGL_angle.so none rbind,create=file,optional 0 0")
 +    nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libGLESv1_CM_angle.so vendor/lib64/egl/libGLESv1_CM_angle.so none rbind,create=file,optional 0 0")
 +    nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libGLESv2_angle.so vendor/lib64/egl/libGLESv2_angle.so none rbind,create=file,optional 0 0")
++    # Patched SF (500 Hz vsync snap window, see patches/lineage-20/) — optional:
++    # absent file = stock image binary.
++    nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/surfaceflinger system/bin/surfaceflinger none rbind,create=file,optional 0 0")
 +
      return nodes
  
