@@ -36,6 +36,7 @@ git add -A patches/ src/ && git commit
 | `dev/restart` | the **only** allowed stack bounce (venus → container → session; never kill SF alone) |
 | `dev/health` | post-restart checklist: boot, renderer, crash count, KWin errors, hwc diag |
 | `dev/measure [pkg]` | canonical launcher-fling frame bench (median/p90/p95/p99/janky) |
+| `dev/monitor [seconds] [label] [pkg]` | correlated app frames + per-context Venus traffic + GPU/health capture |
 | `dev/sync-patches` | regen `patches/` + `src/` from the trees; prints a review diff, commits nothing |
 | `dev/status` / `dev/logs` | truth snapshot / aggregated logs (`-f`, `gfx`, `crash`, `units`) |
 | `dev/wd` / `dev/wdu` | run the runtime checkout as root / user |
