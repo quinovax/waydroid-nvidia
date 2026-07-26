@@ -423,12 +423,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          # rc tags publish as prereleases; plain version tags as full releases
           PRE=""; case "$TAG" in *-rc*) PRE="--prerelease" ;; esac
+          NOTES="Every asset is CI-built from pinned sources with SLSA provenance. Verify: \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" $PRE \
             --title "waydroid-nvidia $TAG" \
-            --notes "Every asset is CI-built from pinned sources and carries a SLSA
-          provenance attestation (the surfaceflinger build runs on the maintainer's
-          registered self-hosted runner; its provenance says so). Verify with:
-          \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`" \
+            --notes "$NOTES" \
             out/*.tar.* out/SHA256SUMS
