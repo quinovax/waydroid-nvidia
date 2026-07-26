@@ -411,6 +411,7 @@ jobs:
             tar --zstd -C prebuilts -cf "out/waydroid-nvidia-guest-prebuilts-${TAG}.tar.zst" .
             tar -C prebuilts -czf "out/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" .
           fi
+          (cd out && sha256sum ./*.tar.* > SHA256SUMS)
           cat out/SHA256SUMS
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
