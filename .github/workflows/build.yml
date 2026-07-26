@@ -425,6 +425,8 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           PRE=""; case "$TAG" in *-rc*) PRE="--prerelease" ;; esac
           NOTES="Every asset is CI-built from pinned sources with SLSA provenance. Verify: \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`"
+          # Delete existing release if any (re-push / re-tag safe)
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" $PRE \
             --title "waydroid-nvidia $TAG" \
             --notes "$NOTES" \
