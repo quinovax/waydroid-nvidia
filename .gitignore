@@ -40,3 +40,4 @@ packaging/aur/waydroid-nvidia-bin/*.tar.zst
 # Test binaries (built on demand by tests/run-probe.sh)
 tests/nvimportprobe
 tests/nvimportprobe-portable
+packaging/selinux/*.mod
