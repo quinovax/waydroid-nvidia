@@ -347,7 +347,7 @@ jobs:
   release:
     name: release (tarballs + SHA256SUMS + provenance)
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [mesa, virglrenderer, gralloc, hwcomposer, waydroid-patch-check]
+    needs: [mesa, virglrenderer, gralloc, waydroid-patch-check]
     runs-on: ubuntu-latest
     permissions:
       contents: write
