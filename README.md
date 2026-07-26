@@ -9,11 +9,10 @@ Works with the proprietary NVIDIA kernel module; the open kernel module
 
 ## Highlights
 
-- **Pure proprietary NVIDIA driver supported** — the closed-source `nvidia.ko` works fine; the open kernel module (`nvidia-open`) is optional and offers no DMA-BUF advantage on this stack. Userspace is always NVIDIA proprietary (CUDA, NVENC, Vulkan ICD, ANGLE).
-- **Proven at scale** — real games tested (Minecraft Bedrock, Subway Surfers, Arknights, Honkai: Star Rail); translated ARM games hold 500 fps at 2 ms present-to-present; Google Play certification passes.
-- **Active rendering fixes** — Present fence leaks patched (UE4 `VK_ERROR_TOO_MANY_OBJECTS`), ASTC texture emulation for desktop NVIDIA, DRM modifier negotiation for zero-copy composition.
-- **Game-ready guest tweaks** — optional `scripts/waydroid-guest-customize.sh` for Magisk/Zygisk/Shamiko, WebView GL override, relative mouse motion, and device spoof in one command.
-- **Purely container** — no VM, no Android-as-second-OS; LXC with host kernel, DMA-BUF pass-through, dmabuf/udmabuf zero-copy to KWin/Niri.
+- **Proprietary NVIDIA driver support** — `nvidia.ko` (closed-source) works alongside `nvidia-open`; no DMA-BUF difference between the two on this stack.
+- **Rendering fixes** — Present fence leaks patched (UE4 `VK_ERROR_TOO_MANY_OBJECTS`), ASTC texture emulation for desktop NVIDIA, DRM modifier negotiation.
+- **Guest customization** — `scripts/waydroid-guest-customize.sh` for Magisk/Zygisk/Shamiko, WebView GL override, mouse fix, device spoof.
+- **Container-native** — LXC with host kernel, DMA-BUF pass-through, udmabuf zero-copy to compositor.
 
 Stock Waydroid can't render on NVIDIA. This project proxies Vulkan (Mesa
 Venus) over a unix socket to a host-side renderer that issues the real Vulkan
@@ -26,17 +25,13 @@ Android app ── Vulkan ──▶ guest Mesa Venus ── unix socket ──�
 KWin ◀── hwcomposer ◀── gralloc imports ◀── NVIDIA dmabufs ◀── NVIDIA driver
 ```
 
-Buffers are allocated host-side as NVIDIA block-linear images and travel to
-the compositor as native NVIDIA dmabufs — no cross-vendor negotiation, no
-copies. GL runs through ANGLE, ASTC textures are emulated in a compute shader
-(desktop NVIDIA lacks the hardware Android mandates), and frame sync is fully
-GPU-side (timeline syncobjs + imported sync_fd semaphores; zero per-frame
-socket roundtrips). The guest runs native high refresh — 500 Hz verified,
-with a translated ARM game holding 500 fps at 2 ms present-to-present.
+Buffers are allocated host-side as NVIDIA block-linear dmabufs and imported
+by the compositor directly — no CPU copies. GL runs through ANGLE, ASTC
+textures are emulated in a compute shader (desktop NVIDIA lacks the hardware
+Android expects), and frame sync uses timeline syncobjs with imported sync_fd
+semaphores. ARM-only apps run via libhoudini translation.
 
-Verified in the field on Turing, Ampere, Ada and Blackwell GPUs. Real games
-tested: Minecraft Bedrock, Subway Surfers, Arknights, Honkai: Star Rail —
-plus Google Play certification and ARM translation (libhoudini).
+Tested on Pascal (GTX 1080) with the proprietary driver.
 
 ## Requirements
 
