@@ -389,23 +389,28 @@ jobs:
           verify_android_elf guest/vendor/lib64/libgbm_mesa_wrapper.so ELF64 'Advanced Micro Devices X86-64' libgbm_mesa_wrapper.so
           tar --zstd -C guest -cf "out/waydroid-nvidia-guest-android-x86_64-${TAG}.tar.zst" .
           tar -C guest -czf "out/waydroid-nvidia-guest-android-x86_64-${TAG}.tar.gz" .
-          # guest prebuilts — now CI-built and attested like everything else
-          mkdir -p prebuilts
+          # guest prebuilts — only assemble if all artifacts are available
+          HAVE_PREBUILTS=1
           for artifact in guest-hwcomposer guest-angle guest-surfaceflinger; do
-            cp -a "artifacts/$artifact"/. prebuilts/
+            [ -d "artifacts/$artifact" ] || { echo "::warning::skipping prebuilts: $artifact not found"; HAVE_PREBUILTS=0; break; }
           done
-          for lib in libEGL_angle.so libGLESv1_CM_angle.so libGLESv2_angle.so; do
-            verify_android_elf "prebuilts/vendor/lib/egl/$lib" ELF32 'Intel 80386' "$lib"
-            verify_android_elf "prebuilts/vendor/lib64/egl/$lib" ELF64 'Advanced Micro Devices X86-64' "$lib"
-          done
-          verify_android_elf prebuilts/vendor/lib64/hw/hwcomposer.waydroid.so ELF64 'Advanced Micro Devices X86-64' hwcomposer.waydroid.so
-          verify_android_elf prebuilts/system/bin/surfaceflinger ELF64 'Advanced Micro Devices X86-64'
-          chmod 0755 prebuilts/system/bin/surfaceflinger
-          (cd prebuilts && find vendor system -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.prebuilts)
-          printf 'CI-built guest prebuilts: hwcomposer (provision.sh clean-room),\nANGLE (pinned %s), surfaceflinger (lineage-20 tree, self-hosted runner).\n' "${ANGLE_SHA:-see pins}" > prebuilts/README.txt
-          tar --zstd -C prebuilts -cf "out/waydroid-nvidia-guest-prebuilts-${TAG}.tar.zst" .
-          tar -C prebuilts -czf "out/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" .
-          (cd out && sha256sum ./*.tar.* > SHA256SUMS)
+          if [ "$HAVE_PREBUILTS" = 1 ]; then
+            mkdir -p prebuilts
+            for artifact in guest-hwcomposer guest-angle guest-surfaceflinger; do
+              cp -a "artifacts/$artifact"/. prebuilts/
+            done
+            for lib in libEGL_angle.so libGLESv1_CM_angle.so libGLESv2_angle.so; do
+              verify_android_elf "prebuilts/vendor/lib/egl/$lib" ELF32 'Intel 80386' "$lib"
+              verify_android_elf "prebuilts/vendor/lib64/egl/$lib" ELF64 'Advanced Micro Devices X86-64' "$lib"
+            done
+            verify_android_elf prebuilts/vendor/lib64/hw/hwcomposer.waydroid.so ELF64 'Advanced Micro Devices X86-64' hwcomposer.waydroid.so
+            verify_android_elf prebuilts/system/bin/surfaceflinger ELF64 'Advanced Micro Devices X86-64'
+            chmod 0755 prebuilts/system/bin/surfaceflinger
+            (cd prebuilts && find vendor system -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.prebuilts)
+            printf 'CI-built guest prebuilts: hwcomposer (provision.sh clean-room),\nANGLE (pinned %s), surfaceflinger (lineage-20 tree, self-hosted runner).\n' "${ANGLE_SHA:-see pins}" > prebuilts/README.txt
+            tar --zstd -C prebuilts -cf "out/waydroid-nvidia-guest-prebuilts-${TAG}.tar.zst" .
+            tar -C prebuilts -czf "out/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" .
+          fi
           cat out/SHA256SUMS
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
