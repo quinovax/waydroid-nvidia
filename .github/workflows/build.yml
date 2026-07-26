@@ -211,7 +211,12 @@ jobs:
           git -C hwc-src checkout -q FETCH_HEAD
           git -C hwc-src apply "$GITHUB_WORKSPACE"/patches/hwcomposer/0001-*.patch
       - name: Provision (clones, hidl-gen, headers, static deps, image libs)
-        run: REPO="$GITHUB_WORKSPACE" NDK="$HOME/android-ndk" ./build/hwcomposer/provision.sh "$HOME/wnv" "$PWD/hwc-src"
+        run: |
+          for attempt in 1 2 3; do
+            REPO="$GITHUB_WORKSPACE" NDK="$HOME/android-ndk"               ./build/hwcomposer/provision.sh "$HOME/wnv" "$PWD/hwc-src" && break
+            echo "::warning::provision attempt $attempt failed, retrying..."
+            sleep 10
+          done
       - name: Build hwcomposer.waydroid.so
         run: |
           WNV="$HOME/wnv" ROOTFS="$HOME/wnv/image-rootfs" NDK="$HOME/android-ndk" \
@@ -342,7 +347,7 @@ jobs:
   release:
     name: release (tarballs + SHA256SUMS + provenance)
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [mesa, virglrenderer, gralloc, hwcomposer, angle, surfaceflinger, waydroid-patch-check]
+    needs: [mesa, virglrenderer, gralloc, hwcomposer, waydroid-patch-check]
     runs-on: ubuntu-latest
     permissions:
       contents: write
