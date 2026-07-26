@@ -4,8 +4,8 @@
 Works with the proprietary NVIDIA kernel module; the open kernel module
 (`nvidia-open`) is optional and has no advantage for DMA-BUF on this stack.**
 
-[![build](https://github.com/Shiro836/waydroid-nvidia/actions/workflows/build.yml/badge.svg)](https://github.com/Shiro836/waydroid-nvidia/actions/workflows/build.yml)
-[![release](https://img.shields.io/github/v/release/Shiro836/waydroid-nvidia)](https://github.com/Shiro836/waydroid-nvidia/releases)
+[![build](https://github.com/CinQwQeggs01/waydroid-nvidia/actions/workflows/build.yml/badge.svg)](https://github.com/CinQwQeggs01/waydroid-nvidia/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/CinQwQeggs01/waydroid-nvidia)](https://github.com/CinQwQeggs01/waydroid-nvidia/releases)
 
 ## Highlights
 
@@ -84,7 +84,7 @@ now** — gamescope crashes and takes the host session down with it
 ### One-line install (Ubuntu / Fedora / Arch)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Shiro836/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash
 ```
 
 This auto-detects your distro, installs dependencies, downloads the latest
@@ -119,7 +119,7 @@ sudo dnf install -y meson ninja-build gcc gcc-c++ git cmake \
 
 **Releases are fully attested**: every asset is CI-built from pinned sources
 and carries SLSA provenance —
-`gh attestation verify <asset> --repo Shiro836/waydroid-nvidia`.
+`gh attestation verify <asset> --repo CinQwQeggs01/waydroid-nvidia`.
 
 ## Documentation
 

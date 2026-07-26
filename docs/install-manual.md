@@ -24,7 +24,7 @@ cd ..
 
 ```sh
 V=vX.Y.Z  # use the first release tag that includes the dual-ABI guest layout
-B=https://github.com/Shiro836/waydroid-nvidia/releases/download/$V
+B=https://github.com/CinQwQeggs01/waydroid-nvidia/releases/download/$V
 curl -LO $B/waydroid-nvidia-host-x86_64-$V.tar.zst
 curl -LO $B/waydroid-nvidia-guest-android-x86_64-$V.tar.zst
 curl -LO $B/waydroid-nvidia-guest-prebuilts-$V.tar.zst
@@ -38,8 +38,8 @@ by this repo's CI from this source — every tarball carries a SLSA attestation
 maintainer's registered self-hosted runner, and its provenance says so):
 
 ```sh
-gh attestation verify waydroid-nvidia-host-x86_64-$V.tar.zst --repo Shiro836/waydroid-nvidia
-gh attestation verify waydroid-nvidia-guest-prebuilts-$V.tar.zst --repo Shiro836/waydroid-nvidia
+gh attestation verify waydroid-nvidia-host-x86_64-$V.tar.zst --repo CinQwQeggs01/waydroid-nvidia
+gh attestation verify waydroid-nvidia-guest-prebuilts-$V.tar.zst --repo CinQwQeggs01/waydroid-nvidia
 ```
 
 ## 3. Install the binaries
