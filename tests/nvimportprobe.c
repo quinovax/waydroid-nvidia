@@ -4,7 +4,7 @@
 // host driver, no venus/server needed:
 //
 //   allocate VkImage (block-linear or LINEAR modifier, gralloc-style usage)
-//   -> export dma_buf (vkGetMemoryFdKHR)          [requires open kernel module]
+//   -> export dma_buf (vkGetMemoryFdKHR)
 //   -> vkGetMemoryFdPropertiesKHR                  (print memoryTypeBits mask)
 //   -> re-create image with ANGLE's usage set (with/without INPUT_ATTACHMENT)
 //   -> dedicated-import the dma_buf into EVERY type in the mask, bind

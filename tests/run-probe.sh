@@ -7,21 +7,16 @@ cd "$(dirname "$0")"
 
 echo "== kernel module:"
 head -1 /proc/driver/nvidia/version 2>/dev/null || echo "  (no /proc/driver/nvidia — driver not loaded?)"
-if head -1 /proc/driver/nvidia/version 2>/dev/null | grep -qv "Open Kernel Module"; then
-    echo "== UNTESTABLE: closed kernel module — no dma_buf support. Pick another host."
-    exit 3
-fi
 
 echo "== nvidia-drm modeset:"
-ms=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo unreadable)
+ms=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo "unreadable (root-only)")
 echo "   $ms"
-if [ "$ms" = "N" ]; then
+if [ "$ms" = "N" ] || [ "$ms" = "0" ]; then
     echo "== UNTESTABLE: nvidia-drm.modeset=0 on the host."
-    echo "   dma_buf paths are disabled; this host can't run the test. Pick another."
+    echo "   dma_buf paths are disabled; this host can't run the test."
     exit 3
 fi
-# unreadable (root-only on newer drivers) or missing: fall through — the
-# probe itself detects the condition via the absent dma_buf extension
+# unreadable = root-only sysfs permission; not an error, just can't verify here
 
 echo "== driver:"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || true
