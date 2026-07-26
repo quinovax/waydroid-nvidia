@@ -56,13 +56,11 @@ the host renderer and logcat should not name `llvmpipe` or `Lavapipe`.
 
 ## Is my GPU/driver combination OK?
 
-Requirements: NVIDIA **open kernel modules** (Turing or newer — the open KM
-does not support older GPUs), driver 595.71+, `nvidia-drm.modeset=1`. The
-stack is validated on Turing, Ampere, Ada and Blackwell.
+Either the proprietary (`nvidia.ko` / `nvidia-dkms`) or open (`nvidia-open`) kernel module works. Pascal and newer GPUs. Driver 535+ required (610.x recommended) with `nvidia-drm.modeset=1`.
 
 To test any machine in ~30 seconds without installing anything, build the
-probe from this repo and run it — it checks the exact buffer-sharing paths
-the stack depends on and names whatever is missing:
+probe from this repo and run it — it checks the actual DMA-BUF import/export
+paths the stack depends on:
 
 ```sh
 gcc -O1 -o nvimportprobe tests/nvimportprobe.c -ldl
@@ -70,4 +68,4 @@ tests/run-probe.sh    # or ./nvimportprobe directly
 ```
 
 Exit 0 = this machine can run the stack. Exit 3 = it can't, and the output
-says why (closed kernel module, modeset off, …).
+says why.

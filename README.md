@@ -1,14 +1,19 @@
 # waydroid-nvidia
 
 **GPU-accelerated Waydroid on the NVIDIA driver — container-native, no VM.
-Needs the open kernel modules (`nvidia-open`); the userspace stays NVIDIA's
-regular proprietary stack.**
+Works with the proprietary NVIDIA kernel module; the open kernel module
+(`nvidia-open`) is optional and has no advantage for DMA-BUF on this stack.**
 
 [![build](https://github.com/Shiro836/waydroid-nvidia/actions/workflows/build.yml/badge.svg)](https://github.com/Shiro836/waydroid-nvidia/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/Shiro836/waydroid-nvidia)](https://github.com/Shiro836/waydroid-nvidia/releases)
-[![AUR](https://img.shields.io/aur/version/waydroid-nvidia-bin)](https://aur.archlinux.org/packages/waydroid-nvidia-bin)
-[![nix](https://img.shields.io/badge/NixOS-community%20flake-5277C3?logo=nixos&logoColor=white)](https://github.com/yigexuanmu/waydroid-nvidia-nix)
-[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+## Highlights
+
+- **Pure proprietary NVIDIA driver supported** — the closed-source `nvidia.ko` works fine; the open kernel module (`nvidia-open`) is optional and offers no DMA-BUF advantage on this stack. Userspace is always NVIDIA proprietary (CUDA, NVENC, Vulkan ICD, ANGLE).
+- **Proven at scale** — real games tested (Minecraft Bedrock, Subway Surfers, Arknights, Honkai: Star Rail); translated ARM games hold 500 fps at 2 ms present-to-present; Google Play certification passes.
+- **Active rendering fixes** — Present fence leaks patched (UE4 `VK_ERROR_TOO_MANY_OBJECTS`), ASTC texture emulation for desktop NVIDIA, DRM modifier negotiation for zero-copy composition.
+- **Game-ready guest tweaks** — optional `scripts/waydroid-guest-customize.sh` for Magisk/Zygisk/Shamiko, WebView GL override, relative mouse motion, and device spoof in one command.
+- **Purely container** — no VM, no Android-as-second-OS; LXC with host kernel, DMA-BUF pass-through, dmabuf/udmabuf zero-copy to KWin/Niri.
 
 Stock Waydroid can't render on NVIDIA. This project proxies Vulkan (Mesa
 Venus) over a unix socket to a host-side renderer that issues the real Vulkan
@@ -35,29 +40,13 @@ plus Google Play certification and ARM translation (libhoudini).
 
 ## Requirements
 
-- **NVIDIA open kernel modules** (`nvidia-open`/`nvidia-open-dkms`) — the
-  closed module has no DMA-BUF support, and every displayed buffer here is
-  one. The userspace (`nvidia-utils`) is the same proprietary code either
-  way; nouveau/NVK is out of scope (stock Waydroid handles it). Open KM
-  means **Turing (RTX 20 / GTX 16) or newer**.
-- Driver **595.71+** (610.x recommended) with **`nvidia-drm.modeset=1`**.
+- **NVIDIA kernel module** (`nvidia.ko` / `nvidia-dkms` or `nvidia-open` / `nvidia-open-dkms`) — either the proprietary or open module works. The proprietary module is the standard one shipped with `nvidia-utils`. Pascal and newer GPUs.
+- Driver **535+** with `nvidia-drm.modeset=1` (610.x recommended).
 - A Wayland session (tested on KWin / Plasma 6) and the usual Waydroid
   kernel bits (binder).
 - Unsure about a machine? `tests/run-probe.sh` checks the exact
   buffer-sharing paths in ~30 s and names anything missing — see
   [`docs/troubleshooting.md`](docs/troubleshooting.md).
-
-## Install (Arch / AUR)
-
-```sh
-yay -S waydroid-nvidia-bin        # provides/conflicts: waydroid
-waydroid init                     # download an Android image, as usual
-sudo waydroid-nvidia-setup        # add --refresh <hz> to match your monitor
-sudo systemctl enable --now waydroid-container.service
-systemctl --user enable --now wd-venus.service
-# re-log-in once (udev rule for /dev/udmabuf), then:
-waydroid session start            # or launch Waydroid from the app menu
-```
 
 `waydroid-nvidia-setup` deploys the guest stack, writes the config, verifies
 your environment (modeset, vendor image, render node) and removes stale
@@ -92,9 +81,27 @@ window and crashes gamescope). **Broken on hybrid Intel+NVIDIA laptops right
 now** — gamescope crashes and takes the host session down with it
 (issue #2, upstream gamescope#1590); hybrid support is being worked on there.
 
-**NixOS:** community flake —
-[yigexuanmu/waydroid-nvidia-nix](https://github.com/yigexuanmu/waydroid-nvidia-nix).
-**Other distros:** the same binaries install anywhere — see
+### One-line install (Ubuntu / Fedora / Arch)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shiro836/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash
+```
+
+This auto-detects your distro, installs dependencies, downloads the latest
+release tarballs, verifies SHA256 checksums, patches waydroid, and installs
+everything — host binaries, guest stack, systemd units, udev rules, and
+SELinux policy (Fedora). Then:
+
+```sh
+waydroid init -s GAPPS
+sudo waydroid-nvidia-setup
+sudo systemctl enable --now waydroid-container.service
+systemctl --user enable --now wd-venus.service
+# re-login once, then:
+waydroid session start
+```
+
+**Manual install / other distros:** see
 [`docs/install-manual.md`](docs/install-manual.md).
 
 ### Build from source (Fedora)
@@ -115,6 +122,28 @@ and carries SLSA provenance —
 `gh attestation verify <asset> --repo Shiro836/waydroid-nvidia`.
 
 ## Documentation
+
+- [`scripts/waydroid-guest-customize.sh`](scripts/waydroid-guest-customize.sh) — optional container customization (Magisk/Zygisk/Shamiko, WebView GL, mouse fix, device spoof)
+
+```sh
+# Install all features
+sudo ./scripts/waydroid-guest-customize.sh --all
+
+# Or pick features
+sudo ./scripts/waydroid-guest-customize.sh --magisk --mouse-fix
+sudo ./scripts/waydroid-guest-customize.sh --webview-gl --settings-tweaks
+
+# Custom device spoof
+SPOOF_MODEL=SM-S908B SPOOF_BRAND=samsung sudo ./scripts/waydroid-guest-customize.sh --device-spoof
+```
+
+| Flag | Effect |
+|------|--------|
+| `--magisk` | Install Magisk 30.1-Waydroid + Zygisk + Shamiko (requires [wsu](https://github.com/mistrmochov/WaydroidSU)) |
+| `--webview-gl` | Disable Vulkan draw functor in WebView, force GL path |
+| `--mouse-fix` | Enable relative mouse motion for games (`fake_touch=1`) |
+| `--device-spoof` | Spoof device identity (default: HUAWEI VOG-AL10, override with `SPOOF_MODEL`/`SPOOF_BRAND`/`SPOOF_DEVICE`) |
+| `--settings-tweaks` | Hide dev settings, disable package verifier, set pointer speed |
 
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — health checks, known
   failure modes, one-command debug capture, GPU probe kit
