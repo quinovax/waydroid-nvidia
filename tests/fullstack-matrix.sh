@@ -17,7 +17,7 @@ mkdir -p ~/wdnv && cd ~/wdnv
 source venv/bin/activate
 pip -q install meson mako pyyaml packaging
 
-[ -d waydroid-nvidia ] || git clone -q --depth 1 https://github.com/Shiro836/waydroid-nvidia
+[ -d waydroid-nvidia ] || git clone -q --depth 1 https://github.com/CinQwQeggs01/waydroid-nvidia
 REPO=~/wdnv/waydroid-nvidia
 source "$REPO/packaging/ci/pins.env"
 
