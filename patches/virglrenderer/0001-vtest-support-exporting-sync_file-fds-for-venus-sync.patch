@@ -348,7 +348,13 @@ index 61b94be..b7242e0 100644
 +      int fd = -1;
 +      VkResult result = vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd);
 +      if (result != VK_SUCCESS) {
-+         ret = -EINVAL;
++         /* GetFenceFdKHR can fail with VK_ERROR_TOO_MANY_OBJECTS when
++          * the process hits its fd limit (multi-client Venus: game +
++          * SF + gralloc).  Returning 1 (already signaled) lets the
++          * guest create a signaled release fence instead of propagating
++          * VK_ERROR_TOO_MANY_OBJECTS through Present (UE4 fatal).
++          */
++         ret = 1;
 +      } else if (fd < 0) {
 +         ret = 1;
 +      } else {

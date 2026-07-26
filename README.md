@@ -95,6 +95,19 @@ now** — gamescope crashes and takes the host session down with it
 **Other distros:** the same binaries install anywhere — see
 [`docs/install-manual.md`](docs/install-manual.md).
 
+### Build from source (Fedora)
+
+```sh
+sudo dnf install -y meson ninja-build gcc gcc-c++ git cmake \
+  libdrm-devel libgbm-devel libepoxy-devel vulkan-headers \
+  wayland-devel wayland-protocols-devel \
+  libX11-devel libXrandr-devel libXfixes-devel xorg-x11-proto-devel \
+  python3-pyyaml python3-mako python3-packaging \
+  glslang libffi-devel openssl-devel \
+  systemd-devel libcap-devel lzip xz
+./packaging/fedora/build.sh all
+```
+
 **Releases are fully attested**: every asset is CI-built from pinned sources
 and carries SLSA provenance —
 `gh attestation verify <asset> --repo Shiro836/waydroid-nvidia`.

@@ -85,11 +85,16 @@ index 0abfb14..4c337a3 100644
     *out_fd = vn_renderer_sync_export_syncobj(dev->renderer, sync, true);
     vn_renderer_sync_destroy(dev->renderer, sync);
  
--   return *out_fd >= 0 ? VK_SUCCESS : VK_ERROR_TOO_MANY_OBJECTS;
-+   /* -1 is a valid already-signaled sync file (see vn_sync_valid_fd);
-+    * transports return < -1 on error
-+    */
-+   return *out_fd >= -1 ? VK_SUCCESS : VK_ERROR_TOO_MANY_OBJECTS;
+   if (*out_fd >= -1)
+      return VK_SUCCESS;
+
+   /* Transport error (e.g. -EINVAL from host GetFenceFdKHR exhaustion):
+    * returning VK_ERROR_TOO_MANY_OBJECTS here makes UE4 Present abort.
+    * Recover by treating the fence as already-signaled (-1) — spec-legal
+    * for release fences and avoids a fatal swapchain error.
+    */
+   *out_fd = -1;
+   return VK_SUCCESS;
  }
  
  static inline bool
