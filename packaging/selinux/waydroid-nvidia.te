@@ -1,0 +1,14 @@
+module waydroid-nvidia 1.0;
+
+require {
+    type init_t;
+    type var_lib_t;
+    class binder { call transfer };
+    class file { getattr setattr };
+}
+
+# Allow waydroid's init (vold/vdc) to call binder
+allow init_t self:binder { call transfer };
+
+# Allow waydroid's init to setattr on /var/lib/waydroid files
+allow init_t var_lib_t:file { getattr setattr };
