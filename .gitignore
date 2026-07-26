@@ -6,6 +6,7 @@ mcpe-vv-module/vvpatch
 mcpe-vv-module/src/vvpatch
 
 # Build outputs
+.work/
 build/hwcomposer/out/
 build/**/out/
 *.o
@@ -24,6 +25,11 @@ tests/nvmembench
 tests/nvmmap
 tests/nvmods
 tests/vnprobe
+
+# makepkg litter in the AUR dir (downloaded sources + built packages);
+# only PKGBUILD/.SRCINFO/local install sources are tracked
+packaging/aur/waydroid-nvidia-bin/*.tar.gz
+packaging/aur/waydroid-nvidia-bin/*.tar.zst
 
 # Editor / OS
 .vscode/
