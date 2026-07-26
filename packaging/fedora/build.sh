@@ -3,14 +3,14 @@
 # Builds: mesa (guest Venus), virglrenderer (host renderer), gralloc, hwcomposer
 # Requires: Fedora 40+ with official repos only (no COPR/external)
 # SELinux: sets correct contexts on installed binaries
-set -euo pipefail
+export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}/usr/lib64/pkgconfig:/usr/share/pkgconfig"
 
 REPO="${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
 PINFILE="$REPO/packaging/ci/pins.env"
 source "$PINFILE"
 
 : "${WNV:=$HOME/waydroid-nv}"
-: "${NDK:=$HOME/android-ndk}"
+: "${NDK:=${ANDROID_NDK_HOME:-$HOME/android-ndk}}"; export NDK
 : "${INSTALL_PREFIX:=/usr/lib/waydroid-nvidia}"
 : "${GUEST_PREFIX:=/var/lib/waydroid/overlay/system}"
 
@@ -81,25 +81,25 @@ setup_sources() {
 
 build_mesa() {
   info "Building mesa (guest Venus driver)"
-  local src="$WNV/mesa"
-  git -C "$src" checkout -q "$MESA_SHA"
-  git -C "$src" am -q "$REPO/patches/mesa/0001-"*.patch "$REPO/patches/mesa/0002-"*.patch 2>/dev/null || \
-    git -C "$src" am --skip  # already applied
-  git -C "$src" apply "$REPO/patches/mesa/0003-wip-"*.patch 2>/dev/null || true
+  git -C "$src" reset --hard HEAD 2>/dev/null || true
+  git -C "$src" clean -fd 2>/dev/null || true
+  git -C "$src" checkout -qf "$MESA_SHA"
+  for pf in "$REPO"/patches/mesa/0001-*.patch "$REPO"/patches/mesa/0002-*.patch "$REPO"/patches/mesa/0003-wip-*.patch; do
+    git -C "$src" apply --3way "$pf" 2>/dev/null || git -C "$src" apply "$pf" 2>/dev/null || true
+  done
   REPO="$REPO" "$REPO/build/mesa/build.sh" "$src" "$src/build-android-x86_64"
   ok "mesa built"
 }
 
 build_virgl() {
   info "Building virglrenderer (host renderer)"
-  local src="$WNV/virglrenderer"
-  git -C "$src" checkout -q "$VIRGL_SHA"
-  git -C "$src" am -q "$REPO/patches/virglrenderer/0001-"*.patch \
-                     "$REPO/patches/virglrenderer/0002-"*.patch 2>/dev/null || \
-    git -C "$src" am --skip
-  git -C "$src" am -q "$REPO/patches/virglrenderer/0003-"*.patch 2>/dev/null || \
-    git -C "$src" am --skip
-  git -C "$src" apply "$REPO/patches/virglrenderer/0004-wip-"*.patch 2>/dev/null || true
+  git -C "$src" reset --hard HEAD 2>/dev/null || true
+  git -C "$src" clean -fd 2>/dev/null || true
+  git -C "$src" checkout -qf "$VIRGL_SHA"
+  for pf in "$REPO"/patches/virglrenderer/0001-*.patch "$REPO"/patches/virglrenderer/0002-*.patch "$REPO"/patches/virglrenderer/0003-*.patch; do
+    git -C "$src" apply --3way "$pf" 2>/dev/null || git -C "$src" apply "$pf" 2>/dev/null || true
+  done
+  git -C "$src" apply --3way "$REPO/patches/virglrenderer/0004-wip-"*.patch 2>/dev/null || git -C "$src" apply "$REPO/patches/virglrenderer/0004-wip-"*.patch 2>/dev/null || true
   REPO="$REPO" "$REPO/build/virglrenderer/build.sh" "$src" "$src/build"
   ok "virglrenderer built"
 }
