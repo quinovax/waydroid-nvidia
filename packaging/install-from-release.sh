@@ -92,10 +92,15 @@ trap 'rm -rf "$WORK"' EXIT
 info "downloading release tarballs"
 for f in waydroid-nvidia-host-x86_64-${TAG}.tar.gz \
          waydroid-nvidia-guest-android-x86_64-${TAG}.tar.gz \
-         waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz \
          SHA256SUMS; do
     curl -fSL "$BASE_URL/$f" -o "$WORK/$f"
 done
+# prebuilts (ANGLE, hwcomposer, surfaceflinger) — optional
+if curl -fSL "$BASE_URL/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" -o "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" 2>/dev/null; then
+    info "prebuilts (ANGLE/hwcomposer/surfaceflinger) downloaded"
+else
+    info "prebuilts not available in this release — GL will use software fallback"
+fi
 
 info "verifying checksums"
 (cd "$WORK" && sha256sum -c --ignore-missing SHA256SUMS) || die "SHA256 verification failed"
@@ -109,7 +114,9 @@ tar -C "$PREFIX" -xf "$WORK/waydroid-nvidia-host-x86_64-${TAG}.tar.gz"
 info "installing guest binaries to $PREFIX/guest"
 mkdir -p "$PREFIX/guest"
 tar -C "$PREFIX/guest" -xf "$WORK/waydroid-nvidia-guest-android-x86_64-${TAG}.tar.gz"
-tar -C "$PREFIX/guest" -xf "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz"
+if [ -f "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" ]; then
+    tar -C "$PREFIX/guest" -xf "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz"
+fi
 ok "binaries installed"
 
 # ---- clone repo at tag to get patches + integration files ----
