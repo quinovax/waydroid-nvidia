@@ -246,10 +246,17 @@ info "using tag: $TAG"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# ---- clone repo at tag (needed for both modes) ----
-info "cloning repo at $TAG"
+# ---- clone repo for patches + integration files ----
+# Release mode: fetch from main so patches/BASE are always current.
+# Source mode: fetch at the tag so the build matches the release.
 REPO_SRC="$WORK/waydroid-nvidia"
-git clone -q --depth 1 --branch "$TAG" "$REPO_URL" "$REPO_SRC"
+if [ "$SOURCE" -eq 1 ]; then
+    info "cloning repo at $TAG"
+    git clone -q --depth 1 --branch "$TAG" "$REPO_URL" "$REPO_SRC"
+else
+    info "cloning repo (main)"
+    git clone -q --depth 1 "$REPO_URL" "$REPO_SRC"
+fi
 
 if [ "$SOURCE" -eq 1 ]; then
     # ---- SOURCE MODE: build everything from source ----
