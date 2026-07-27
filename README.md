@@ -76,7 +76,7 @@ window and crashes gamescope). **Broken on hybrid Intel+NVIDIA laptops right
 now** — gamescope crashes and takes the host session down with it
 (issue #2, upstream gamescope#1590); hybrid support is being worked on there.
 
-### One-line install (Ubuntu / Fedora / Arch)
+### Install from the latest release (recommended)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash
@@ -85,7 +85,35 @@ curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/p
 This auto-detects your distro, installs dependencies, downloads the latest
 release tarballs, verifies SHA256 checksums, patches waydroid, and installs
 everything — host binaries, guest stack, systemd units, udev rules, and
-SELinux policy (Fedora). Then:
+SELinux policy (Fedora).
+
+To install a specific release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash -s -- --tag v0.1.2
+```
+
+### Install from a tag (build from source)
+
+When a tag exists but no release has been published yet (pre-built tarballs
+are uploaded manually and may lag behind tags), you can build from source:
+
+```sh
+git clone https://github.com/CinQwQeggs01/waydroid-nvidia.git
+cd waydroid-nvidia
+sudo ./packaging/install-from-release.sh --source --tag v0.1.0
+```
+
+This installs build dependencies, downloads the Android NDK, clones and
+patches all upstream trees, builds mesa (guest Venus driver) and
+virglrenderer (host renderer) from source, and installs everything.
+
+**Note:** ANGLE, hwcomposer, and surfaceflinger are not built by
+`--source`.  If the release for this tag includes a prebuilts tarball, run
+without `--source` instead; otherwise copy them manually into
+`/usr/lib/waydroid-nvidia/guest/`.
+
+### After installing (both methods)
 
 ```sh
 waydroid init -s GAPPS
@@ -99,22 +127,8 @@ waydroid session start
 **Manual install / other distros:** see
 [`docs/install-manual.md`](docs/install-manual.md).
 
-### Build from source (Fedora)
+### Build from source (Fedora, advanced)
 
-```sh
-sudo dnf install -y meson ninja-build gcc gcc-c++ git cmake \
-  libdrm-devel libgbm-devel libepoxy-devel vulkan-headers \
-  wayland-devel wayland-protocols-devel \
-  libX11-devel libXrandr-devel libXfixes-devel xorg-x11-proto-devel \
-  python3-pyyaml python3-mako python3-packaging \
-  glslang libffi-devel openssl-devel \
-  systemd-devel libcap-devel lzip xz
-./packaging/fedora/build.sh all
-```
-
-**Releases are fully attested**: every asset is CI-built from pinned sources
-and carries SLSA provenance —
-`gh attestation verify <asset> --repo CinQwQeggs01/waydroid-nvidia`.
 
 ## Documentation
 
