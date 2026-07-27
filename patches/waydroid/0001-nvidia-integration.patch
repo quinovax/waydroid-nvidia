@@ -2,7 +2,7 @@ diff --git a/tools/actions/container_manager.py b/tools/actions/container_manage
 index 837ae1a..b3f2c1a 100644
 --- a/tools/actions/container_manager.py
 +++ b/tools/actions/container_manager.py
-@@ -25,11 +25,18 @@ class DbusContainerManager(dbus.service.Object):
+@@ -25,12 +25,21 @@ class DbusContainerManager(dbus.service.Object):
      @dbus.service.method("id.waydro.ContainerManager", in_signature='a{ss}', out_signature='', sender_keyword="sender", connection_keyword="conn")
      def Start(self, session, sender, conn):
          dbus_info = dbus.Interface(conn.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus/Bus", False), "org.freedesktop.DBus")
