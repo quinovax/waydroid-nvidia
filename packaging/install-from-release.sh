@@ -292,7 +292,7 @@ fi
 
 # ---- install patched waydroid (both modes) ----
 info "installing patched waydroid"
-WAYDROID_SHA=$(cat "$REPO_SRC/patches/waydroid/BASE" | tr -d '[:space:]')
+WAYDROID_SHA=$(sed -n 's/^base-commit: *//p' "$REPO_SRC/patches/waydroid/BASE" | sed 's/ .*//')
 WAYDROID_SRC="$WORK/waydroid"
 git init -q "$WAYDROID_SRC"
 git -C "$WAYDROID_SRC" fetch -q --depth 1 "$WAYDROID_UPSTREAM" "$WAYDROID_SHA"
