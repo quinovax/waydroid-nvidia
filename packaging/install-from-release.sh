@@ -43,28 +43,43 @@ detect_distro() {
 DISTRO=$(detect_distro)
 info "detected distro family: $DISTRO"
 
+# ---- pipewire-pulseaudio conflict guard ----
+# On modern distros, pipewire-pulseaudio replaces pulseaudio.  Installing
+# pulseaudio alongside it causes a transaction conflict.  Detect this once
+# via the distro's native package query and set PA_PKG accordingly.
+PA_PKG="pulseaudio"
+case "$DISTRO" in
+    debian) dpkg -s pipewire-pulseaudio &>/dev/null && PA_PKG="" ;;
+    fedora) rpm -q  pipewire-pulseaudio &>/dev/null && PA_PKG="" ;;
+    arch)   pacman -Qi pipewire-pulseaudio &>/dev/null && PA_PKG="" ;;
+esac
+[ -z "$PA_PKG" ] && info "pipewire-pulseaudio detected — skipping traditional pulseaudio package"
+
 # ---- install deps ----
 install_deps_debian() {
     info "installing Debian/Ubuntu dependencies"
     apt-get update -q
+    # shellcheck disable=SC2086
     apt-get install -yq lxc python3 python3-gi python3-dbus nftables dnsmasq \
-        gir1.2-gtk-3.0 pulseaudio binutils \
+        gir1.2-gtk-3.0 $PA_PKG binutils \
         libepoxy0 libdrm2 libgbm1 libx11-6 libexpat1 libvulkan1 \
         curl git make gcc patch
 }
 
 install_deps_fedora() {
     info "installing Fedora dependencies"
+    # shellcheck disable=SC2086
     dnf install -yq lxc python3 python3-gobject python3-dbus nftables dnsmasq \
-        gtk3 pulseaudio binutils \
+        gtk3 $PA_PKG binutils \
         libepoxy libdrm mesa-libgbm libX11 expat vulkan-loader \
         curl git make gcc patch
 }
 
 install_deps_arch() {
     info "installing Arch dependencies"
+    # shellcheck disable=SC2086
     pacman -Syq --noconfirm --needed lxc python python-gobject python-dbus \
-        nftables dnsmasq gtk3 pulseaudio binutils \
+        nftables dnsmasq gtk3 $PA_PKG binutils \
         libepoxy libdrm mesa libx11 expat vulkan-icd-loader \
         curl git base-devel patch
 }
