@@ -91,27 +91,43 @@ PY
 }
 
 # ── Device identity spoof ──
+# Spoofs the device as a real phone to bypass emulator detection in apps like
+# AnTuTu.  The default target is HUAWEI P30 Pro (VOG-AL10, Kirin 980).
+# Override SoC/board properties via SPOOF_* env vars if changing the target.
 device_spoof() {
   blue "== Device identity spoof"
   need_root
   local MODEL="${SPOOF_MODEL:-VOG-AL10}"
   local BRAND="${SPOOF_BRAND:-HUAWEI}"
   local DEVICE="${SPOOF_DEVICE:-HWVOG}"
-  green "  Spoofing as: $BRAND $MODEL ($DEVICE)"
-  python3 - "$CFG" "$MODEL" "$BRAND" "$DEVICE" <<'PY'
+  local HARDWARE="${SPOOF_HARDWARE:-kirin980}"
+  local PLATFORM="${SPOOF_PLATFORM:-kirin980}"
+  local SOC="${SPOOF_SOC:-Kirin 980}"
+  local CHIPNAME="${SPOOF_CHIPNAME:-kirin980}"
+  local BOARD="${SPOOF_BOARD:-VOG}"
+  local API_LEVEL="${SPOOF_API_LEVEL:-28}"
+  green "  Spoofing as: $BRAND $MODEL ($DEVICE, SoC: $SOC)"
+  python3 - "$CFG" "$MODEL" "$BRAND" "$DEVICE" \
+      "$HARDWARE" "$PLATFORM" "$SOC" "$CHIPNAME" "$BOARD" "$API_LEVEL" <<'PY'
 import configparser, sys
 from pathlib import Path
 cfg=Path(sys.argv[1]); model=sys.argv[2]; brand=sys.argv[3]; device=sys.argv[4]
+hw=sys.argv[5]; platform=sys.argv[6]; soc=sys.argv[7]
+chip=sys.argv[8]; board=sys.argv[9]; api=sys.argv[10]
 cp=configparser.ConfigParser(); cp.optionxform=str; cp.read(cfg)
 p=cp.setdefault('properties',{})
 for k,v in {
+    # product identity
     'ro.product.brand':brand,'ro.product.manufacturer':brand,
     'ro.product.model':model,'ro.product.device':device,'ro.product.name':model,
+    'ro.product.board':board,
+    'ro.product.first_api_level':api,
     'ro.system.build.product':model,'ro.system.build.flavor':f'{device}-user',
     'ro.build.fingerprint':f'{brand}/{model}/{device}:10/{brand}{model}/10.1.0.162C00:user/release-keys',
     'ro.system.build.description':f'{model}-user 10 {brand}{model} release-keys',
     'ro.build.display.id':f'{model} 10.1.0.162(C00E160R1P8)',
-    'ro.build.tags':'release-keys','ro.debuggable':'0',
+    'ro.build.tags':'release-keys','ro.build.type':'user','ro.debuggable':'0',
+    # per-partition product identity (API 30+ namespaces)
     'ro.product.system.brand':brand,'ro.product.system.manufacturer':brand,
     'ro.product.system.model':model,'ro.product.system.device':device,'ro.product.system.name':model,
     'ro.product.vendor.brand':brand,'ro.product.vendor.manufacturer':brand,
@@ -120,13 +136,15 @@ for k,v in {
     'ro.product.odm.model':model,'ro.product.odm.device':device,'ro.product.odm.name':model,
     'ro.product.system_ext.brand':brand,'ro.product.system_ext.manufacturer':brand,
     'ro.product.system_ext.model':model,'ro.product.system_ext.device':device,'ro.product.system_ext.name':model,
+    # SoC / hardware platform — AnTuTu and similar apps check these to detect
+    # emulators.  'unknown' / 'waydroid' are instant tells.
+    'ro.hardware':hw,'ro.board.platform':platform,
+    'ro.soc.model':soc,'ro.hardware.chipname':chip,
 }.items():
     p[k]=v
-p.setdefault('ro.hardware','unknown')
-p.setdefault('ro.board.platform','waydroid')
 with cfg.open('w') as f: cp.write(f)
 PY
-  green "  Identity spoofed as $BRAND $MODEL"
+  green "  Identity spoofed as $BRAND $MODEL (SoC: $SOC)"
 }
 
 # ── Settings tweaks ──
@@ -154,18 +172,26 @@ Options:
   --magisk            Install Magisk 30.1-Waydroid + Zygisk + Shamiko (requires wsu)
   --webview-gl        Force WebView/Chrome off Vulkan draw functor, use GL
   --mouse-fix         Enable relative mouse motion for games (fake_touch=1)
-  --device-spoof      Spoof device as HUAWEI VOG-AL10 (override with SPOOF_MODEL env)
+  --device-spoof      Spoof device as HUAWEI P30 Pro (override with SPOOF_* env)
   --settings-tweaks   Disable dev settings, package verifier, set pointer speed
   --help              Show this help
 
 Environment variables (for --device-spoof):
-  SPOOF_MODEL   Device model   (default: VOG-AL10)
-  SPOOF_BRAND   Device brand   (default: HUAWEI)
-  SPOOF_DEVICE  Device codename (default: HWVOG)
+  SPOOF_MODEL     Device model      (default: VOG-AL10)
+  SPOOF_BRAND     Device brand      (default: HUAWEI)
+  SPOOF_DEVICE    Device codename   (default: HWVOG)
+  SPOOF_HARDWARE  HAL prefix / ro.hardware (default: kirin980)
+  SPOOF_PLATFORM  Board platform    (default: kirin980)
+  SPOOF_SOC       SoC model name    (default: Kirin 980)
+  SPOOF_CHIPNAME  Chip name          (default: kirin980)
+  SPOOF_BOARD     Board name         (default: VOG)
+  SPOOF_API_LEVEL First API level    (default: 28)
 
 Examples:
   sudo $0 --all
-  SPOOF_MODEL=SM-S908B SPOOF_BRAND=samsung sudo $0 --device-spoof
+  SPOOF_MODEL=SM-S908B SPOOF_BRAND=samsung SPOOF_SOC="Exynos 2200" \
+      SPOOF_HARDWARE=s5e9925 SPOOF_PLATFORM=s5e9925 SPOOF_CHIPNAME=s5e9925 \
+      SPOOF_BOARD=dm1q SPOOF_API_LEVEL=31 sudo $0 --device-spoof
 EOF
 }
 
