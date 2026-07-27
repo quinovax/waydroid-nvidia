@@ -293,6 +293,9 @@ fi
 # ---- install patched waydroid (both modes) ----
 info "installing patched waydroid"
 WAYDROID_SHA=$(sed -n 's/^base-commit: *//p' "$REPO_SRC/patches/waydroid/BASE" | sed 's/ .*//')
+# Resolve short SHA to full 40-char SHA (git fetch over network requires it)
+WAYDROID_SHA=$(git ls-remote "$WAYDROID_UPSTREAM" "$WAYDROID_SHA" | head -1 | cut -f1)
+[ -n "$WAYDROID_SHA" ] || die "could not resolve base-commit SHA from patches/waydroid/BASE"
 WAYDROID_SRC="$WORK/waydroid"
 git init -q "$WAYDROID_SRC"
 git -C "$WAYDROID_SRC" fetch -q --depth 1 "$WAYDROID_UPSTREAM" "$WAYDROID_SHA"
