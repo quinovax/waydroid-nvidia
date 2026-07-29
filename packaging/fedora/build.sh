@@ -3,6 +3,10 @@
 # Builds: mesa (guest Venus), virglrenderer (host renderer), gralloc, hwcomposer
 # Requires: Fedora 40+ with official repos only (no COPR/external)
 # SELinux: sets correct contexts on installed binaries
+#
+# Strict mode matters here: without it an unset path or a failed checkout used
+# to let the script sail past every step and exit 0 with nothing patched.
+set -euo pipefail
 export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}/usr/lib64/pkgconfig:/usr/share/pkgconfig"
 
 REPO="${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
@@ -81,11 +85,17 @@ setup_sources() {
 
 build_mesa() {
   info "Building mesa (guest Venus driver)"
-  git -C "$src" reset --hard HEAD 2>/dev/null || true
-  git -C "$src" clean -fd 2>/dev/null || true
+  local src="$WNV/mesa"
+  [[ -d "$src/.git" ]] || die "mesa tree missing at $src — run setup_sources first"
+  git -C "$src" reset --hard HEAD
+  git -C "$src" clean -fd
   git -C "$src" checkout -qf "$MESA_SHA"
-  for pf in "$REPO"/patches/mesa/0001-*.patch "$REPO"/patches/mesa/0002-*.patch "$REPO"/patches/mesa/0003-wip-*.patch; do
-    git -C "$src" apply --3way "$pf" 2>/dev/null || git -C "$src" apply "$pf" 2>/dev/null || true
+  local pf
+  for pf in "$REPO"/patches/mesa/0001-*.patch \
+            "$REPO"/patches/mesa/0002-*.patch \
+            "$REPO"/patches/mesa/0003-wip-*.patch; do
+    [[ -f "$pf" ]] || die "expected patch not found: $pf"
+    git -C "$src" apply --3way "$pf" || die "failed to apply $(basename "$pf")"
   done
   REPO="$REPO" "$REPO/build/mesa/build.sh" "$src" "$src/build-android-x86_64"
   ok "mesa built"
@@ -93,13 +103,19 @@ build_mesa() {
 
 build_virgl() {
   info "Building virglrenderer (host renderer)"
-  git -C "$src" reset --hard HEAD 2>/dev/null || true
-  git -C "$src" clean -fd 2>/dev/null || true
+  local src="$WNV/virglrenderer"
+  [[ -d "$src/.git" ]] || die "virglrenderer tree missing at $src — run setup_sources first"
+  git -C "$src" reset --hard HEAD
+  git -C "$src" clean -fd
   git -C "$src" checkout -qf "$VIRGL_SHA"
-  for pf in "$REPO"/patches/virglrenderer/0001-*.patch "$REPO"/patches/virglrenderer/0002-*.patch "$REPO"/patches/virglrenderer/0003-*.patch; do
-    git -C "$src" apply --3way "$pf" 2>/dev/null || git -C "$src" apply "$pf" 2>/dev/null || true
+  local pf
+  for pf in "$REPO"/patches/virglrenderer/0001-*.patch \
+            "$REPO"/patches/virglrenderer/0002-*.patch \
+            "$REPO"/patches/virglrenderer/0003-*.patch \
+            "$REPO"/patches/virglrenderer/0004-wip-*.patch; do
+    [[ -f "$pf" ]] || die "expected patch not found: $pf"
+    git -C "$src" apply --3way "$pf" || die "failed to apply $(basename "$pf")"
   done
-  git -C "$src" apply --3way "$REPO/patches/virglrenderer/0004-wip-"*.patch 2>/dev/null || git -C "$src" apply "$REPO/patches/virglrenderer/0004-wip-"*.patch 2>/dev/null || true
   REPO="$REPO" "$REPO/build/virglrenderer/build.sh" "$src" "$src/build"
   ok "virglrenderer built"
 }
@@ -123,13 +139,23 @@ install_all() {
   sudo cp -f "$WNV/virglrenderer/build/vtest/virgl_test_server" "$INSTALL_PREFIX/"
   sudo cp -f "$WNV/virglrenderer/build/server/virgl_render_server" "$INSTALL_PREFIX/"
   sudo cp -f "$WNV/virglrenderer/build/src/libvirglrenderer.so."* "$INSTALL_PREFIX/"
-  sudo cp -f "$WNV/hwc-build/out/libEGL_angle.so" "$INSTALL_PREFIX/guest/" 2>/dev/null || true
-  sudo cp -f "$WNV/hwc-build/out/libGLESv2_angle.so" "$INSTALL_PREFIX/guest/" 2>/dev/null || true
-  sudo cp -f "$WNV/hwc-build/out/libGLESv1_CM_angle.so" "$INSTALL_PREFIX/guest/" 2>/dev/null || true
-  sudo cp -f "$WNV/mesa/build-android-x86_64/src/virtio/vulkan/libvulkan_virtio.so" "$INSTALL_PREFIX/guest/" 2>/dev/null || true
-  sudo cp -f "$WNV/hwc-build/out/hwcomposer.waydroid.so" "$INSTALL_PREFIX/guest/" 2>/dev/null || true
+  # The guest Venus driver is built by build_mesa above — a missing file here
+  # means the build silently produced nothing, so do not mask it.
+  sudo cp -f "$WNV/mesa/build-android-x86_64/src/virtio/vulkan/libvulkan_virtio.so" \
+      "$INSTALL_PREFIX/guest/"
+  # ANGLE and hwcomposer come from the separate provision/build path and may
+  # legitimately be absent; say so instead of failing or staying silent.
+  local opt
+  for opt in libEGL_angle.so libGLESv2_angle.so libGLESv1_CM_angle.so \
+             hwcomposer.waydroid.so; do
+    if [[ -f "$WNV/hwc-build/out/$opt" ]]; then
+      sudo cp -f "$WNV/hwc-build/out/$opt" "$INSTALL_PREFIX/guest/"
+    else
+      info "optional component not built, skipping: $opt"
+    fi
+  done
   sudo chmod 755 "$INSTALL_PREFIX/virgl_test_server" "$INSTALL_PREFIX/virgl_render_server"
-  sudo chmod 644 "$INSTALL_PREFIX/"*.so* "$INSTALL_PREFIX/guest/"*.so 2>/dev/null || true
+  sudo chmod 644 "$INSTALL_PREFIX/"*.so* "$INSTALL_PREFIX/guest/"*.so
 
   # SELinux contexts for host binaries (virgl_test_server runs as user service)
   if command -v restorecon &>/dev/null; then

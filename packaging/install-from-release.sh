@@ -288,6 +288,9 @@ else
     # it does NOT care whether the files we downloaded are listed at all. With a
     # SHA256SUMS that omits our tarballs it prints OK and exits 0, so unverified
     # bytes would get unpacked into /usr as root. Demand an entry per artifact.
+    #
+    # CI writes the list with `sha256sum ./*.tar.*`, so every name carries a
+    # leading "./"; accept that form and normalise it away for the check.
     info "verifying checksums"
     SUMS="$WORK/SHA256SUMS"
     VERIFY_LINES="$WORK/.verify"
@@ -296,11 +299,13 @@ else
              waydroid-nvidia-guest-android-x86_64-${TAG}.tar.gz \
              $([ -f "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" ] \
                    && echo "waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz"); do
-        # match "<hash>  <name>" or "<hash> *<name>", exact name only
-        if ! grep -E "^[0-9a-fA-F]{64} [ *]?${f//./\\.}\$" "$SUMS" >> "$VERIFY_LINES"; then
+        # "<hash>[ ]<sp|*>[./]<name>" — exact basename, optional binary marker
+        if ! grep -E "^[0-9a-fA-F]{64} [ *]?(\./)?${f//./\\.}\$" "$SUMS" \
+                | sed -E "s#([ *])\./#\1#" >> "$VERIFY_LINES"; then
             die "SHA256SUMS has no entry for $f — refusing to install unverified binaries"
         fi
     done
+    [ -s "$VERIFY_LINES" ] || die "no checksum lines collected — refusing to install"
     (cd "$WORK" && sha256sum -c --strict "$VERIFY_LINES") || die "SHA256 verification failed"
     ok "checksums verified ($(wc -l < "$VERIFY_LINES") artifacts)"
 

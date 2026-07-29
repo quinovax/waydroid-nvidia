@@ -495,11 +495,17 @@ vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
    if (memfd < 0)
       return -errno;
    if (ftruncate(memfd, (off_t)size) < 0) {
+      int err = errno;
       close(memfd);
-      return -errno;
+      return -err;
    }
    /* udmabuf requires the memfd to be shrink-sealed */
-   fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK);
+   if (fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) < 0) {
+      int err = errno;
+      fprintf(stderr, "vtest_gpu_alloc: F_SEAL_SHRINK failed (%s)\n", strerror(err));
+      close(memfd);
+      return -err;
+   }
 
    int ufd = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
    if (ufd < 0) {
@@ -520,10 +526,14 @@ vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
       .size = size,
    };
    int dmabuf = ioctl(ufd, UDMABUF_CREATE, &create);
+   /* Capture errno before close(): a successful close does not clear it, but a
+    * failing one overwrites it, so the returned code would describe the wrong
+    * call -- and could even be 0, reporting success with *out_fd never set. */
+   int ioctl_err = dmabuf < 0 ? errno : 0;
    close(ufd);
    close(memfd);
    if (dmabuf < 0)
-      return -errno;
+      return -ioctl_err;
 
    *out_stride = stride;
    *out_size = size;
