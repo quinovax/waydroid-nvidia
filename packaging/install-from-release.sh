@@ -70,13 +70,17 @@ install_deps_debian() {
         gir1.2-gtk-3.0 $PA_PKG binutils \
         libepoxy0 libdrm2 libgbm1 libx11-6 libexpat1 libvulkan1 \
         curl git make gcc patch
+    # python3-gbinder only exists in the Waydroid PPA / newer Debian; waydroid
+    # imports it at runtime, so try it but do not fail the whole install here.
+    apt-get install -yq python3-gbinder 2>/dev/null \
+        || info "python3-gbinder unavailable — add the Waydroid PPA and install it manually"
 }
 
 install_deps_fedora() {
     info "installing Fedora dependencies"
     # shellcheck disable=SC2086
-    dnf install -yq lxc python3 python3-gobject python3-dbus nftables dnsmasq \
-        gtk3 $PA_PKG binutils \
+    dnf install -yq lxc python3 python3-gobject python3-dbus python3-gbinder \
+        nftables dnsmasq gtk3 $PA_PKG binutils \
         libepoxy libdrm mesa-libgbm libX11 expat vulkan-loader \
         curl git make gcc patch
 }
@@ -85,7 +89,7 @@ install_deps_arch() {
     info "installing Arch dependencies"
     # shellcheck disable=SC2086
     pacman -Syq --noconfirm --needed lxc python python-gobject python-dbus \
-        nftables dnsmasq gtk3 $PA_PKG binutils \
+        python-gbinder nftables dnsmasq gtk3 $PA_PKG binutils \
         libepoxy libdrm mesa libx11 expat vulkan-icd-loader \
         curl git base-devel patch
 }
@@ -310,6 +314,33 @@ NFTABLES=1
 command -v nft >/dev/null 2>&1 || NFTABLES=0
 make -C "$WAYDROID_SRC" install USE_NFTABLES=$NFTABLES
 ok "patched waydroid installed"
+
+# ---- pin the interpreter for installed waydroid entry points ----
+# `#!/usr/bin/env python3` resolves through the *caller's* PATH, so a
+# user-local python (Homebrew, pyenv, conda, ~/.local) shadows the system one
+# and waydroid dies with "ModuleNotFoundError: No module named 'dbus'".
+# Rewrite the shebangs to an absolute interpreter that really has the deps.
+info "selecting python interpreter for waydroid"
+PYBIN=""
+for cand in /usr/bin/python3 /usr/local/bin/python3; do
+    [ -x "$cand" ] || continue
+    if "$cand" -c 'import dbus, dbus.mainloop.glib, gi' >/dev/null 2>&1; then
+        PYBIN="$cand"
+        break
+    fi
+done
+if [ -z "$PYBIN" ]; then
+    die "no system python3 with the python-dbus and python-gobject bindings was found.
+Install them for /usr/bin/python3 (python3-dbus + python3-gobject on Debian/Fedora,
+python-dbus + python-gobject on Arch) and re-run this installer."
+fi
+ok "using $PYBIN ($("$PYBIN" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))'))"
+
+for f in /usr/bin/waydroid /usr/lib/waydroid/waydroid.py; do
+    [ -f "$f" ] || continue
+    sed -i "1s|^#!.*python3.*$|#!$PYBIN|" "$f"
+done
+ok "waydroid entry points pinned to $PYBIN"
 
 # ---- install systemd units, udev rules, tmpfiles, setup script ----
 info "installing host integration files"

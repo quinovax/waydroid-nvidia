@@ -41,6 +41,7 @@ none), then attach it to an issue.
 | Cursor invisible / screenshots black, everything else fine | No `/dev/udmabuf` access (CPU-mappable buffer path); wd-venus journal says exactly this | The package's udev rule grants it to the seated user — re-log-in once after install. Headless: `setfacl -m u:USER:rw /dev/udmabuf` |
 | Images in `/etc/waydroid-extra/images` or `/usr/share/waydroid-extra/images` | waydroid silently prefers preinstalled images over downloads | Remove/move them if you want OTA images |
 | ARM32-only app runs on LLVM/Lavapipe while the desktop is accelerated | The 32-bit `vendor/lib/hw/vulkan.virtio.so` is missing or is a renamed `vulkan.lvp.so` | Install a dual-ABI release and re-run `sudo waydroid-nvidia-setup`; it requires ELF32/`EM_386` for every `vendor/lib` payload |
+| `waydroid` dies instantly with `ModuleNotFoundError: No module named 'dbus'` (or `gi`, `gbinder`) | `/usr/bin/waydroid` used `#!/usr/bin/env python3`, and a user-local python (Homebrew/linuxbrew, pyenv, conda, `~/.local`) earlier in `PATH` shadows the system interpreter that owns the bindings | Re-run the installer (it now pins the shebang to an absolute system python), or fix it in place: `sudo sed -i '1s\|^#!.*\|#!/usr/bin/python3\|' /usr/bin/waydroid /usr/lib/waydroid/waydroid.py` |
 
 For a translated app, confirm its process maps the 32-bit stack (replace the
 package name if needed):
