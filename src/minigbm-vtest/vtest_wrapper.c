@@ -111,13 +111,28 @@ sock_recv_fd(int sock)
    if (n <= 0)
       return -1;
 
-   struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-   if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS ||
-       c->cmsg_len < CMSG_LEN(sizeof(int)))
+   /* Require exactly one fd. recvmsg() has already installed every fd the
+    * message carried into this process, so a rejection must close them or they
+    * leak for the lifetime of the container. MSG_CTRUNC means the control data
+    * did not fit and any fds beyond the first were dropped by the kernel. */
+   int nfds = 0, fds[8];
+   for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+      if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+         continue;
+      size_t payload = c->cmsg_len - CMSG_LEN(0);
+      for (size_t off = 0; off + sizeof(int) <= payload; off += sizeof(int)) {
+         if (nfds < (int)(sizeof(fds) / sizeof(fds[0]))) {
+            memcpy(&fds[nfds], CMSG_DATA(c) + off, sizeof(int));
+            nfds++;
+         }
+      }
+   }
+   if ((msg.msg_flags & MSG_CTRUNC) || nfds != 1) {
+      for (int i = 0; i < nfds; i++)
+         close(fds[i]);
       return -1;
-   int fd;
-   memcpy(&fd, CMSG_DATA(c), sizeof(fd));
-   return fd;
+   }
+   return fds[0];
 }
 
 static int
@@ -250,7 +265,14 @@ vtest_alloc(struct alloc_args *args)
    return -ENODEV;
 
 have_resp:;
+   /* Any error below happens *after* the response header was read but before
+    * the SCM_RIGHTS fd is received. Returning here would leave that fd queued
+    * on the socket, and the next vtest_alloc would recvmsg() the stale fd from
+    * this failed request and hand it back as a valid buffer. The stream has no
+    * resync point, so drop the connection instead. */
    if (resp[0] < VCMD_RESOURCE_ALLOC_GPU_RESP_SIZE) {
+      close(dev->sock);
+      dev->sock = -1;
       pthread_mutex_unlock(&dev->mutex);
       LOGE("alloc: host payload too short (%u < %u)", resp[0],
            VCMD_RESOURCE_ALLOC_GPU_RESP_SIZE);
@@ -259,6 +281,8 @@ have_resp:;
    const uint32_t *d = &resp[VTEST_HDR_SIZE];
    const uint32_t status = d[0];
    if (status) {
+      close(dev->sock);
+      dev->sock = -1;
       pthread_mutex_unlock(&dev->mutex);
       LOGE("alloc %ux%u fmt=%s(0x%08x) flags=%u failed: host status %u", args->width,
            args->height, vtest_format_name(args->drm_format), args->drm_format,

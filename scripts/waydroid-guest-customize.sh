@@ -53,9 +53,14 @@ install_magisk() {
 webview_gl() {
   blue "== WebView: disable Vulkan draw functor, force GL"
   adb_connect
-  printf '_ --disable-features=WebViewDrawFunctorVulkan,WebViewVulkan,Vulkan,DefaultANGLEVulkan,VulkanFromANGLE\n' > /tmp/wd-wv-flags
-  ADB push /tmp/wd-wv-flags /data/local/tmp/webview-command-line
-  ADB push /tmp/wd-wv-flags /data/local/tmp/chrome-command-line
+  # Runs as root: a fixed /tmp name would let any local user pre-plant a
+  # symlink and have root truncate/overwrite an arbitrary file.
+  local flags
+  flags=$(mktemp) || die "mktemp failed"
+  trap 'rm -f "$flags"' RETURN
+  printf '_ --disable-features=WebViewDrawFunctorVulkan,WebViewVulkan,Vulkan,DefaultANGLEVulkan,VulkanFromANGLE\n' > "$flags"
+  ADB push "$flags" /data/local/tmp/webview-command-line
+  ADB push "$flags" /data/local/tmp/chrome-command-line
   ADB shell chmod 644 /data/local/tmp/webview-command-line /data/local/tmp/chrome-command-line
   ADB shell setprop debug.hwui.renderer skiagl 2>/dev/null || true
   ADB shell am force-stop com.google.android.webview 2>/dev/null || true
