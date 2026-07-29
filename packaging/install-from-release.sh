@@ -319,28 +319,36 @@ ok "patched waydroid installed"
 # `#!/usr/bin/env python3` resolves through the *caller's* PATH, so a
 # user-local python (Homebrew, pyenv, conda, ~/.local) shadows the system one
 # and waydroid dies with "ModuleNotFoundError: No module named 'dbus'".
-# Rewrite the shebangs to an absolute interpreter that really has the deps.
+# Rewrite the shebang to an absolute interpreter that really has the deps.
 info "selecting python interpreter for waydroid"
 PYBIN=""
 for cand in /usr/bin/python3 /usr/local/bin/python3; do
     [ -x "$cand" ] || continue
-    if "$cand" -c 'import dbus, dbus.mainloop.glib, gi' >/dev/null 2>&1; then
+    if "$cand" -c 'import dbus, dbus.mainloop.glib, gi, gbinder' >/dev/null 2>&1; then
         PYBIN="$cand"
         break
     fi
 done
 if [ -z "$PYBIN" ]; then
-    die "no system python3 with the python-dbus and python-gobject bindings was found.
-Install them for /usr/bin/python3 (python3-dbus + python3-gobject on Debian/Fedora,
-python-dbus + python-gobject on Arch) and re-run this installer."
+    die "no system python3 with the dbus, gobject and gbinder bindings was found.
+Install them for /usr/bin/python3 (python3-dbus + python3-gobject + python3-gbinder on
+Debian/Fedora, python-dbus + python-gobject + python-gbinder on Arch) and re-run this
+installer."
 fi
 ok "using $PYBIN ($("$PYBIN" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))'))"
 
-for f in /usr/bin/waydroid /usr/lib/waydroid/waydroid.py; do
-    [ -f "$f" ] || continue
-    sed -i "1s|^#!.*python3.*$|#!$PYBIN|" "$f"
-done
-ok "waydroid entry points pinned to $PYBIN"
+# Only ever rewrite the real script. /usr/bin/waydroid is a relative symlink to
+# it (upstream Makefile), and that link is what puts /usr/lib/waydroid on
+# sys.path[0] so `import tools` resolves. Editing through the link with `sed -i`
+# would replace it with a copy under /usr/bin and break `import tools`.
+sed -i "1s|^#!.*python3.*$|#!$PYBIN|" /usr/lib/waydroid/waydroid.py
+
+# Repair the launcher if a previous in-place edit clobbered the symlink.
+if [ ! -L /usr/bin/waydroid ]; then
+    ln -sfn ../lib/waydroid/waydroid.py /usr/bin/waydroid
+    info "restored /usr/bin/waydroid as a symlink to /usr/lib/waydroid/waydroid.py"
+fi
+ok "waydroid entry point pinned to $PYBIN"
 
 # ---- install systemd units, udev rules, tmpfiles, setup script ----
 info "installing host integration files"
