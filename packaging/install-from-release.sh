@@ -284,9 +284,25 @@ else
         info "prebuilts not available in this release — GL will use software fallback"
     fi
 
+    # `sha256sum -c --ignore-missing` only skips entries whose file is absent —
+    # it does NOT care whether the files we downloaded are listed at all. With a
+    # SHA256SUMS that omits our tarballs it prints OK and exits 0, so unverified
+    # bytes would get unpacked into /usr as root. Demand an entry per artifact.
     info "verifying checksums"
-    (cd "$WORK" && sha256sum -c --ignore-missing SHA256SUMS) || die "SHA256 verification failed"
-    ok "checksums verified"
+    SUMS="$WORK/SHA256SUMS"
+    VERIFY_LINES="$WORK/.verify"
+    : > "$VERIFY_LINES"
+    for f in waydroid-nvidia-host-x86_64-${TAG}.tar.gz \
+             waydroid-nvidia-guest-android-x86_64-${TAG}.tar.gz \
+             $([ -f "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" ] \
+                   && echo "waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz"); do
+        # match "<hash>  <name>" or "<hash> *<name>", exact name only
+        if ! grep -E "^[0-9a-fA-F]{64} [ *]?${f//./\\.}\$" "$SUMS" >> "$VERIFY_LINES"; then
+            die "SHA256SUMS has no entry for $f — refusing to install unverified binaries"
+        fi
+    done
+    (cd "$WORK" && sha256sum -c --strict "$VERIFY_LINES") || die "SHA256 verification failed"
+    ok "checksums verified ($(wc -l < "$VERIFY_LINES") artifacts)"
 
     info "installing host binaries to $PREFIX"
     mkdir -p "$PREFIX"
