@@ -1,7 +1,8 @@
-From 5ac882fdcffee78acde29ccd456781828e2e6494 Mon Sep 17 00:00:00 2001
+From bad15eb2ba2b9fb9228cab61ee6ce06d97a3941e Mon Sep 17 00:00:00 2001
 From: test <test@test>
 Date: Sun, 26 Jul 2026 15:57:26 +0800
-Subject: [PATCH] vtest: support exporting sync_file fds for venus sync points
+Subject: [PATCH 1/4] vtest: support exporting sync_file fds for venus sync
+ points
 
 New VCMD_SYNC_EXPORT_SYNC_FILE + VCMD_PARAM_HAS_VENUS_SYNC_FD. The vtest
 server resolves a (sync_id, value) point to the pending timeline submit's
@@ -34,7 +35,7 @@ multi-client Venus) instead of propagating VK_ERROR_TOO_MANY_OBJECTS.
  18 files changed, 381 insertions(+)
 
 diff --git a/server/render_context.c b/server/render_context.c
-index b44b5b5..718b1b5 100644
+index b44b5b58..718b1b52 100644
 --- a/server/render_context.c
 +++ b/server/render_context.c
 @@ -23,6 +23,34 @@ render_context_update_timeline(struct render_context *ctx,
@@ -81,7 +82,7 @@ index b44b5b5..718b1b5 100644
        RENDER_CONTEXT_DISPATCH(DESTROY_RESOURCE, destroy_resource, 0),
        RENDER_CONTEXT_DISPATCH(SUBMIT_CMD, submit_cmd, 0),
 diff --git a/server/render_protocol.h b/server/render_protocol.h
-index cae94a0..ed74a1e 100644
+index cae94a05..ed74a1ec 100644
 --- a/server/render_protocol.h
 +++ b/server/render_protocol.h
 @@ -39,6 +39,7 @@ enum render_context_op {
@@ -135,7 +136,7 @@ index cae94a0..ed74a1e 100644
  
  #ifdef __APPLE__
 diff --git a/server/render_state.c b/server/render_state.c
-index bc7f8e1..e90a289 100644
+index bc7f8e16..e90a289d 100644
 --- a/server/render_state.c
 +++ b/server/render_state.c
 @@ -217,6 +217,13 @@ render_state_submit_fence(uint32_t ctx_id,
@@ -153,7 +154,7 @@ index bc7f8e1..e90a289 100644
  render_state_create_resource(uint32_t ctx_id,
                               uint32_t res_id,
 diff --git a/server/render_state.h b/server/render_state.h
-index 98de272..e271986 100644
+index 98de2722..e2719860 100644
 --- a/server/render_state.h
 +++ b/server/render_state.h
 @@ -32,6 +32,10 @@ render_state_submit_fence(uint32_t ctx_id,
@@ -168,7 +169,7 @@ index 98de272..e271986 100644
  render_state_create_resource(uint32_t ctx_id,
                               uint32_t res_id,
 diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
-index 2780a54..801517d 100644
+index 2780a540..801517dc 100644
 --- a/src/proxy/proxy_context.c
 +++ b/src/proxy/proxy_context.c
 @@ -194,6 +194,79 @@ proxy_context_sync_thread(void *arg)
@@ -260,7 +261,7 @@ index 2780a54..801517d 100644
  
  static bool
 diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
-index 2ea5898..c170bd3 100644
+index 2ea58988..c170bd32 100644
 --- a/src/venus/vkr_context.c
 +++ b/src/venus/vkr_context.c
 @@ -160,6 +160,24 @@ vkr_context_submit_fence(struct vkr_context *ctx,
@@ -289,7 +290,7 @@ index 2ea5898..c170bd3 100644
  vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
  {
 diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
-index 12541a7..7ba72eb 100644
+index 12541a72..7ba72eb8 100644
 --- a/src/venus/vkr_context.h
 +++ b/src/venus/vkr_context.h
 @@ -117,6 +117,13 @@ vkr_context_destroy(struct vkr_context *ctx);
@@ -307,7 +308,7 @@ index 12541a7..7ba72eb 100644
  vkr_context_submit_fence(struct vkr_context *ctx,
                           uint32_t flags,
 diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
-index 61b94be..08c7b07 100644
+index 61b94bef..08c7b07f 100644
 --- a/src/venus/vkr_queue.c
 +++ b/src/venus/vkr_queue.c
 @@ -111,6 +111,62 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
@@ -374,7 +375,7 @@ index 61b94be..08c7b07 100644
  vkr_queue_sync_thread_fini(struct vkr_queue *queue)
  {
 diff --git a/src/venus/vkr_queue.h b/src/venus/vkr_queue.h
-index 6a3a909..5246a5a 100644
+index 6a3a909e..5246a5a2 100644
 --- a/src/venus/vkr_queue.h
 +++ b/src/venus/vkr_queue.h
 @@ -89,6 +89,12 @@ vkr_queue_create(struct vkr_context *ctx,
@@ -391,7 +392,7 @@ index 6a3a909..5246a5a 100644
  vkr_queue_sync_submit(struct vkr_queue *queue,
                        uint32_t flags,
 diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
-index c0335ca..d7eaab3 100644
+index c0335ca5..d7eaab36 100644
 --- a/src/venus/vkr_renderer.c
 +++ b/src/venus/vkr_renderer.c
 @@ -155,6 +155,18 @@ vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size)
@@ -414,7 +415,7 @@ index c0335ca..d7eaab3 100644
  vkr_renderer_submit_fence(uint32_t ctx_id,
                            uint32_t flags,
 diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
-index be3ae04..b606ce6 100644
+index be3ae046..b606ce62 100644
 --- a/src/venus/vkr_renderer.h
 +++ b/src/venus/vkr_renderer.h
 @@ -47,6 +47,10 @@ vkr_renderer_destroy_context(uint32_t ctx_id);
@@ -429,7 +430,7 @@ index be3ae04..b606ce6 100644
  vkr_renderer_submit_fence(uint32_t ctx_id,
                            uint32_t flags,
 diff --git a/src/virgl_context.h b/src/virgl_context.h
-index 25bc106..5db5cc3 100644
+index 25bc1060..5db5cc30 100644
 --- a/src/virgl_context.h
 +++ b/src/virgl_context.h
 @@ -129,6 +129,17 @@ struct virgl_context {
@@ -451,7 +452,7 @@ index 25bc106..5db5cc3 100644
     int (*get_device_fd)(struct virgl_context *ctx);
  
 diff --git a/src/virglrenderer.c b/src/virglrenderer.c
-index fe36775..c82b916 100644
+index fe36775a..c82b916d 100644
 --- a/src/virglrenderer.c
 +++ b/src/virglrenderer.c
 @@ -435,6 +435,20 @@ int virgl_renderer_context_create_fence(uint32_t ctx_id,
@@ -476,7 +477,7 @@ index fe36775..c82b916 100644
  {
     TRACE_FUNC();
 diff --git a/src/virglrenderer.h b/src/virglrenderer.h
-index 0bcafef..f59dd9a 100644
+index 0bcafef4..f59dd9a3 100644
 --- a/src/virglrenderer.h
 +++ b/src/virglrenderer.h
 @@ -457,6 +457,16 @@ VIRGL_EXPORT int virgl_renderer_context_create_fence(uint32_t ctx_id,
@@ -497,7 +498,7 @@ index 0bcafef..f59dd9a 100644
  VIRGL_EXPORT int virgl_renderer_context_get_poll_fd(uint32_t ctx_id);
  
 diff --git a/vtest/vtest.h b/vtest/vtest.h
-index b2708a2..ea3b9bb 100644
+index b2708a20..ea3b9bbd 100644
 --- a/vtest/vtest.h
 +++ b/vtest/vtest.h
 @@ -94,6 +94,7 @@ int vtest_sync_unref(uint32_t length_dw);
@@ -509,7 +510,7 @@ index b2708a2..ea3b9bb 100644
  int vtest_submit_cmd2(uint32_t length_dw);
  
 diff --git a/vtest/vtest_protocol.h b/vtest/vtest_protocol.h
-index 1bd515c..7453e1b 100644
+index 1bd515c5..7453e1b3 100644
 --- a/vtest/vtest_protocol.h
 +++ b/vtest/vtest_protocol.h
 @@ -94,6 +94,9 @@
@@ -559,7 +560,7 @@ index 1bd515c..7453e1b 100644
     VCMD_SUBMIT_CMD2_FLAG_RING_IDX = 1 << 0,
     VCMD_SUBMIT_CMD2_FLAG_IN_FENCE_FD = 1 << 1,
 diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
-index ba4feb1..69b9658 100644
+index ba4feb1a..69b96585 100644
 --- a/vtest/vtest_renderer.c
 +++ b/vtest/vtest_renderer.c
 @@ -966,6 +966,10 @@ int vtest_get_param(UNUSED uint32_t length_dw)
@@ -650,7 +651,7 @@ index ba4feb1..69b9658 100644
  {
     struct vtest_context *ctx = vtest_get_current_context();
 diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
-index 64a29e1..0d11ec8 100644
+index 64a29e1a..0d11ec89 100644
 --- a/vtest/vtest_server.c
 +++ b/vtest/vtest_server.c
 @@ -730,6 +730,7 @@ static const struct vtest_command {

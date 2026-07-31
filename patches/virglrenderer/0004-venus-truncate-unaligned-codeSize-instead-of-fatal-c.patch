@@ -1,0 +1,53 @@
+From 0cdeee6d841d45e2709f6eb6b1ac9cf40595ab05 Mon Sep 17 00:00:00 2001
+From: QuinOvaX <cinqwqeggs01@outlook.com>
+Date: Fri, 31 Jul 2026 21:02:24 +0800
+Subject: [PATCH 4/4] venus: truncate unaligned codeSize instead of fatal
+ context kill
+
+Android apps compiled with some toolchains (AnTuTu, Geekbench 6) send
+vkCreateShaderModule with codeSize not divisible by 4.  The venus
+encoder/decoder already truncates the transmitted payload to codeSize&~3,
+so the driver never sees the extra bytes anyway.  Calling
+vkr_context_set_fatal() here poisoned the whole Vulkan context, causing
+every subsequent vkCreateGraphicsPipelines to fail with CS error and
+producing a black-screen / crash in all 3-D benchmarks.
+
+Truncate codeSize to the nearest 4-byte boundary and log a warning
+instead.  Remove the now-unused local ctx variable.
+---
+ src/venus/vkr_pipeline.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index 76709b9b..9e8dd26d 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -11,7 +11,6 @@ static void
+ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkCreateShaderModule *args)
+ {
+-   struct vkr_context *ctx = dispatch->data;
+ 
+    /* Reject invalid codeSize.
+     *
+@@ -37,8 +36,15 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
+     * validating codeSize here.
+     */
+    if (args->pCreateInfo->codeSize % 4 != 0) {
+-      vkr_context_set_fatal(ctx);
+-      return;
++      /* The venus encoder/decoder already transmitted only codeSize & ~3 bytes,
++       * so the driver would read out-of-bounds if we passed the unaligned size.
++       * Truncate to the nearest 4-byte boundary instead of fatally killing the
++       * whole Vulkan context (which broke every subsequent pipeline creation,
++       * causing AnTuTu 3D / Geekbench GPU tests to black-screen or crash). */
++      vkr_log("vkCreateShaderModule: codeSize %zu not 4-byte aligned, truncating to %zu",
++              args->pCreateInfo->codeSize,
++              args->pCreateInfo->codeSize & ~(size_t)3);
++      ((VkShaderModuleCreateInfo *)args->pCreateInfo)->codeSize &= ~(size_t)3;
+    }
+ 
+    vkr_shader_module_create_and_add(dispatch->data, args);
+-- 
+2.55.0
+

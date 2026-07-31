@@ -1,7 +1,7 @@
-From e8a33ed6a4489fed52d1f15300f83af5b80694d8 Mon Sep 17 00:00:00 2001
+From 520e8e6ac6b02405ef37cca5c5ce422b7dcaaa4c Mon Sep 17 00:00:00 2001
 From: forsen <gazikkamalov2@gmail.com>
 Date: Fri, 10 Jul 2026 20:06:20 +0300
-Subject: [PATCH 2/3] vtest: support importing dmabufs as blob resources for
+Subject: [PATCH 2/4] vtest: support importing dmabufs as blob resources for
  venus
 
 New VCMD_RESOURCE_IMPORT_BLOB: receives a dmabuf fd over SCM_RIGHTS,
@@ -20,7 +20,7 @@ client learns the res_id.
  5 files changed, 115 insertions(+)
 
 diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
-index 801517d..b718ef2 100644
+index 801517dc..b718ef25 100644
 --- a/src/proxy/proxy_context.c
 +++ b/src/proxy/proxy_context.c
 @@ -205,6 +205,29 @@ proxy_context_export_fence(struct virgl_context *base,
@@ -54,7 +54,7 @@ index 801517d..b718ef2 100644
      * it is no longer pending it has retired -> already signaled
      */
 diff --git a/vtest/vtest.h b/vtest/vtest.h
-index ea3b9bb..fa74075 100644
+index ea3b9bbd..fa74075a 100644
 --- a/vtest/vtest.h
 +++ b/vtest/vtest.h
 @@ -95,6 +95,7 @@ int vtest_sync_read(uint32_t length_dw);
@@ -66,7 +66,7 @@ index ea3b9bb..fa74075 100644
  int vtest_submit_cmd2(uint32_t length_dw);
  
 diff --git a/vtest/vtest_protocol.h b/vtest/vtest_protocol.h
-index 7453e1b..3a7381f 100644
+index 7453e1b3..3a7381f7 100644
 --- a/vtest/vtest_protocol.h
 +++ b/vtest/vtest_protocol.h
 @@ -96,6 +96,8 @@
@@ -96,7 +96,7 @@ index 7453e1b..3a7381f 100644
     VCMD_SUBMIT_CMD2_FLAG_RING_IDX = 1 << 0,
     VCMD_SUBMIT_CMD2_FLAG_IN_FENCE_FD = 1 << 1,
 diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
-index 69b9658..f3212ad 100644
+index 69b96585..f3212ad7 100644
 --- a/vtest/vtest_renderer.c
 +++ b/vtest/vtest_renderer.c
 @@ -2413,6 +2413,84 @@ out:
@@ -185,7 +185,7 @@ index 69b9658..f3212ad 100644
  {
     struct vtest_context *ctx = vtest_get_current_context();
 diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
-index 0d11ec8..8685d33 100644
+index 0d11ec89..8685d335 100644
 --- a/vtest/vtest_server.c
 +++ b/vtest/vtest_server.c
 @@ -731,6 +731,7 @@ static const struct vtest_command {
