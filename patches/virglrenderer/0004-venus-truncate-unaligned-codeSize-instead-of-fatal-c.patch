@@ -1,7 +1,7 @@
 From 0cdeee6d841d45e2709f6eb6b1ac9cf40595ab05 Mon Sep 17 00:00:00 2001
 From: QuinOvaX <cinqwqeggs01@outlook.com>
 Date: Fri, 31 Jul 2026 21:02:24 +0800
-Subject: [PATCH 4/4] venus: truncate unaligned codeSize instead of fatal
+Subject: [PATCH 4/5] venus: truncate unaligned codeSize instead of fatal
  context kill
 
 Android apps compiled with some toolchains (AnTuTu, Geekbench 6) send
