@@ -20,10 +20,10 @@ say "mesa: 0001,0002 (committed) + 0003 (wip)"
 fmt "$MESA_TREE" "$MESA_BASE" "$REPO/patches/mesa"
 diffto "$MESA_TREE" "$REPO/patches/mesa/0003-wip-ahb-memory-steering.patch"
 
-say "virglrenderer: 0001-0003 (committed) + 0004 (wip) + net-new src"
+say "virglrenderer: 0001-0004 (committed) + 0005 (wip) + net-new src"
 fmt "$VIRGL_TREE" "$VIRGL_BASE" "$REPO/patches/virglrenderer"
-# 0004 = tracked WIP only (untracked gpu-alloc files are shipped as net-new src)
-diffto "$VIRGL_TREE" "$REPO/patches/virglrenderer/0004-wip-gpu-alloc-and-global-priority.patch"
+# 0005 = tracked WIP only (untracked gpu-alloc files are shipped as net-new src)
+diffto "$VIRGL_TREE" "$REPO/patches/virglrenderer/0005-wip-gpu-alloc-and-global-priority.patch"
 cp "$VIRGL_TREE/vtest/vtest_gpu_alloc.c" "$REPO/src/virglrenderer-vtest/"
 cp "$VIRGL_TREE/vtest/vtest_gpu_alloc.h" "$REPO/src/virglrenderer-vtest/"
 [ -f "$VIRGL_TREE/vtest/vtest_alloc_formats.h" ] && cp "$VIRGL_TREE/vtest/vtest_alloc_formats.h" "$REPO/src/"
