@@ -1,0 +1,129 @@
+From f788639ae383f9140bb4df6e53f90496a1308632 Mon Sep 17 00:00:00 2001
+From: QuinOvaX <cinqwqeggs01@outlook.com>
+Date: Fri, 31 Jul 2026 22:00:27 +0800
+Subject: [PATCH 5/5] venus: retry vkCreateDevice without
+ virglrenderer-appended extensions on -3
+
+VK_ERROR_INITIALIZATION_FAILED (-3) is occasionally returned by NVIDIA
+drivers when the combined extension list (guest + virglrenderer-appended
+KHR_external_memory_fd / EXT_external_memory_dma_buf / KHR_external_fence_fd)
+is used.  The NOT_PERMITTED retry already strips the global queue priority
+chain; add a parallel path for -3 that falls back to the guest's original
+extension list.
+
+If the retry succeeds the session stays alive (dmabuf/fence-fd import
+disabled for that device instance only); if it still fails the error path
+logs the full list as before.  Save guest_ext_count / guest_exts_ptr
+before the append block so the original pointers are available at retry
+time.
+---
+ src/venus/vkr_device.c | 71 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
+
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 3e943bfd..a8c6d72f 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -108,6 +108,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          const uint32_t queue_count = args->pCreateInfo->pQueueCreateInfos[i].queueCount;
+ 
+          if (queue_family_index >= physical_dev->queue_family_property_count) {
++            vkr_log("CreateDevice: bad queueFamilyIndex %u (families %u)",
++                    queue_family_index, physical_dev->queue_family_property_count);
+             args->ret = VK_ERROR_UNKNOWN;
+             break;
+          }
+@@ -117,6 +119,9 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+ 
+          if (queue_family_properties->queueCount - counts[queue_family_index] <
+              queue_count) {
++            vkr_log("CreateDevice: family %u queueCount %u exceeds available %u",
++                    queue_family_index, queue_count,
++                    queue_family_properties->queueCount - counts[queue_family_index]);
+             args->ret = VK_ERROR_UNKNOWN;
+             break;
+          }
+@@ -128,6 +133,11 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          return;
+    }
+ 
++   /* Save the guest's original extension list before we append our own so
++    * that the VK_ERROR_INITIALIZATION_FAILED retry path can fall back to it. */
++   const uint32_t guest_ext_count = args->pCreateInfo->enabledExtensionCount;
++   const char * const *guest_exts_ptr = args->pCreateInfo->ppEnabledExtensionNames;
++
+    /* append extensions for our own use */
+    const char **exts = NULL;
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
+@@ -176,7 +186,68 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    vn_replace_vkCreateDevice_args_handle(args);
+    args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
+                                 &dev->base.handle.device);
++
++   /* Android clients (HWUI) request a global queue priority and expect it to
++    * be honored best-effort, but desktop drivers (NVIDIA) reject unprivileged
++    * priority requests with NOT_PERMITTED. Retry without the priority chain.
++    */
++   if (args->ret == VK_ERROR_NOT_PERMITTED_KHR) {
++      bool stripped = false;
++      for (uint32_t i = 0; i < args->pCreateInfo->queueCreateInfoCount; i++) {
++         VkDeviceQueueCreateInfo *qci =
++            (VkDeviceQueueCreateInfo *)&args->pCreateInfo->pQueueCreateInfos[i];
++         VkBaseOutStructure *prev = (VkBaseOutStructure *)qci;
++         for (VkBaseOutStructure *s = prev->pNext; s; s = s->pNext) {
++            if (s->sType ==
++                VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR) {
++               prev->pNext = s->pNext;
++               stripped = true;
++            } else {
++               prev = s;
++            }
++         }
++      }
++      if (stripped) {
++         vkr_log("CreateDevice: NOT_PERMITTED; retrying without global queue "
++                 "priority");
++         args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo,
++                                      NULL, &dev->base.handle.device);
++      }
++   }
++
++   /* NVIDIA occasionally returns VK_ERROR_INITIALIZATION_FAILED (-3) for the
++    * combined extension list.  The virglrenderer-appended extensions
++    * (KHR_external_memory_fd, EXT_external_memory_dma_buf, KHR_external_fence_fd,
++    * …) are the most likely culprit because they were not present in the
++    * original guest request.  Retry with only the guest's list to isolate
++    * whether a virglrenderer-added extension is the cause.
++    *
++    * If the retry succeeds we lose dmabuf/fence-fd import for this device
++    * instance, but the session stays alive — which is far better than a crash.
++    * If it still fails we fall through to the error path with full logging.
++    */
++   if (args->ret == VK_ERROR_INITIALIZATION_FAILED && exts != NULL) {
++      vkr_log("CreateDevice: VK_ERROR_INITIALIZATION_FAILED with %u extensions "
++              "(guest %u + virglrenderer %u); retrying with guest-only list",
++              args->pCreateInfo->enabledExtensionCount,
++              guest_ext_count,
++              args->pCreateInfo->enabledExtensionCount - guest_ext_count);
++      ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames =
++         guest_exts_ptr;
++      ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount =
++         guest_ext_count;
++      args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo,
++                                   NULL, &dev->base.handle.device);
++      if (args->ret == VK_SUCCESS)
++         vkr_log("CreateDevice: guest-only retry succeeded — "
++                 "dmabuf/fence-fd import disabled for this device");
++   }
++
+    if (args->ret != VK_SUCCESS) {
++      vkr_log("CreateDevice: host driver returned %d (extCount=%u)", args->ret,
++              args->pCreateInfo->enabledExtensionCount);
++      for (uint32_t i = 0; i < args->pCreateInfo->enabledExtensionCount; i++)
++         vkr_log("  ext[%u]: %s", i, args->pCreateInfo->ppEnabledExtensionNames[i]);
+       free(exts);
+       free(dev);
+       return;
+-- 
+2.55.0
+
