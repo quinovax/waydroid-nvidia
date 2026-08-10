@@ -128,7 +128,7 @@ install_build_deps_fedora() {
 install_build_deps_arch() {
     info "installing Arch build dependencies"
     pacman -Syq --noconfirm --needed meson ninja gcc cmake pkgconf \
-        libdrm libgbm libepoxy vulkan-headers \
+        libdrm mesa libepoxy vulkan-headers \
         wayland wayland-protocols \
         libx11 libxrandr libxfixes \
         python-mako python-packaging python-yaml \
