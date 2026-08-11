@@ -57,7 +57,7 @@ PA_PKG="pulseaudio"
 case "$DISTRO" in
     debian) dpkg -s pipewire-pulseaudio &>/dev/null && PA_PKG="" ;;
     fedora) rpm -q  pipewire-pulseaudio &>/dev/null && PA_PKG="" ;;
-    arch)   pacman -Qi pipewire-pulseaudio &>/dev/null && PA_PKG="" ;;
+    arch)   pacman -Qi pipewire-pulse &>/dev/null && PA_PKG="" ;;
 esac
 [ -z "$PA_PKG" ] && info "pipewire-pulseaudio detected — skipping traditional pulseaudio package"
 
@@ -128,7 +128,7 @@ install_build_deps_fedora() {
 install_build_deps_arch() {
     info "installing Arch build dependencies"
     pacman -Syq --noconfirm --needed meson ninja gcc cmake pkgconf \
-        libdrm libgbm libepoxy vulkan-headers \
+        libdrm mesa libepoxy vulkan-headers \
         wayland wayland-protocols \
         libx11 libxrandr libxfixes \
         python-mako python-packaging python-yaml \
