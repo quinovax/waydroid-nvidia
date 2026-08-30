@@ -19,9 +19,19 @@ every buffer it shows must be NVIDIA-native:
 - NVIDIA **exports** dma_buf from `VkDeviceMemory` (optimal and linear).
 
 So the guest allocates its buffers **through the host NVIDIA driver** over the
-socket, and never lets guest Mesa pick modifiers blindly. NVIDIA LINEAR is
-external-only (undisplayable); **block-linear** binds as `GL_TEXTURE_2D`, so GPU
-buffers use block-linear DRM modifiers.
+socket, and never lets guest Mesa pick modifiers blindly.
+
+Which modifier depends on who composites:
+
+- **Compositor on NVIDIA** (discrete card, or the display wired to NVIDIA):
+  NVIDIA LINEAR is external-only (`GL_TEXTURE_EXTERNAL_OES`); **block-linear**
+  binds as `GL_TEXTURE_2D`, so GPU buffers use block-linear DRM modifiers.
+- **Compositor on an iGPU** (hybrid laptop panel on Intel/AMD): the iGPU
+  cannot import NVIDIA block-linear. GPU buffers are exported as **NVIDIA
+  LINEAR**, which Intel/AMD bind as `GL_TEXTURE_2D` (`tests/crossimport.c`).
+  Detected from DRM connectors / `boot_vga`; override with
+  `WAYDROID_NVIDIA_PRESENT=linear|block-linear`. The host renderer logs the
+  chosen path on first alloc (`vtest_gpu_alloc: present=...`).
 
 ## The pipeline
 

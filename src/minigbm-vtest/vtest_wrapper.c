@@ -301,6 +301,16 @@ have_resp:;
    args->out_stride = d[1];
    args->out_map_stride = d[2];
    args->out_modifier = d[3] | (uint64_t)d[4] << 32;
+
+   {
+      static int alloc_log_n;
+      int n = alloc_log_n++;
+      if (n < 16 || (n % 128) == 0)
+         LOGI("alloc %ux%u fmt=%s flags=0x%x stride=%u mod=0x%llx (#%d)",
+              args->width, args->height, vtest_format_name(args->drm_format),
+              flags, args->out_stride,
+              (unsigned long long)args->out_modifier, n);
+   }
    return 0;
 }
 
