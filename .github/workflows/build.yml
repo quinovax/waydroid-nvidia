@@ -323,10 +323,10 @@ jobs:
             cp -a artifacts/guest-angle/. prebuilts/
             cp -a artifacts/guest-surfaceflinger/. prebuilts/
           else
-            echo "::warning::ANGLE/surfaceflinger artifacts missing — fetching Shiro836 v0.1.2 fallback"
+            echo "::warning::ANGLE/surfaceflinger artifacts missing — fetching this repo's v0.1.1 prebuilts"
             curl -fSL -o prebuilts-fallback.tar.zst \
-              https://github.com/Shiro836/waydroid-nvidia/releases/download/v0.1.2/waydroid-nvidia-guest-prebuilts-v0.1.2.tar.zst
-            echo "61899f56c203b750d41f7c141a1ee264cb68241748cc9cda512ed45f2997cbd1  prebuilts-fallback.tar.zst" | sha256sum -c -
+              https://github.com/CinQwQeggs01/waydroid-nvidia/releases/download/v0.1.1/waydroid-nvidia-guest-prebuilts-v0.1.1.tar.zst
+            echo "380c4e804b4ea9c61fa83613d63d1850812cc5484e1271e90005542e18f7ad12  prebuilts-fallback.tar.zst" | sha256sum -c -
             mkdir -p fallback && tar --zstd -C fallback -xf prebuilts-fallback.tar.zst
             # Keep this job's hwcomposer (NVIDIA patches) over the fallback copy.
             if [ -d artifacts/guest-hwcomposer ]; then

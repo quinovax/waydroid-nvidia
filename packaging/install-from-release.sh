@@ -8,7 +8,7 @@
 #
 # Usage:
 #   curl -fsSL .../install-from-release.sh | sudo bash                       # latest release
-#   curl -fsSL .../install-from-release.sh | sudo bash -s -- --tag v0.1.2    # specific release
+#   curl -fsSL .../install-from-release.sh | sudo bash -s -- --tag v0.1.1    # specific release
 #   sudo ./install-from-release.sh --source [--tag v0.1.0]                   # build from source
 #   pkexec ./packaging/install-from-release.sh --local "$PWD" --skip-build   # deploy this checkout
 set -euo pipefail
@@ -21,11 +21,11 @@ SOURCE=0
 LOCAL=""
 SKIP_BUILD=0
 # ANGLE / hwcomposer / surfaceflinger are built on a self-hosted runner this
-# fork does not have. When a tag ships without guest-prebuilts, reuse the
-# last known-good upstream tarball (issues #2 and #5).
-PREBUILTS_FALLBACK_URL="https://github.com/Shiro836/waydroid-nvidia/releases/download/v0.1.2"
-PREBUILTS_FALLBACK_FILE="waydroid-nvidia-guest-prebuilts-v0.1.2.tar.zst"
-PREBUILTS_FALLBACK_SHA256="61899f56c203b750d41f7c141a1ee264cb68241748cc9cda512ed45f2997cbd1"
+# fork does not have. When a tag ships without guest-prebuilts, reuse this
+# repository's last release that includes them.
+PREBUILTS_FALLBACK_URL="https://github.com/CinQwQeggs01/waydroid-nvidia/releases/download/v0.1.1"
+PREBUILTS_FALLBACK_FILE="waydroid-nvidia-guest-prebuilts-v0.1.1.tar.gz"
+PREBUILTS_FALLBACK_SHA256="a3f49671dd460134f38433c7a89b8916bc95329c68f413bd94c1c22a5ab48ca6"
 
 die()  { echo "FATAL: $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*"; }
@@ -419,12 +419,13 @@ else
             die "failed to download $f — release may not exist for $TAG (try --source)"
     done
     # prebuilts (ANGLE, hwcomposer, surfaceflinger) — fetched from this tag
-    # when present, otherwise install_prebuilts() falls back to upstream v0.1.2
+    # when present, otherwise install_prebuilts() falls back to this repo's
+    # last release that ships them.
     if curl -fSL "$BASE_URL/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" \
             -o "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" 2>/dev/null; then
         info "prebuilts (ANGLE/hwcomposer/surfaceflinger) downloaded"
     else
-        info "prebuilts not in $TAG — will use the Shiro836 v0.1.2 fallback"
+        info "prebuilts not in $TAG — will use this repo's $PREBUILTS_FALLBACK_FILE fallback"
     fi
 
     # `sha256sum -c --ignore-missing` only skips entries whose file is absent —

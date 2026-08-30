@@ -55,26 +55,33 @@ sudo waydroid shell getprop ro.product.cpu.abilist
 # x86_64,x86,... means Houdini can translate ARM32-only apps into the x86 path
 ```
 
-**If your compositor is not on the NVIDIA GPU** (monitors connected to
-another GPU, iGPU-driven laptop panel): the compositor can't display this
-stack's NVIDIA buffers and the Waydroid window dies instantly. The workaround
-is running Waydroid nested inside gamescope pinned to the NVIDIA GPU, so
-compositing happens on NVIDIA and gamescope hands your desktop something it
-can display. Needs `gamescope` and `wayland-utils`:
+**Hybrid GPUs** (laptop panel on Intel/AMD, NVIDIA as the render GPU): the
+iGPU compositor cannot import NVIDIA **block-linear** dmabufs, which is why
+the Waydroid window used to die instantly. The host allocator now detects
+that topology and exports **NVIDIA LINEAR** presentation buffers instead
+(Intel/AMD can import those as `GL_TEXTURE_2D`; see `tests/crossimport.c`).
+Discrete NVIDIA (this is the compositor GPU) still uses block-linear.
+
+Check which path was chosen:
 
 ```sh
-waydroid session stop; sleep 5
-W=$(wayland-info | grep -B1 'flags: current' | grep -oP 'width:\s*\K\d+' | head -1)
-H=$(wayland-info | grep -B1 'flags: current' | grep -oP 'height:\s*\K\d+' | head -1)
-GPU=$(lspci -nn | grep -Ei 'vga|3d' | grep -i nvidia | grep -oP '\[\K10de:[0-9a-f]{4}' | head -1)
-gamescope -f -W "$W" -H "$H" --prefer-vk-device "$GPU" -- \
-  sh -c 'WAYLAND_DISPLAY=$GAMESCOPE_WAYLAND_DISPLAY exec waydroid show-full-ui'
+journalctl --user -u wd-venus --since '2 min ago' --no-pager | grep vtest_gpu_alloc
+# hybrid:   present=nvidia-linear  ... path=nvidia-linear modifier=0x0
+# discrete: present=block-linear   ... path=block-linear  modifier=0x03...
 ```
 
-Launch apps from inside Android while nested (`waydroid app launch` swaps the
-window and crashes gamescope). **Broken on hybrid Intel+NVIDIA laptops right
-now** — gamescope crashes and takes the host session down with it
-(issue #2, upstream gamescope#1590); hybrid support is being worked on there.
+Override if auto-detect is wrong (`linear` on an iGPU-compositor box,
+`block-linear` when KWin/Mutter is on NVIDIA):
+
+```sh
+systemctl --user edit wd-venus.service
+# [Service]
+# Environment=WAYDROID_NVIDIA_PRESENT=linear
+systemctl --user daemon-reload && systemctl --user restart wd-venus.service
+```
+
+Nesting Waydroid in gamescope pinned to NVIDIA is **not** the hybrid path —
+it still crashes and can take the host session with it (gamescope#1590).
 
 ### Install from the latest release (recommended)
 
@@ -92,7 +99,7 @@ SELinux policy (rpm family).
 To install a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash -s -- --tag v0.1.2
+curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash -s -- --tag v0.1.1
 ```
 
 ### Install from a tag (build from source)
@@ -112,8 +119,8 @@ virglrenderer (host renderer) from source, and installs everything.
 
 **Note:** ANGLE, hwcomposer, and surfaceflinger are not built by
 `--source`. The installer fetches the `guest-prebuilts` tarball from the
-same tag when it exists, and otherwise falls back to the last known-good
-upstream asset (`Shiro836/waydroid-nvidia` v0.1.2). `waydroid-nvidia-setup`
+same tag when it exists, and otherwise from this repository's latest
+release that ships them (currently `v0.1.1`). `waydroid-nvidia-setup`
 requires those files — a stock install without them cannot pass payload
 validation.
 
