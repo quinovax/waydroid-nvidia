@@ -54,10 +54,11 @@ wire round-trip barrier.
 can't bind them. So gralloc allocates *through the host*.
 
 - New host allocator `src/virglrenderer-vtest/vtest_gpu_alloc.c`: GPU buffers as
-  exportable `VkImage`s with real NVIDIA **block-linear** DRM modifiers (LINEAR is
-  external-only on NVIDIA EGL ⇒ undisplayable; block-linear binds as
-  `GL_TEXTURE_2D`). CPU-mappable buffers as NVIDIA linear images (or udmabuf
-  fallback).
+  exportable `VkImage`s. On a NVIDIA compositor they use real NVIDIA
+  **block-linear** DRM modifiers (LINEAR is external-only on NVIDIA EGL ⇒
+  undisplayable; block-linear binds as `GL_TEXTURE_2D`). On an iGPU compositor
+  (hybrid) they use **NVIDIA LINEAR**, which Intel/AMD can import. CPU-mappable
+  buffers as NVIDIA linear images (or udmabuf fallback).
 - Guest gralloc backend `src/minigbm-vtest/vtest_wrapper.c` replaces
   `libgbm_mesa_wrapper.so` — allocations go over the socket instead of guest libgbm.
 

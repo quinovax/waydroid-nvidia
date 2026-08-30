@@ -30,6 +30,44 @@ sudo -v; ( nvidia-smi -L; systemctl --user restart wd-venus; waydroid session st
 Skim it for personal data (a fresh crash-looping boot normally contains
 none), then attach it to an issue.
 
+## Hybrid display verification
+
+On a box with an Intel/AMD iGPU driving the panel and NVIDIA doing the
+render, the first gralloc alloc dumps the DRM topology and the chosen
+presentation path to the `wd-venus` journal. After `show-full-ui`:
+
+```sh
+journalctl --user -u wd-venus --since '2 min ago' --no-pager | grep vtest_gpu_alloc
+```
+
+Healthy hybrid:
+
+```
+vtest_gpu_alloc: === presentation topology (hybrid issue #2) ===
+vtest_gpu_alloc:   card0 vendor=0x8086 (Intel) driver=i915 boot_vga=1 connected=yes [eDP-1]
+vtest_gpu_alloc:   card1 vendor=0x10de (NVIDIA) driver=nvidia boot_vga=0 connected=no
+vtest_gpu_alloc:   present=nvidia-linear  reason=non-NVIDIA GPU has the only connected display (iGPU compositor)
+vtest_gpu_alloc: gpu 1920x1080 ARGB8888 path=nvidia-linear hostvis=0 modifier=0x0 ...
+```
+
+Healthy discrete NVIDIA (no iGPU compositor): `present=block-linear` and
+`modifier=0x03...`. If a hybrid box chose `block-linear`, force LINEAR:
+
+```sh
+systemctl --user edit wd-venus.service
+# [Service]
+# Environment=WAYDROID_NVIDIA_PRESENT=linear
+systemctl --user daemon-reload
+systemctl --user restart wd-venus.service
+```
+
+Do **not** set `=linear` on a machine whose compositor is on NVIDIA — KWin
+cannot bind LINEAR as `GL_TEXTURE_2D` and the window goes black.
+
+The probe `tests/crossimport.c` (`gcc -O1 -o crossimport tests/crossimport.c -lEGL -lGLESv2 -lgbm -ldl`)
+checks whether this iGPU can import NVIDIA LINEAR at all, without starting
+Waydroid.
+
 ## Known failure modes
 
 | Symptom | Cause | Fix |
@@ -44,6 +82,8 @@ none), then attach it to an issue.
 | ARM32-only app runs on LLVM/Lavapipe while the desktop is accelerated | The 32-bit `vendor/lib/hw/vulkan.virtio.so` is missing or is a renamed `vulkan.lvp.so` | Install a dual-ABI release and re-run `sudo waydroid-nvidia-setup`; it requires ELF32/`EM_386` for every `vendor/lib` payload |
 | `waydroid` dies instantly with `ModuleNotFoundError: No module named 'dbus'` (or `gi`, `gbinder`) | `/usr/bin/waydroid` used `#!/usr/bin/env python3`, and a user-local python (Homebrew/linuxbrew, pyenv, conda, `~/.local`) earlier in `PATH` shadows the system interpreter that owns the bindings | Re-run the installer (it now pins the shebang to an absolute system python), or fix it in place: `sudo sed -i '1s\|^#!.*\|#!/usr/bin/python3\|' /usr/lib/waydroid/waydroid.py` — edit **only** that file, never `/usr/bin/waydroid` (see next row) |
 | `ModuleNotFoundError: No module named 'tools'` | `/usr/bin/waydroid` is supposed to be a symlink to `/usr/lib/waydroid/waydroid.py`; that link is what makes `sys.path[0]` the waydroid dir. Editing it in place (`sed -i`, some editors) replaces the link with a plain copy under `/usr/bin`, where `tools/` does not exist | Restore the link: `sudo ln -sfn ../lib/waydroid/waydroid.py /usr/bin/waydroid` |
+| Hybrid laptop: Waydroid window dies instantly / black, KWin/Mutter logs `INVALID_WL_BUFFER` or "unsupported modifier" | iGPU compositor cannot import NVIDIA **block-linear** dmabufs | Host `wd-venus` must log `present=nvidia-linear` and allocs with `modifier=0x0`. If it chose `block-linear`, force it: `systemctl --user edit wd-venus.service` → `[Service]` `Environment=WAYDROID_NVIDIA_PRESENT=linear`, then `daemon-reload` + restart `wd-venus` and the session. Collect `journalctl --user -u wd-venus --since '2 min ago' \| grep vtest_gpu_alloc` |
+| Discrete NVIDIA: window black after setting `WAYDROID_NVIDIA_PRESENT=linear` | NVIDIA EGL cannot bind LINEAR as `GL_TEXTURE_2D` | Unset the override (or set `=block-linear`). LINEAR is only for iGPU compositors |
 
 For a translated app, confirm its process maps the 32-bit stack (replace the
 package name if needed):

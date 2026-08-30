@@ -4,6 +4,7 @@
 #include "vtest_gpu_alloc.h"
 #include "vtest_alloc_formats.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -21,6 +23,249 @@
 #include <vulkan/vulkan.h>
 
 #define ALLOC_ALIGN(v, a) (((v) + (a)-1) & ~((uint64_t)(a)-1))
+
+/* Presentation path for hybrid GPUs (issue #2 / gamescope#1590).
+ *
+ * Discrete NVIDIA compositor: block-linear. NVIDIA EGL binds LINEAR only
+ * as GL_TEXTURE_EXTERNAL_OES; KWin samples RGB as GL_TEXTURE_2D.
+ *
+ * iGPU compositor: NVIDIA LINEAR. Intel/AMD import LINEAR dma_bufs as
+ * GL_TEXTURE_2D (tests/crossimport.c). NVIDIA block-linear is not in the
+ * iGPU compositor's zwp_linux_dmabuf list, so attaching it is a fatal
+ * Wayland protocol error.
+ *
+ * Override: WAYDROID_NVIDIA_PRESENT=linear|block-linear
+ */
+enum present_mode {
+   PRESENT_BLOCK_LINEAR = 0,
+   PRESENT_NVIDIA_LINEAR = 1,
+};
+
+static enum present_mode g_present_mode = PRESENT_BLOCK_LINEAR;
+static pthread_once_t g_present_once = PTHREAD_ONCE_INIT;
+static unsigned g_alloc_log_n;
+
+static const char *
+pci_vendor_name(unsigned vendor)
+{
+   switch (vendor) {
+   case 0x10de:
+      return "NVIDIA";
+   case 0x8086:
+      return "Intel";
+   case 0x1002:
+      return "AMD";
+   default:
+      return "other";
+   }
+}
+
+static bool
+read_sysfs_u(const char *path, unsigned *out)
+{
+   FILE *f = fopen(path, "r");
+   if (!f)
+      return false;
+   unsigned v = 0;
+   int n = fscanf(f, "%x", &v);
+   fclose(f);
+   if (n != 1)
+      return false;
+   *out = v;
+   return true;
+}
+
+static bool
+read_sysfs_line(const char *path, char *buf, size_t buflen)
+{
+   FILE *f = fopen(path, "r");
+   if (!f)
+      return false;
+   if (!fgets(buf, (int)buflen, f)) {
+      fclose(f);
+      return false;
+   }
+   fclose(f);
+   size_t n = strlen(buf);
+   while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+      buf[--n] = '\0';
+   return n > 0;
+}
+
+static bool
+is_drm_card(const char *name)
+{
+   if (strncmp(name, "card", 4) != 0)
+      return false;
+   const char *p = name + 4;
+   if (*p < '0' || *p > '9')
+      return false;
+   for (; *p; p++) {
+      if (*p < '0' || *p > '9')
+         return false;
+   }
+   return true;
+}
+
+static void
+present_init(void)
+{
+   bool nvidia_connected = false;
+   bool other_connected = false;
+   bool other_present = false;
+   bool boot_vga_nvidia = false;
+   bool boot_vga_other = false;
+
+   fprintf(stderr, "vtest_gpu_alloc: === presentation topology (hybrid issue #2) ===\n");
+
+   DIR *dir = opendir("/sys/class/drm");
+   if (!dir) {
+      fprintf(stderr, "vtest_gpu_alloc:   cannot open /sys/class/drm (%s)\n",
+              strerror(errno));
+   } else {
+      struct dirent *ent;
+      while ((ent = readdir(dir))) {
+         if (!is_drm_card(ent->d_name))
+            continue;
+
+         char path[320];
+         unsigned vendor = 0;
+         snprintf(path, sizeof(path), "/sys/class/drm/%s/device/vendor",
+                  ent->d_name);
+         if (!read_sysfs_u(path, &vendor))
+            continue;
+
+         char driver[64] = "?";
+         snprintf(path, sizeof(path), "/sys/class/drm/%s/device/driver",
+                  ent->d_name);
+         char link[256];
+         ssize_t n = readlink(path, link, sizeof(link) - 1);
+         if (n > 0) {
+            link[n] = '\0';
+            const char *slash = strrchr(link, '/');
+            const char *src = slash ? slash + 1 : link;
+            snprintf(driver, sizeof(driver), "%.*s", (int)sizeof(driver) - 1, src);
+         }
+
+         unsigned boot = 0;
+         snprintf(path, sizeof(path), "/sys/class/drm/%s/device/boot_vga",
+                  ent->d_name);
+         read_sysfs_u(path, &boot);
+
+         bool nvidia = (vendor == 0x10de);
+         char conn[192] = "";
+         bool connected = false;
+
+         DIR *conns = opendir("/sys/class/drm");
+         if (conns) {
+            char prefix[64];
+            if ((size_t)snprintf(prefix, sizeof(prefix), "%s-", ent->d_name) >=
+                sizeof(prefix)) {
+               closedir(conns);
+               continue;
+            }
+            size_t plen = strlen(prefix);
+            struct dirent *c;
+            while ((c = readdir(conns))) {
+               if (strncmp(c->d_name, prefix, plen) != 0)
+                  continue;
+               snprintf(path, sizeof(path), "/sys/class/drm/%s/status",
+                        c->d_name);
+               char st[32];
+               if (!read_sysfs_line(path, st, sizeof(st)))
+                  continue;
+               if (strcmp(st, "connected") != 0)
+                  continue;
+               connected = true;
+               size_t used = strlen(conn);
+               snprintf(conn + used, sizeof(conn) - used, "%s%s",
+                        used ? "," : "", c->d_name + plen);
+            }
+            closedir(conns);
+         }
+
+         fprintf(stderr,
+                 "vtest_gpu_alloc:   %s vendor=0x%04x (%s) driver=%s boot_vga=%u connected=%s",
+                 ent->d_name, vendor, pci_vendor_name(vendor), driver, boot,
+                 connected ? "yes" : "no");
+         if (connected)
+            fprintf(stderr, " [%s]", conn);
+         fprintf(stderr, "\n");
+
+         if (nvidia) {
+            if (connected)
+               nvidia_connected = true;
+            if (boot)
+               boot_vga_nvidia = true;
+         } else {
+            other_present = true;
+            if (connected)
+               other_connected = true;
+            if (boot)
+               boot_vga_other = true;
+         }
+      }
+      closedir(dir);
+   }
+
+   const char *env = getenv("WAYDROID_NVIDIA_PRESENT");
+   const char *reason;
+   enum present_mode mode = PRESENT_BLOCK_LINEAR;
+
+   if (env && (!strcmp(env, "linear") || !strcmp(env, "1") ||
+               !strcmp(env, "nvidia-linear"))) {
+      mode = PRESENT_NVIDIA_LINEAR;
+      reason = "WAYDROID_NVIDIA_PRESENT override";
+   } else if (env && (!strcmp(env, "block-linear") || !strcmp(env, "0") ||
+                      !strcmp(env, "block"))) {
+      mode = PRESENT_BLOCK_LINEAR;
+      reason = "WAYDROID_NVIDIA_PRESENT override";
+   } else if (other_connected && !nvidia_connected) {
+      mode = PRESENT_NVIDIA_LINEAR;
+      reason = "non-NVIDIA GPU has the only connected display (iGPU compositor)";
+   } else if (other_connected && nvidia_connected && boot_vga_other &&
+              !boot_vga_nvidia) {
+      mode = PRESENT_NVIDIA_LINEAR;
+      reason = "both GPUs have displays; boot_vga is the iGPU";
+   } else if (other_present && !nvidia_connected) {
+      mode = PRESENT_NVIDIA_LINEAR;
+      reason = "NVIDIA has no connected display; another GPU is present";
+   } else if (other_present) {
+      mode = PRESENT_BLOCK_LINEAR;
+      reason = "NVIDIA has a connected display (compositor assumed on NVIDIA)";
+   } else {
+      mode = PRESENT_BLOCK_LINEAR;
+      reason = "NVIDIA is the only GPU with a connected display";
+   }
+
+   g_present_mode = mode;
+   fprintf(stderr, "vtest_gpu_alloc:   present=%s  reason=%s\n",
+           mode == PRESENT_NVIDIA_LINEAR ? "nvidia-linear" : "block-linear",
+           reason);
+   fprintf(stderr,
+           "vtest_gpu_alloc:   override: WAYDROID_NVIDIA_PRESENT=linear|block-linear\n");
+   fprintf(stderr, "vtest_gpu_alloc: ===\n");
+}
+
+static void
+log_alloc(const char *kind, uint32_t w, uint32_t h, uint32_t fmt,
+          const char *path, bool host_visible, uint64_t modifier,
+          uint32_t stride, uint64_t size, int ret)
+{
+   unsigned i = __sync_fetch_and_add(&g_alloc_log_n, 1);
+   if (i >= 16 && (i % 128) != 0)
+      return;
+   if (ret) {
+      fprintf(stderr,
+              "vtest_gpu_alloc: %s %ux%u %s path=%s FAILED ret=%d (#%u)\n",
+              kind, w, h, vtest_format_name(fmt), path, ret, i);
+      return;
+   }
+   fprintf(stderr,
+           "vtest_gpu_alloc: %s %ux%u %s path=%s hostvis=%d modifier=0x%llx stride=%u size=%llu (#%u)\n",
+           kind, w, h, vtest_format_name(fmt), path, (int)host_visible,
+           (unsigned long long)modifier, stride, (unsigned long long)size, i);
+}
 
 struct alloc_vk {
    void *lib;
@@ -282,7 +527,7 @@ alloc_vk_init_locked(void)
 
 static int
 vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
-                      bool linear, uint32_t *out_stride,
+                      bool linear, bool host_visible, uint32_t *out_stride,
                       uint64_t *out_modifier, uint64_t *out_size, int *out_fd)
 {
    const VkFormat format = drm_format_to_vk(drm_format);
@@ -378,17 +623,25 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    };
-   if (vk->CreateImage(vk->device, &image_info, NULL, &image) != VK_SUCCESS)
-      goto out;
+   {
+      VkResult vr = vk->CreateImage(vk->device, &image_info, NULL, &image);
+      if (vr != VK_SUCCESS) {
+         fprintf(stderr,
+                 "vtest_gpu_alloc: CreateImage %ux%u %s linear=%d failed vk=%d\n",
+                 width, height, vtest_format_name(drm_format), (int)linear,
+                 (int)vr);
+         goto out;
+      }
+   }
 
    VkMemoryRequirements reqs;
    vk->GetImageMemoryRequirements(vk->device, image, &reqs);
 
    uint32_t mem_type = UINT32_MAX;
    const VkMemoryPropertyFlags want =
-      linear ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-             : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+      host_visible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                   : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
    for (uint32_t i = 0; i < vk->mem_props.memoryTypeCount; i++) {
       if ((reqs.memoryTypeBits & (1u << i)) &&
           (vk->mem_props.memoryTypes[i].propertyFlags & want) == want) {
@@ -416,9 +669,16 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
       .allocationSize = reqs.size,
       .memoryTypeIndex = mem_type,
    };
-   if (vk->AllocateMemory(vk->device, &alloc_info, NULL, &memory) != VK_SUCCESS) {
-      memory = VK_NULL_HANDLE;
-      goto out;
+   {
+      VkResult vr = vk->AllocateMemory(vk->device, &alloc_info, NULL, &memory);
+      if (vr != VK_SUCCESS) {
+         fprintf(stderr,
+                 "vtest_gpu_alloc: AllocateMemory %ux%u %s hostvis=%d failed vk=%d\n",
+                 width, height, vtest_format_name(drm_format), (int)host_visible,
+                 (int)vr);
+         memory = VK_NULL_HANDLE;
+         goto out;
+      }
    }
    if (vk->BindImageMemory(vk->device, image, memory, 0) != VK_SUCCESS)
       goto out;
@@ -467,8 +727,25 @@ vtest_gpu_alloc_gpu(uint32_t width, uint32_t height, uint32_t drm_format,
                     uint32_t *out_stride, uint64_t *out_modifier,
                     uint64_t *out_size, int *out_fd)
 {
-   return vtest_gpu_alloc_image(width, height, drm_format, false, out_stride,
-                                out_modifier, out_size, out_fd);
+   pthread_once(&g_present_once, present_init);
+
+   const bool linear = (g_present_mode == PRESENT_NVIDIA_LINEAR);
+   const char *path = linear ? "nvidia-linear" : "block-linear";
+   bool host_visible = false;
+   int ret = vtest_gpu_alloc_image(width, height, drm_format, linear, false,
+                                   out_stride, out_modifier, out_size, out_fd);
+   if (ret && linear) {
+      /* LINEAR + DEVICE_LOCAL refused; NVIDIA often places LINEAR in
+       * host-visible memory anyway. Same tiling, different heap. */
+      ret = vtest_gpu_alloc_image(width, height, drm_format, true, true,
+                                  out_stride, out_modifier, out_size, out_fd);
+      if (ret == 0)
+         host_visible = true;
+   }
+   log_alloc("gpu", width, height, drm_format, path, host_visible,
+             ret ? 0 : *out_modifier, ret ? 0 : *out_stride,
+             ret ? 0 : *out_size, ret);
+   return ret;
 }
 
 int
@@ -481,10 +758,19 @@ vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
     * own LINEAR memory so guest renders into them are clean. Fall back to a
     * plain udmabuf when the format isn't renderable (non-whitelisted).
     * Upstream Shiro836#12. */
+   pthread_once(&g_present_once, present_init);
+
    uint64_t modifier = 0;
-   if (vtest_gpu_alloc_image(width, height, drm_format, true, out_stride,
-                             &modifier, out_size, out_fd) == 0)
+   if (vtest_gpu_alloc_image(width, height, drm_format, true, true, out_stride,
+                             &modifier, out_size, out_fd) == 0) {
+      log_alloc("cpu", width, height, drm_format, "nvidia-linear-hostvis", true,
+                modifier, *out_stride, *out_size, 0);
       return 0;
+   }
+
+   fprintf(stderr,
+           "vtest_gpu_alloc: cpu NVIDIA LINEAR failed for %ux%u %s, falling back to udmabuf\n",
+           width, height, vtest_format_name(drm_format));
 
    /* Fallback: /dev/udmabuf over a shrink-sealed memfd. */
    uint32_t stride = 0;
@@ -549,5 +835,7 @@ vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
    *out_stride = stride;
    *out_size = size;
    *out_fd = dmabuf;
+   log_alloc("cpu", width, height, drm_format, "udmabuf-linear", true, 0,
+             stride, size, 0);
    return 0;
 }

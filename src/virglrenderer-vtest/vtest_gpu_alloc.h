@@ -1,13 +1,21 @@
 /*
  * Host-side buffer allocator for VCMD_RESOURCE_ALLOC_GPU.
  *
- * GPU path: allocates an exportable linear VkImage + dedicated VkDeviceMemory
- * on the render GPU (NVIDIA) and exports it as a dma_buf.  Buffers born on
- * the compositing GPU are the only ones KWin-on-NVIDIA can bind as
- * GL_TEXTURE_2D (foreign dmabufs bind only as EXTERNAL_OES).
+ * GPU path: exportable VkImage + dedicated VkDeviceMemory on the render GPU
+ * (NVIDIA), exported as a dma_buf.
  *
- * CPU path: memfd + udmabuf, for BO_USE_SW_* gralloc buffers that the guest
- * must mmap; still a real dma_buf so the GPU can sample it.
+ *   Discrete NVIDIA (compositor on NVIDIA): block-linear DRM modifiers.
+ *   NVIDIA EGL binds LINEAR only as GL_TEXTURE_EXTERNAL_OES; KWin needs
+ *   GL_TEXTURE_2D, which block-linear provides.
+ *
+ *   Hybrid (iGPU compositor + NVIDIA render): NVIDIA LINEAR. Intel/AMD
+ *   import LINEAR dma_bufs as GL_TEXTURE_2D (tests/crossimport.c);
+ *   NVIDIA block-linear is not advertised by the iGPU compositor.
+ *   Auto-detected from DRM connectors / boot_vga; override with
+ *   WAYDROID_NVIDIA_PRESENT=linear|block-linear.
+ *
+ * CPU path: NVIDIA LINEAR (host-visible) first, udmabuf fallback, for
+ * BO_USE_SW_* gralloc buffers the guest must mmap.
  */
 
 #ifndef VTEST_GPU_ALLOC_H
