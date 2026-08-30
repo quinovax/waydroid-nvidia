@@ -874,10 +874,42 @@ index 3e943bfd..3880c3ec 100644
        free(dev);
        return;
 diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
-index 08c7b07f..1c05d6b1 100644
+index 08c7b07f..cec48f53 100644
 --- a/src/venus/vkr_queue.c
 +++ b/src/venus/vkr_queue.c
-@@ -79,7 +79,8 @@ bool
+@@ -5,6 +5,9 @@
+ 
+ #include "vkr_queue.h"
+ 
++#include <unistd.h>
++
++#include "util/libsync.h"
+ #include "venus-protocol/vn_protocol_renderer_queue.h"
+ 
+ #include "vkr_context.h"
+@@ -55,6 +58,8 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+    sync->flags = fence_flags;
+    sync->ring_idx = ring_idx;
+    sync->fence_id = fence_id;
++   sync->export_fd = -1;
++   sync->deferred_timeline_point = 0;
+ 
+    return sync;
+ }
+@@ -62,6 +67,12 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+ static void
+ vkr_device_free_queue_sync(struct vkr_device *dev, struct vkr_queue_sync *sync)
+ {
++   if (sync->export_fd >= 0) {
++      close(sync->export_fd);
++      sync->export_fd = -1;
++   }
++   sync->deferred_timeline_point = 0;
++
+    mtx_lock(&dev->free_sync_mutex);
+    list_addtail(&sync->head, &dev->free_syncs);
+    mtx_unlock(&dev->free_sync_mutex);
+@@ -79,7 +90,8 @@ bool
  vkr_queue_sync_submit(struct vkr_queue *queue,
                        uint32_t flags,
                        uint32_t ring_idx,
@@ -887,78 +919,228 @@ index 08c7b07f..1c05d6b1 100644
  {
     TRACE_FUNC();
     struct vkr_device *dev = queue->device;
-@@ -103,6 +104,36 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+@@ -103,6 +115,62 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
        return false;
     }
  
-+   /* Materialize the fresh fence into the context's shared timeline: SYNC_FD
-+    * export has copy transference and the fence has a pending signal op, so
-+    * exporting right after QueueSubmit is spec-legal.  fd == -1 (already
-+    * signaled) and errors both make vkr_context_timeline_import signal the
-+    * point directly.
++   /* One GetFenceFdKHR, here, before the sync thread can WaitForFences.
++    * vkGetFenceFdKHR requires the fence to be externally synchronized;
++    * doing it later races the waiter and NVIDIA returns
++    * VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003), after which the
++    * VkFence is reset and will never signal.
++    *
++    * Never WaitForFences on the vtest command/select thread: --no-fork
++    * --multi-clients is one loop, so an infinite wait wedges SF, HWUI and
++    * system_server together (browser ANR).
 +    */
-+   if (timeline_point) {
++   if (dev->physical_device->KHR_external_fence_fd && !sync->device_lost) {
++      const VkFenceGetFdInfoKHR info = {
++         .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
++         .fence = sync->fence,
++         .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++      };
 +      int fd = -1;
-+      if (dev->physical_device->KHR_external_fence_fd && !sync->device_lost) {
-+         const VkFenceGetFdInfoKHR info = {
-+            .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
-+            .fence = sync->fence,
-+            .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
-+         };
-+         if (vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd) != VK_SUCCESS) {
-+            /* Don't signal the timeline point early: that lets the guest
-+             * over-submit until GetFenceFdKHR's TOO_MANY_OBJECTS (fd leak
-+             * or RLIMIT) becomes a permanent FPS collapse (issue #4).
-+             * Wait for the real fence, then retry; fd stays -1 only if
-+             * the wait itself says the fence has already signaled. */
-+            vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
-+                              ~(uint64_t)0);
-+            if (vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd) !=
-+                VK_SUCCESS)
-+               fd = -1;
++      VkResult export_result =
++         vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd);
++      if (export_result == VK_SUCCESS && fd >= 0) {
++         sync->export_fd = fd;
++      } else if (export_result != VK_SUCCESS) {
++         /* Do not signal the timeline point early: that lets the guest
++          * over-submit until a real TOO_MANY_OBJECTS becomes a permanent
++          * FPS collapse (issue #4). Defer import until the sync thread
++          * has waited on the still-valid VkFence. */
++         vkr_log("GetFenceFdKHR failed (vk ret %d)%s for fence_id %" PRIu64
++                 "; no cached SYNC_FD",
++                 export_result,
++                 export_result == VK_ERROR_INVALID_EXTERNAL_HANDLE
++                    ? " INVALID_EXTERNAL_HANDLE"
++                    : export_result == VK_ERROR_TOO_MANY_OBJECTS
++                         ? " TOO_MANY_OBJECTS"
++                         : "",
++                 fence_id);
++         if (timeline_point)
++            sync->deferred_timeline_point = timeline_point;
++      }
++      /* SUCCESS && fd < 0: already signaled. export_fd stays -1. */
++   }
++
++   if (timeline_point && !sync->deferred_timeline_point) {
++      int import_fd = -1;
++      if (sync->export_fd >= 0) {
++         import_fd = os_dupfd_cloexec(sync->export_fd);
++         if (import_fd < 0) {
++            vkr_log("dup export_fd failed for fence_id %" PRIu64
++                    ", deferring timeline import",
++                    fence_id);
++            sync->deferred_timeline_point = timeline_point;
 +         }
 +      }
-+      vkr_context_timeline_import(queue->context, fd, timeline_point);
++      if (!sync->deferred_timeline_point)
++         vkr_context_timeline_import(queue->context, import_fd, timeline_point);
 +   }
 +
     mtx_lock(&queue->sync_thread.mutex);
     list_addtail(&sync->head, &queue->sync_thread.syncs);
     cnd_signal(&queue->sync_thread.cond);
-@@ -149,12 +180,24 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
-       if (result != VK_SUCCESS) {
-          /* GetFenceFdKHR can fail with VK_ERROR_TOO_MANY_OBJECTS when
-           * the process hits its fd limit (multi-client Venus: game +
+@@ -124,43 +192,46 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
+ 
+    int ret = 1;
+    mtx_lock(&queue->sync_thread.mutex);
+-   list_for_each_entry (struct vkr_queue_sync, sync, &queue->sync_thread.syncs, head) {
+-      if (sync->fence_id != fence_id)
+-         continue;
+-
+-      if (sync->device_lost) {
+-         ret = -ENODEV;
+-         break;
++   for (;;) {
++      struct vkr_queue_sync *found = NULL;
++      list_for_each_entry (struct vkr_queue_sync, sync, &queue->sync_thread.syncs,
++                           head) {
++         if (sync->fence_id == fence_id) {
++            found = sync;
++            break;
++         }
+       }
+ 
+-      /* SYNC_FD export has copy transference and the fence has a pending
+-       * signal operation (QueueSubmit happened in vkr_queue_sync_submit), so
+-       * this is spec-legal even while the sync thread waits on the fence.
+-       * The driver may return -1 if the fence already signaled; map that to
+-       * "already signaled".
+-       */
+-      const VkFenceGetFdInfoKHR info = {
+-         .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+-         .fence = sync->fence,
+-         .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+-      };
+-      int fd = -1;
+-      VkResult result = vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd);
+-      if (result != VK_SUCCESS) {
+-         /* GetFenceFdKHR can fail with VK_ERROR_TOO_MANY_OBJECTS when
+-          * the process hits its fd limit (multi-client Venus: game +
 -          * SF + gralloc).  Returning 1 (already signaled) lets the
 -          * guest create a signaled release fence instead of propagating
 -          * VK_ERROR_TOO_MANY_OBJECTS through Present (UE4 fatal).
-+          * SF + gralloc).  Returning "already signaled" without waiting
-+          * lets the guest over-submit, which makes the fd/object leak
-+          * worse until FPS collapses (issue #4). Wait for the real
-+          * fence first so a signaled fallback is truthful; UE4 still
-+          * doesn't see TOO_MANY_OBJECTS through Present.
-+          *
-+          * Held mutex is intentional: unlocking would let the sync
-+          * thread ResetFence this VkFence under us.
-           */
--         ret = 1;
--      } else if (fd < 0) {
-+         vkr_log("GetFenceFdKHR failed (vk ret %d) for fence_id %" PRIu64
-+                 ", waiting then retrying",
-+                 result, fence_id);
-+         vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
-+                           ~(uint64_t)0);
-+         fd = -1;
-+         result = vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd);
-+      }
-+      if (result != VK_SUCCESS || fd < 0) {
+-          */
++      if (!found) {
++         /* Retired (or never pending): already signaled. */
           ret = 1;
+-      } else if (fd < 0) {
++         break;
++      }
++      if (found->device_lost || queue->sync_thread.join) {
++         ret = found->device_lost ? -ENODEV : 1;
++         break;
++      }
++      if (found->export_fd >= 0) {
++         int fd = os_dupfd_cloexec(found->export_fd);
++         if (fd >= 0) {
++            *out_fd = fd;
++            ret = 0;
++            break;
++         }
++         vkr_log("dup cached SYNC_FD failed for fence_id %" PRIu64, fence_id);
++         /* Fall through and wait for retire so a signaled fallback is
++          * truthful (issue #4). dup failure does not free the cached fd. */
++      } else if (vk->GetFenceStatus(dev->base.handle.device, found->fence) ==
++                 VK_SUCCESS) {
+          ret = 1;
+-      } else {
+-         *out_fd = fd;
+-         ret = 0;
++         break;
+       }
+-      break;
++
++      /* No usable cached fd: GetFenceFdKHR failed at submit. Wait for the
++       * sync thread to retire it. Never WaitForFences here — that raced
++       * GetFenceFdKHR, hung the vtest select loop, and wedged every client.
++       */
++      cnd_wait(&queue->sync_thread.cond, &queue->sync_thread.mutex);
+    }
+    mtx_unlock(&queue->sync_thread.mutex);
+ 
+@@ -173,7 +244,7 @@ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
+    /* vkDeviceWaitIdle has been called */
+    mtx_lock(&queue->sync_thread.mutex);
+    queue->sync_thread.join = true;
+-   cnd_signal(&queue->sync_thread.cond);
++   cnd_broadcast(&queue->sync_thread.cond);
+    mtx_unlock(&queue->sync_thread.mutex);
+ 
+    thrd_join(queue->sync_thread.thread, NULL);
+@@ -227,11 +298,26 @@ vkr_queue_thread(void *arg)
+       struct vkr_queue_sync *sync =
+          list_first_entry(&queue->sync_thread.syncs, struct vkr_queue_sync, head);
+ 
++      const int export_fd = sync->export_fd;
++      const bool device_lost = sync->device_lost;
++
+       mtx_unlock(&queue->sync_thread.mutex);
+ 
+       VkResult result;
+-      if (sync->device_lost) {
++      if (device_lost) {
+          result = VK_ERROR_DEVICE_LOST;
++      } else if (export_fd >= 0) {
++         /* NVIDIA SYNC_FD export resets the VkFence. Wait on the
++          * sync_file; never on the VkFence after GetFenceFdKHR. */
++         if (sync_wait(export_fd, 3000) == 0) {
++            result = VK_SUCCESS;
++         } else if (errno == ETIME) {
++            result = VK_TIMEOUT;
++         } else {
++            vkr_log("sync_wait failed for fence_id %" PRIu64 " (%s), retiring",
++                    sync->fence_id, strerror(errno));
++            result = VK_SUCCESS;
++         }
        } else {
-          *out_fd = fd;
+          result = vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
+                                     ns_per_sec * 3);
+@@ -244,6 +330,19 @@ vkr_queue_thread(void *arg)
+ 
+       list_del(&sync->head);
+ 
++      const uint64_t deferred = sync->deferred_timeline_point;
++      sync->deferred_timeline_point = 0;
++      cnd_broadcast(&queue->sync_thread.cond);
++
++      if (deferred) {
++         /* timeline_import takes ctx->timeline.mutex; drop ours so we
++          * cannot deadlock with vkr_queue_sync_submit (timeline then
++          * sync_thread). */
++         mtx_unlock(&queue->sync_thread.mutex);
++         vkr_context_timeline_import(ctx, -1, deferred);
++         mtx_lock(&queue->sync_thread.mutex);
++      }
++
+       vkr_queue_sync_retire(queue, sync);
+    }
+    mtx_unlock(&queue->sync_thread.mutex);
 diff --git a/src/venus/vkr_queue.h b/src/venus/vkr_queue.h
-index 5246a5a2..9c802ad8 100644
+index 5246a5a2..717abfc0 100644
 --- a/src/venus/vkr_queue.h
 +++ b/src/venus/vkr_queue.h
-@@ -95,10 +95,14 @@ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
+@@ -16,6 +16,17 @@ struct vkr_queue_sync {
+    uint32_t ring_idx;
+    uint64_t fence_id;
+ 
++   /* Cached SYNC_FD from the single GetFenceFdKHR at submit. NVIDIA's
++    * export resets the VkFence (copy transference in name only), so later
++    * GetFenceFdKHR returns VK_ERROR_INVALID_EXTERNAL_HANDLE and
++    * WaitForFences on the VkFence never returns. >=0 = fd; -1 = none.
++    */
++   int export_fd;
++   /* GetFenceFdKHR failed at submit: import fd=-1 into the timeline only
++    * after the sync thread has waited on the still-valid VkFence.
++    */
++   uint64_t deferred_timeline_point;
++
+    struct list_head head;
+ };
+ 
+@@ -95,10 +106,14 @@ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
  int
  vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int *out_fd);
  
