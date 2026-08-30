@@ -13,10 +13,12 @@ vtest set it false. HWUI hard-requires `VK_KHR_external_semaphore_fd`
 
 **Host (virglrenderer):**
 - `RENDER_CONTEXT_OP_EXPORT_FENCE {fence_id}` → reply `{found}` + one fd.
-- vkr dispatch: lock queues, find the pending sync by `fence_id`,
-  `vkGetFenceFdKHR(SYNC_FD)` (copy-transference semantics, safe vs the waiter
-  thread), reply. Not found ⇒ already retired ⇒ `found=0` (guest returns fd −1 =
-  "already signaled", spec-legal).
+- vkr dispatch: lock queues, find the pending sync by `fence_id`, dup the
+  SYNC_FD cached at submit (one `vkGetFenceFdKHR` before the waiter thread
+  sees the fence). Not found ⇒ already retired ⇒ `found=0` (guest returns
+  fd −1 = "already signaled", spec-legal). A second GetFenceFdKHR races the
+  waiter; NVIDIA then returns `VK_ERROR_INVALID_EXTERNAL_HANDLE` and the
+  VkFence never signals.
 - Public API `virgl_renderer_context_export_fence(ctx, fence_id, &fd)` (bypasses
   the DRM/GL-only fence table).
 - vtest: `VCMD_SYNC_EXPORT_SYNC_FILE` + `VCMD_PARAM_HAS_VENUS_SYNC_FD`.
