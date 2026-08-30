@@ -811,8 +811,70 @@ index 7ba72eb8..ce1a8507 100644
  bool
  vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size);
  
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 3e943bfd..3880c3ec 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -108,6 +108,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          const uint32_t queue_count = args->pCreateInfo->pQueueCreateInfos[i].queueCount;
+ 
+          if (queue_family_index >= physical_dev->queue_family_property_count) {
++            vkr_log("CreateDevice: bad queueFamilyIndex %u (families %u)",
++                    queue_family_index, physical_dev->queue_family_property_count);
+             args->ret = VK_ERROR_UNKNOWN;
+             break;
+          }
+@@ -117,6 +119,9 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+ 
+          if (queue_family_properties->queueCount - counts[queue_family_index] <
+              queue_count) {
++            vkr_log("CreateDevice: family %u queueCount %u exceeds available %u",
++                    queue_family_index, queue_count,
++                    queue_family_properties->queueCount - counts[queue_family_index]);
+             args->ret = VK_ERROR_UNKNOWN;
+             break;
+          }
+@@ -176,7 +181,38 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    vn_replace_vkCreateDevice_args_handle(args);
+    args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
+                                 &dev->base.handle.device);
++
++   /* Android clients (HWUI) request a global queue priority and expect it to
++    * be honored best-effort, but desktop drivers (NVIDIA) reject unprivileged
++    * priority requests with NOT_PERMITTED. Retry without the priority chain.
++    */
++   if (args->ret == VK_ERROR_NOT_PERMITTED_KHR) {
++      bool stripped = false;
++      for (uint32_t i = 0; i < args->pCreateInfo->queueCreateInfoCount; i++) {
++         VkDeviceQueueCreateInfo *qci =
++            (VkDeviceQueueCreateInfo *)&args->pCreateInfo->pQueueCreateInfos[i];
++         VkBaseOutStructure *prev = (VkBaseOutStructure *)qci;
++         for (VkBaseOutStructure *s = prev->pNext; s; s = s->pNext) {
++            if (s->sType ==
++                VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR) {
++               prev->pNext = s->pNext;
++               stripped = true;
++            } else {
++               prev = s;
++            }
++         }
++      }
++      if (stripped) {
++         vkr_log("CreateDevice: NOT_PERMITTED; retrying without global queue "
++                 "priority");
++         args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo,
++                                      NULL, &dev->base.handle.device);
++      }
++   }
++
+    if (args->ret != VK_SUCCESS) {
++      vkr_log("CreateDevice: host driver returned %d (extCount=%u)", args->ret,
++              args->pCreateInfo->enabledExtensionCount);
+       free(exts);
+       free(dev);
+       return;
 diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
-index 08c7b07f..8b78f338 100644
+index 08c7b07f..1c05d6b1 100644
 --- a/src/venus/vkr_queue.c
 +++ b/src/venus/vkr_queue.c
 @@ -79,7 +79,8 @@ bool
@@ -825,7 +887,7 @@ index 08c7b07f..8b78f338 100644
  {
     TRACE_FUNC();
     struct vkr_device *dev = queue->device;
-@@ -103,6 +104,26 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+@@ -103,6 +104,36 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
        return false;
     }
  
@@ -843,8 +905,18 @@ index 08c7b07f..8b78f338 100644
 +            .fence = sync->fence,
 +            .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
 +         };
-+         if (vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd) != VK_SUCCESS)
-+            fd = -1;
++         if (vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd) != VK_SUCCESS) {
++            /* Don't signal the timeline point early: that lets the guest
++             * over-submit until GetFenceFdKHR's TOO_MANY_OBJECTS (fd leak
++             * or RLIMIT) becomes a permanent FPS collapse (issue #4).
++             * Wait for the real fence, then retry; fd stays -1 only if
++             * the wait itself says the fence has already signaled. */
++            vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
++                              ~(uint64_t)0);
++            if (vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd) !=
++                VK_SUCCESS)
++               fd = -1;
++         }
 +      }
 +      vkr_context_timeline_import(queue->context, fd, timeline_point);
 +   }
@@ -852,6 +924,36 @@ index 08c7b07f..8b78f338 100644
     mtx_lock(&queue->sync_thread.mutex);
     list_addtail(&sync->head, &queue->sync_thread.syncs);
     cnd_signal(&queue->sync_thread.cond);
+@@ -149,12 +180,24 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
+       if (result != VK_SUCCESS) {
+          /* GetFenceFdKHR can fail with VK_ERROR_TOO_MANY_OBJECTS when
+           * the process hits its fd limit (multi-client Venus: game +
+-          * SF + gralloc).  Returning 1 (already signaled) lets the
+-          * guest create a signaled release fence instead of propagating
+-          * VK_ERROR_TOO_MANY_OBJECTS through Present (UE4 fatal).
++          * SF + gralloc).  Returning "already signaled" without waiting
++          * lets the guest over-submit, which makes the fd/object leak
++          * worse until FPS collapses (issue #4). Wait for the real
++          * fence first so a signaled fallback is truthful; UE4 still
++          * doesn't see TOO_MANY_OBJECTS through Present.
++          *
++          * Held mutex is intentional: unlocking would let the sync
++          * thread ResetFence this VkFence under us.
+           */
+-         ret = 1;
+-      } else if (fd < 0) {
++         vkr_log("GetFenceFdKHR failed (vk ret %d) for fence_id %" PRIu64
++                 ", waiting then retrying",
++                 result, fence_id);
++         vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
++                           ~(uint64_t)0);
++         fd = -1;
++         result = vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd);
++      }
++      if (result != VK_SUCCESS || fd < 0) {
+          ret = 1;
+       } else {
+          *out_fd = fd;
 diff --git a/src/venus/vkr_queue.h b/src/venus/vkr_queue.h
 index 5246a5a2..9c802ad8 100644
 --- a/src/venus/vkr_queue.h

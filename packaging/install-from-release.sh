@@ -10,6 +10,7 @@
 #   curl -fsSL .../install-from-release.sh | sudo bash                       # latest release
 #   curl -fsSL .../install-from-release.sh | sudo bash -s -- --tag v0.1.2    # specific release
 #   sudo ./install-from-release.sh --source [--tag v0.1.0]                   # build from source
+#   pkexec ./packaging/install-from-release.sh --local "$PWD" --skip-build   # deploy this checkout
 set -euo pipefail
 
 REPO_URL="https://github.com/CinQwQeggs01/waydroid-nvidia"
@@ -17,6 +18,14 @@ WAYDROID_UPSTREAM="https://github.com/waydroid/waydroid.git"
 PREFIX="/usr/lib/waydroid-nvidia"
 TAG=""
 SOURCE=0
+LOCAL=""
+SKIP_BUILD=0
+# ANGLE / hwcomposer / surfaceflinger are built on a self-hosted runner this
+# fork does not have. When a tag ships without guest-prebuilts, reuse the
+# last known-good upstream tarball (issues #2 and #5).
+PREBUILTS_FALLBACK_URL="https://github.com/Shiro836/waydroid-nvidia/releases/download/v0.1.2"
+PREBUILTS_FALLBACK_FILE="waydroid-nvidia-guest-prebuilts-v0.1.2.tar.zst"
+PREBUILTS_FALLBACK_SHA256="61899f56c203b750d41f7c141a1ee264cb68241748cc9cda512ed45f2997cbd1"
 
 die()  { echo "FATAL: $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*"; }
@@ -26,31 +35,79 @@ ok()   { echo -e "\033[1;32m  OK\033[0m $*"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --tag)    TAG="${2:?--tag needs a value}"; shift 2 ;;
-        --source) SOURCE=1; shift ;;
+        --tag)        TAG="${2:?--tag needs a value}"; shift 2 ;;
+        --source)     SOURCE=1; shift ;;
+        --local)      LOCAL="${2:?--local needs a path}"; shift 2 ;;
+        --skip-build) SKIP_BUILD=1; shift ;;
         *) die "unknown argument: $1" ;;
     esac
 done
 
-# ---- detect distro ----
-detect_distro() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case "$ID" in
-            ubuntu|debian|linuxmint|pop)    echo "debian" ;;
-            fedora|rhel|centos|rocky|alma)  echo "fedora" ;;
-            arch|manjaro|endeavouros)       echo "arch"   ;;
-            *) die "unsupported distro: $ID (supported: Ubuntu/Debian, Fedora, Arch)" ;;
-        esac
-    elif command -v apt-get >/dev/null 2>&1; then echo "debian"
-    elif command -v dnf >/dev/null 2>&1; then echo "fedora"
-    elif command -v pacman >/dev/null 2>&1; then echo "arch"
-    else die "cannot detect distro"
+if [ -n "$LOCAL" ]; then
+    [ -d "$LOCAL/patches/waydroid" ] || die "--local $LOCAL is not a waydroid-nvidia checkout"
+    LOCAL="$(cd "$LOCAL" && pwd)"
+fi
+
+# ---- detect package-manager family ----
+# Attribute a system file to apt, dnf, or pacman.
+detect_pkg_family() {
+    local probe="" f hits="" family
+    for f in /usr/lib/os-release /etc/os-release /usr/bin/bash /bin/sh; do
+        if [ -e "$f" ]; then
+            probe="$f"
+            break
+        fi
+    done
+    [ -n "$probe" ] || die "cannot find a system file to attribute to a package manager"
+
+    # Refuse if more than one manager claims $probe.
+    family=""
+    if command -v dpkg-query >/dev/null 2>&1 && \
+            dpkg-query -S "$probe" >/dev/null 2>&1; then
+        hits="${hits:+$hits }debian"
+        family=debian
     fi
+    if command -v rpm >/dev/null 2>&1 && \
+            rpm -q --whatprovides "$probe" >/dev/null 2>&1; then
+        hits="${hits:+$hits }fedora"
+        family=fedora
+    fi
+    if command -v pacman >/dev/null 2>&1 && \
+            pacman -Qo "$probe" >/dev/null 2>&1; then
+        hits="${hits:+$hits }arch"
+        family=arch
+    fi
+    case "$hits" in
+        debian|fedora|arch)
+            echo "$family"
+            return 0
+            ;;
+        "")
+            ;;
+        *)
+            die "ambiguous package manager for $probe (got: $hits). Need exactly one of dpkg, rpm, pacman."
+            ;;
+    esac
+
+    # Chroots / debootstrap / rpmstrap where the probe file is not packaged.
+    if command -v apt-get >/dev/null 2>&1 && [ -f /var/lib/dpkg/status ]; then
+        echo debian
+        return 0
+    fi
+    if { command -v dnf || command -v yum; } >/dev/null 2>&1 && \
+            { [ -d /usr/lib/sysimage/rpm ] || [ -d /var/lib/rpm ]; }; then
+        echo fedora
+        return 0
+    fi
+    if command -v pacman >/dev/null 2>&1 && [ -d /var/lib/pacman/local ]; then
+        echo arch
+        return 0
+    fi
+    die "cannot detect package manager (need apt+dpkg, dnf/yum+rpm, or pacman)"
 }
 
-DISTRO=$(detect_distro)
-info "detected distro family: $DISTRO"
+DISTRO=$(detect_pkg_family)
+info "package manager family: $DISTRO"
 
 # ---- pipewire-pulseaudio conflict guard ----
 PA_PKG="pulseaudio"
@@ -69,7 +126,7 @@ install_deps_debian() {
     apt-get install -yq lxc python3 python3-gi python3-dbus nftables dnsmasq \
         gir1.2-gtk-3.0 $PA_PKG binutils \
         libepoxy0 libdrm2 libgbm1 libx11-6 libexpat1 libvulkan1 \
-        curl git make gcc patch
+        curl git make gcc patch zstd
     # python3-gbinder only exists in the Waydroid PPA / newer Debian; waydroid
     # imports it at runtime, so try it but do not fail the whole install here.
     apt-get install -yq python3-gbinder 2>/dev/null \
@@ -82,7 +139,7 @@ install_deps_fedora() {
     dnf install -yq lxc python3 python3-gobject python3-dbus python3-gbinder \
         nftables dnsmasq gtk3 $PA_PKG binutils \
         libepoxy libdrm mesa-libgbm libX11 expat vulkan-loader \
-        curl git make gcc patch
+        curl git make gcc patch zstd
 }
 
 install_deps_arch() {
@@ -91,15 +148,23 @@ install_deps_arch() {
     pacman -Syq --noconfirm --needed lxc python python-gobject python-dbus \
         python-gbinder nftables dnsmasq gtk3 $PA_PKG binutils \
         libepoxy libdrm mesa libx11 expat vulkan-icd-loader \
-        curl git base-devel patch
+        curl git base-devel patch zstd
 }
 
-case "$DISTRO" in
-    debian) install_deps_debian ;;
-    fedora) install_deps_fedora ;;
-    arch)   install_deps_arch   ;;
-esac
-ok "dependencies installed"
+if [ "$SKIP_BUILD" -eq 1 ]; then
+    command -v git >/dev/null 2>&1 || die "git is required"
+    command -v make >/dev/null 2>&1 || die "make is required"
+    command -v zstd >/dev/null 2>&1 || die "zstd is required to unpack the prebuilts fallback"
+    command -v tar >/dev/null 2>&1 || die "tar is required"
+    info "skip-build: not installing distro packages"
+else
+    case "$DISTRO" in
+        debian) install_deps_debian ;;
+        fedora) install_deps_fedora ;;
+        arch)   install_deps_arch   ;;
+    esac
+    ok "dependencies installed"
+fi
 
 # ---- build deps (source mode only) ----
 install_build_deps_debian() {
@@ -228,13 +293,71 @@ build_from_source() {
         "$PREFIX/guest/vendor/lib/hw/vulkan.virtio.so"
 
     ok "source build and install complete"
-    info "NOTE: ANGLE, hwcomposer, and surfaceflinger are not built by --source."
-    info "If the release for this tag includes a prebuilts tarball, re-run without --source;"
-    info "otherwise copy them manually into $PREFIX/guest/"
+    info "ANGLE, hwcomposer, and surfaceflinger are not built by --source;"
+    info "the installer will fetch the guest-prebuilts tarball next."
+}
+
+extract_archive() {
+    local archive="$1" dest="$2"
+    mkdir -p "$dest"
+    case "$archive" in
+        *.tar.zst|*.tzst) tar --zstd -C "$dest" -xf "$archive" ;;
+        *.tar.gz|*.tgz)   tar -C "$dest" -xf "$archive" ;;
+        *) die "unsupported archive: $archive" ;;
+    esac
+}
+
+# ANGLE / hwcomposer / surfaceflinger. waydroid-nvidia-setup hard-requires them
+# (issues #2 and #5); never continue with a half-empty guest tree.
+install_prebuilts() {
+    local dest="$1"
+    mkdir -p "$dest"
+    if [ -f "$dest/vendor/lib64/egl/libEGL_angle.so" ] &&
+       [ -f "$dest/vendor/lib/egl/libEGL_angle.so" ] &&
+       [ -f "$dest/vendor/lib64/hw/hwcomposer.waydroid.so" ] &&
+       [ -f "$dest/system/bin/surfaceflinger" ]; then
+        ok "guest prebuilts already present"
+        return 0
+    fi
+
+    local tag_tb=""
+    if [ -n "${TAG:-}" ]; then
+        for cand in "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" \
+                    "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.zst"; do
+            [ -f "$cand" ] && tag_tb="$cand" && break
+        done
+    fi
+    if [ -n "$tag_tb" ]; then
+        info "installing prebuilts from $tag_tb"
+        extract_archive "$tag_tb" "$dest"
+    fi
+
+    if [ ! -f "$dest/vendor/lib64/egl/libEGL_angle.so" ] ||
+       [ ! -f "$dest/vendor/lib/egl/libEGL_angle.so" ] ||
+       [ ! -f "$dest/vendor/lib64/hw/hwcomposer.waydroid.so" ] ||
+       [ ! -f "$dest/system/bin/surfaceflinger" ]; then
+        info "fetching prebuilts fallback ($PREBUILTS_FALLBACK_FILE)"
+        local fb="$WORK/$PREBUILTS_FALLBACK_FILE"
+        curl -fSL "$PREBUILTS_FALLBACK_URL/$PREBUILTS_FALLBACK_FILE" -o "$fb" || \
+            die "failed to download prebuilts fallback from $PREBUILTS_FALLBACK_URL"
+        echo "$PREBUILTS_FALLBACK_SHA256  $fb" | sha256sum -c - || \
+            die "prebuilts fallback checksum mismatch"
+        extract_archive "$fb" "$dest"
+    fi
+
+    [ -f "$dest/vendor/lib64/egl/libEGL_angle.so" ] || \
+        die "prebuilts missing vendor/lib64/egl/libEGL_angle.so"
+    [ -f "$dest/vendor/lib/egl/libEGL_angle.so" ] || \
+        die "prebuilts missing vendor/lib/egl/libEGL_angle.so (32-bit ANGLE)"
+    [ -f "$dest/vendor/lib64/hw/hwcomposer.waydroid.so" ] || \
+        die "prebuilts missing vendor/lib64/hw/hwcomposer.waydroid.so"
+    [ -f "$dest/system/bin/surfaceflinger" ] || \
+        die "prebuilts missing system/bin/surfaceflinger"
+    ok "guest prebuilts installed (ANGLE/hwcomposer/surfaceflinger)"
 }
 
 # ---- determine tag ----
-if [ -z "$TAG" ]; then
+if [ "$SKIP_BUILD" -eq 0 ] && [ -z "$TAG" ]; then
     if [ "$SOURCE" -eq 1 ]; then
         # source mode with no tag: use latest tag
         TAG=$(git ls-remote --tags --sort=-v:refname "$REPO_URL" | head -1 | sed 's/.*refs\/tags\///')
@@ -245,26 +368,45 @@ if [ -z "$TAG" ]; then
     fi
     [ -n "$TAG" ] || die "could not determine tag (no releases? use --tag or --source)"
 fi
-info "using tag: $TAG"
+if [ -n "$TAG" ]; then
+    info "using tag: $TAG"
+elif [ "$SKIP_BUILD" -eq 1 ]; then
+    info "skip-build: using binaries already in $PREFIX"
+else
+    die "could not determine tag (no releases? use --tag or --source)"
+fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 # ---- clone repo for patches + integration files ----
-# Release mode: fetch from main so patches/BASE are always current.
-# Source mode: fetch at the tag so the build matches the release.
-REPO_SRC="$WORK/waydroid-nvidia"
-if [ "$SOURCE" -eq 1 ]; then
-    info "cloning repo at $TAG"
-    git clone -q --depth 1 --branch "$TAG" "$REPO_URL" "$REPO_SRC"
+# --local: this checkout. Release mode: fetch from main so patches/BASE are
+# always current. Source mode: fetch at the tag so the build matches the release.
+if [ -n "$LOCAL" ]; then
+    REPO_SRC="$LOCAL"
+    info "using local checkout $REPO_SRC"
 else
-    info "cloning repo (main)"
-    git clone -q --depth 1 "$REPO_URL" "$REPO_SRC"
+    REPO_SRC="$WORK/waydroid-nvidia"
+    if [ "$SOURCE" -eq 1 ]; then
+        info "cloning repo at $TAG"
+        git clone -q --depth 1 --branch "$TAG" "$REPO_URL" "$REPO_SRC"
+    else
+        info "cloning repo (main)"
+        git clone -q --depth 1 "$REPO_URL" "$REPO_SRC"
+    fi
 fi
 
-if [ "$SOURCE" -eq 1 ]; then
-    # ---- SOURCE MODE: build everything from source ----
+if [ "$SKIP_BUILD" -eq 1 ]; then
+    [ -x "$PREFIX/virgl_test_server" ] || \
+        die "--skip-build requires existing $PREFIX/virgl_test_server (install a release first)"
+    info "keeping existing host/guest binaries in $PREFIX"
+    mkdir -p "$PREFIX/guest"
+    install_prebuilts "$PREFIX/guest"
+elif [ "$SOURCE" -eq 1 ]; then
+    # ---- SOURCE MODE: build mesa + virglrenderer, then fetch prebuilts ----
     build_from_source "$WORK" "$REPO_SRC"
+    mkdir -p "$PREFIX/guest"
+    install_prebuilts "$PREFIX/guest"
 else
     # ---- RELEASE MODE: download pre-built tarballs ----
     BASE_URL="$REPO_URL/releases/download/$TAG"
@@ -276,12 +418,13 @@ else
         curl -fSL "$BASE_URL/$f" -o "$WORK/$f" || \
             die "failed to download $f — release may not exist for $TAG (try --source)"
     done
-    # prebuilts (ANGLE, hwcomposer, surfaceflinger) — optional
+    # prebuilts (ANGLE, hwcomposer, surfaceflinger) — fetched from this tag
+    # when present, otherwise install_prebuilts() falls back to upstream v0.1.2
     if curl -fSL "$BASE_URL/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" \
             -o "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" 2>/dev/null; then
         info "prebuilts (ANGLE/hwcomposer/surfaceflinger) downloaded"
     else
-        info "prebuilts not available in this release — GL will use software fallback"
+        info "prebuilts not in $TAG — will use the Shiro836 v0.1.2 fallback"
     fi
 
     # `sha256sum -c --ignore-missing` only skips entries whose file is absent —
@@ -316,9 +459,7 @@ else
     info "installing guest binaries to $PREFIX/guest"
     mkdir -p "$PREFIX/guest"
     tar -C "$PREFIX/guest" -xf "$WORK/waydroid-nvidia-guest-android-x86_64-${TAG}.tar.gz"
-    if [ -f "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz" ]; then
-        tar -C "$PREFIX/guest" -xf "$WORK/waydroid-nvidia-guest-prebuilts-${TAG}.tar.gz"
-    fi
+    install_prebuilts "$PREFIX/guest"
     ok "binaries installed"
 fi
 
@@ -399,18 +540,37 @@ udevadm control --reload 2>/dev/null || true
 udevadm trigger /dev/udmabuf 2>/dev/null || true
 
 ok "installation complete"
+if [ "$DISTRO" = "fedora" ]; then
 cat <<'EOF'
 
-Next steps:
-  waydroid init                     # download an Android image
-  sudo waydroid-nvidia-setup        # configure the NVIDIA stack (--refresh <hz>)
-  sudo systemctl enable --now waydroid-container.service
+Next steps (dnf/rpm family — Fedora, Nobara, Bazzite, RHEL, …):
+  # Fedora's waydroid 1.6 package needs explicit OTA URLs:
+  pkexec waydroid init -f -c https://ota.waydro.id/system -v https://ota.waydro.id/vendor
+  pkexec waydroid-nvidia-setup        # configure the NVIDIA stack (--refresh <hz>)
+  pkexec systemctl enable --now waydroid-container.service
   systemctl --user enable --now wd-venus.service
   # re-login once (udev rule for /dev/udmabuf), then:
   waydroid session start
 
 Verify GPU acceleration:
-  sudo waydroid shell dumpsys SurfaceFlinger | grep GLES
+  pkexec waydroid shell dumpsys SurfaceFlinger | grep GLES
   # should show: ANGLE (NVIDIA, Vulkan ... Venus (NVIDIA GeForce ...))
 
 EOF
+else
+cat <<'EOF'
+
+Next steps:
+  waydroid init                     # download an Android image
+  pkexec waydroid-nvidia-setup      # configure the NVIDIA stack (--refresh <hz>)
+  pkexec systemctl enable --now waydroid-container.service
+  systemctl --user enable --now wd-venus.service
+  # re-login once (udev rule for /dev/udmabuf), then:
+  waydroid session start
+
+Verify GPU acceleration:
+  pkexec waydroid shell dumpsys SurfaceFlinger | grep GLES
+  # should show: ANGLE (NVIDIA, Vulkan ... Venus (NVIDIA GeForce ...))
+
+EOF
+fi
