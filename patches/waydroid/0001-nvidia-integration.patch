@@ -1,17 +1,12 @@
 diff --git a/tools/actions/container_manager.py b/tools/actions/container_manager.py
-index 837ae1a..b3f2c1a 100644
+index 6e088bb..c71d4fe 100644
 --- a/tools/actions/container_manager.py
 +++ b/tools/actions/container_manager.py
-@@ -25,12 +25,21 @@ class DbusContainerManager(dbus.service.Object):
+@@ -26,7 +26,16 @@ class DbusContainerManager(dbus.service.Object):
      @dbus.service.method("id.waydro.ContainerManager", in_signature='a{ss}', out_signature='', sender_keyword="sender", connection_keyword="conn")
      def Start(self, session, sender, conn):
          dbus_info = dbus.Interface(conn.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus/Bus", False), "org.freedesktop.DBus")
 -        uid = dbus_info.GetConnectionUnixUser(sender)
--        if str(uid) not in ["0", session["user_id"]]:
--            raise RuntimeError("Cannot start a session on behalf of another user")
--        pid = dbus_info.GetConnectionUnixProcessID(sender)
--        if str(uid) != "0" and str(pid) != session["pid"]:
--            raise RuntimeError("Invalid session pid")
 +        try:
 +            uid = dbus_info.GetConnectionUnixUser(sender)
 +        except dbus.exceptions.DBusException as e:
@@ -22,16 +17,11 @@ index 837ae1a..b3f2c1a 100644
 +            logging.debug("Start() sender gone, skipping caller verification")
 +            do_start(self.args, session)
 +            return
-+        if str(uid) not in ["0", session["user_id"]]:
-+            raise RuntimeError("Cannot start a session on behalf of another user")
-+        pid = dbus_info.GetConnectionUnixProcessID(sender)
-+        if str(uid) != "0" and str(pid) != session["pid"]:
-+            raise RuntimeError("Invalid session pid")
-         do_start(self.args, session)
- 
-     @helpers.logging.log_exceptions
+         if str(uid) not in ["0", session["user_id"]]:
+             raise RuntimeError("Cannot start a session on behalf of another user")
+         pid = dbus_info.GetConnectionUnixProcessID(sender)
 diff --git a/tools/actions/session_manager.py b/tools/actions/session_manager.py
-index 4e8426c..a1b2c3d 100644
+index 4e8426c..82443f6 100644
 --- a/tools/actions/session_manager.py
 +++ b/tools/actions/session_manager.py
 @@ -66,6 +66,32 @@ def start(args, unlocked_cb=None, background=True):
@@ -86,10 +76,10 @@ index 92190ab..c1d96fe 100644
      for node in sorted(glob.glob("/dev/dri/renderD*")):
          renderDev = os.path.basename(node)
 diff --git a/tools/helpers/lxc.py b/tools/helpers/lxc.py
-index d3f6c24..e72935c 100644
+index d3f6c24..54d151b 100644
 --- a/tools/helpers/lxc.py
 +++ b/tools/helpers/lxc.py
-@@ -124,6 +124,47 @@ def generate_nodes_lxc_config(args):
+@@ -124,9 +124,76 @@ def generate_nodes_lxc_config(args):
      # NFC config
      make_entry("/system/etc/libnfc-nci.conf", options="bind,optional 0 0")
  
@@ -137,6 +127,49 @@ index d3f6c24..e72935c 100644
      return nodes
  
  LXC_APPARMOR_PROFILE = "lxc-waydroid"
++
++def lxc_supports_apparmor():
++    """True iff liblxc was built with AppArmor.
++
++    Fedora/RHEL (and some other SELinux distros) ship liblxc without
++    AppArmor. Their parser returns EINVAL for `lxc.apparmor.profile`, so
++    leaving the stock `unconfined` line in the generated config makes
++    `lxc-start` refuse to load it (waydroid#1495, waydroid-nvidia#6).
++    Kernel AppArmor being enabled is irrelevant — the key itself is invalid.
++    """
++    for lib in (
++        "/usr/lib64/liblxc.so.1",
++        "/usr/lib/liblxc.so.1",
++        "/usr/lib/x86_64-linux-gnu/liblxc.so.1",
++        "/usr/lib/aarch64-linux-gnu/liblxc.so.1",
++    ):
++        if not os.path.exists(lib):
++            continue
++        try:
++            out = subprocess.check_output(
++                ["ldd", lib], text=True, stderr=subprocess.DEVNULL)
++            return "libapparmor.so" in out
++        except (OSError, subprocess.CalledProcessError):
++            return False
++    return False
++
+ def get_apparmor_status(args):
+     enabled = False
+     if shutil.which("aa-enabled"):
+@@ -169,7 +236,12 @@ def set_lxc_config(args):
+     tools.helpers.run.user(args, command)
+     command = ["cp", "-fpr", seccomp_profile, lxc_path + "/waydroid.seccomp"]
+     tools.helpers.run.user(args, command)
+-    if get_apparmor_status(args):
++    if not lxc_supports_apparmor():
++        # config_3 ships `lxc.apparmor.profile = unconfined`. Strip every
++        # AppArmor key so liblxc built without HAVE_APPARMOR can parse the file.
++        command = ["sed", "-i", "-E", "/lxc\\.aa_profile|lxc\\.apparmor\\./d", lxc_path + "/config"]
++        tools.helpers.run.user(args, command)
++    elif get_apparmor_status(args):
+         command = ["sed", "-i", "-E", "/lxc.aa_profile|lxc.apparmor.profile/ s/unconfined/{}/g".format(LXC_APPARMOR_PROFILE), lxc_path + "/config"]
+         tools.helpers.run.user(args, command)
+ 
 diff --git a/tools/services/hardware_manager.py b/tools/services/hardware_manager.py
 index 072df41..7f74391 100644
 --- a/tools/services/hardware_manager.py

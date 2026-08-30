@@ -80,12 +80,14 @@ now** — gamescope crashes and takes the host session down with it
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash
+# or, from a checkout, without sudo:
+#   ./pkexec-install.sh
 ```
 
 This auto-detects your distro, installs dependencies, downloads the latest
 release tarballs, verifies SHA256 checksums, patches waydroid, and installs
 everything — host binaries, guest stack, systemd units, udev rules, and
-SELinux policy (Fedora).
+SELinux policy (rpm family).
 
 To install a specific release:
 
@@ -109,16 +111,20 @@ patches all upstream trees, builds mesa (guest Venus driver) and
 virglrenderer (host renderer) from source, and installs everything.
 
 **Note:** ANGLE, hwcomposer, and surfaceflinger are not built by
-`--source`.  If the release for this tag includes a prebuilts tarball, run
-without `--source` instead; otherwise copy them manually into
-`/usr/lib/waydroid-nvidia/guest/`.
+`--source`. The installer fetches the `guest-prebuilts` tarball from the
+same tag when it exists, and otherwise falls back to the last known-good
+upstream asset (`Shiro836/waydroid-nvidia` v0.1.2). `waydroid-nvidia-setup`
+requires those files — a stock install without them cannot pass payload
+validation.
 
 ### After installing (both methods)
 
 ```sh
 waydroid init -s GAPPS
-sudo waydroid-nvidia-setup
-sudo systemctl enable --now waydroid-container.service
+# Fedora / other rpm-family waydroid 1.6 packages need explicit OTA URLs:
+#   pkexec waydroid init -f -c https://ota.waydro.id/system -v https://ota.waydro.id/vendor
+pkexec waydroid-nvidia-setup
+pkexec systemctl enable --now waydroid-container.service
 systemctl --user enable --now wd-venus.service
 # re-login once, then:
 waydroid session start
