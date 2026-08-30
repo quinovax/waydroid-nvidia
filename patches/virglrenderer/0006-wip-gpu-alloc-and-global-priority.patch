@@ -1585,7 +1585,7 @@ index f3212ad7..3a9cbbb3 100644
  
  int vtest_drm_sync_create(UNUSED uint32_t length_dw)
 diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
-index dcf1b192..94584fe4 100644
+index dcf1b192..6e1ea1d8 100644
 --- a/vtest/vtest_server.c
 +++ b/vtest/vtest_server.c
 @@ -33,12 +33,16 @@
@@ -1646,7 +1646,21 @@ index dcf1b192..94584fe4 100644
  enum vtest_client_result {
     VTEST_CLIENT_DISCONNECTED = 1,
     VTEST_CLIENT_ERROR_INPUT_READ,
-@@ -426,6 +464,11 @@ static void vtest_server_open_socket(void)
+@@ -272,6 +310,13 @@ static void vtest_server_parse_args(int argc, char **argv)
+       server.multi_clients = false;
+    }
+ 
++   /* Venus does not use vrend. On NVIDIA proprietary, virgl_egl_init
++    * aborts in libepoxy when eglCreateSyncKHR is missing from the mixed
++    * Mesa/NVIDIA EGL stack. Skip GL unless the user asked for it. */
++   if (server.venus && !server.use_glx && !server.use_gles &&
++       !server.use_egl_surfaceless)
++      server.no_virgl = true;
++
+    if (!server.no_virgl) {
+       server.ctx_flags = VIRGL_RENDERER_USE_EGL;
+       if (server.use_glx) {
+@@ -426,6 +471,11 @@ static void vtest_server_open_socket(void)
        goto err;
     }
  
@@ -1658,7 +1672,7 @@ index dcf1b192..94584fe4 100644
     return;
  
  err:
-@@ -525,6 +568,7 @@ static void vtest_server_dispatch_clients(void)
+@@ -525,6 +575,7 @@ static void vtest_server_dispatch_clients(void)
        int ret;
  
        if (client->context_need_poll) {
@@ -1666,7 +1680,7 @@ index dcf1b192..94584fe4 100644
           vtest_poll_context(client->context);
           client->context_need_poll = false;
        }
-@@ -732,8 +776,37 @@ static const struct vtest_command {
+@@ -732,8 +783,37 @@ static const struct vtest_command {
     HANDLER(RESOURCE_EXPORT_FD,          resource_export_fd,        true   ),
     HANDLER(SYNC_EXPORT_SYNC_FILE,       sync_export_sync_file,     true   ),
     HANDLER(RESOURCE_IMPORT_BLOB,        resource_import_blob,      true   ),
@@ -1704,7 +1718,7 @@ index dcf1b192..94584fe4 100644
  static int vtest_client_dispatch_commands(struct vtest_client *client)
  {
     TRACE_FUNC();
-@@ -766,6 +839,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
+@@ -766,6 +846,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
  
     vtest_poll_resource_busy_wait();
     if (header[1] <= 0 || header[1] >= ARRAY_SIZE(vtest_commands)) {
@@ -1713,7 +1727,7 @@ index dcf1b192..94584fe4 100644
        return VTEST_CLIENT_ERROR_COMMAND_ID;
     }
  
-@@ -785,8 +860,30 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
+@@ -785,8 +867,30 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
  
     vtest_set_current_context(client->context);
  
