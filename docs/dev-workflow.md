@@ -81,6 +81,9 @@ Iron rules learned the hard way:
 
 - **Always restart the whole stack** (`dev/restart`); never kill
   composer/SurfaceFlinger individually — SF zombies with `flips=0`.
+  The patched session already restarts `wd-venus` on start and stops it on
+  stop; `dev/restart` still bounces Venus first so a hung renderer cannot
+  poison the next connect.
 - **After deploying any guest `.so`, a full container restart is mandatory** —
   bind-mounted libraries keep their old inode for running processes.
 - Bind-mount targets must be real files in the image, never symlinks.

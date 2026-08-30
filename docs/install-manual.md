@@ -84,8 +84,11 @@ Same as the AUR steps from `waydroid init` onward — the container unit is
 waydroid init
 sudo waydroid-nvidia-setup           # add --refresh <hz> to match your monitor
 sudo systemctl enable --now waydroid-container.service
-systemctl --user enable --now wd-venus.service
 waydroid session start
 ```
+
+`wd-venus.service` is started and stopped by the patched session. Do not
+`systemctl --user enable` it — leftover vtest clients after a session
+restart block the next SurfaceFlinger connect.
 
 If anything misbehaves, see [`troubleshooting.md`](troubleshooting.md).

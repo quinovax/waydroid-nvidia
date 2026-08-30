@@ -132,10 +132,13 @@ waydroid init -s GAPPS
 #   pkexec waydroid init -f -c https://ota.waydro.id/system -v https://ota.waydro.id/vendor
 pkexec waydroid-nvidia-setup
 pkexec systemctl enable --now waydroid-container.service
-systemctl --user enable --now wd-venus.service
 # re-login once, then:
 waydroid session start
 ```
+
+The patched session starts and stops `wd-venus.service` with itself. Do
+**not** `systemctl --user enable` it: leftover vtest clients after a session
+restart block the next SurfaceFlinger connect (listen Recv-Q on `venus.sock`).
 
 **Manual install / other distros:** see
 [`docs/install-manual.md`](docs/install-manual.md).

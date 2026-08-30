@@ -549,9 +549,9 @@ Next steps (dnf/rpm family — Fedora, Nobara, Bazzite, RHEL, …):
   pkexec waydroid init -f -c https://ota.waydro.id/system -v https://ota.waydro.id/vendor
   pkexec waydroid-nvidia-setup        # configure the NVIDIA stack (--refresh <hz>)
   pkexec systemctl enable --now waydroid-container.service
-  systemctl --user enable --now wd-venus.service
   # re-login once (udev rule for /dev/udmabuf), then:
   waydroid session start
+  # the patched session starts/stops wd-venus; do not enable that unit
 
 Verify GPU acceleration:
   pkexec waydroid shell dumpsys SurfaceFlinger | grep GLES
@@ -565,9 +565,9 @@ Next steps:
   waydroid init                     # download an Android image
   pkexec waydroid-nvidia-setup      # configure the NVIDIA stack (--refresh <hz>)
   pkexec systemctl enable --now waydroid-container.service
-  systemctl --user enable --now wd-venus.service
   # re-login once (udev rule for /dev/udmabuf), then:
   waydroid session start
+  # the patched session starts/stops wd-venus; do not enable that unit
 
 Verify GPU acceleration:
   pkexec waydroid shell dumpsys SurfaceFlinger | grep GLES

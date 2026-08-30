@@ -40,7 +40,8 @@ clone → apply → build path locally.
 
 1. **Host renderer** — virglrenderer at `patches/virglrenderer/BASE`, apply
    series, copy `src/virglrenderer-vtest/*` into `vtest/`, `meson` + `ninja`
-   (`build/virglrenderer/build.sh`). Runs as the `wd-venus` systemd user unit.
+   (`build/virglrenderer/build.sh`). Runs as the `wd-venus` systemd user unit,
+   started and stopped with the Waydroid session.
 2. **Guest Mesa Venus** — mesa at `patches/mesa/BASE`, apply, then NDK
    cross-build both `ANDROID_ABI=x86_64` and `ANDROID_ABI=x86`
    (`build/mesa/build.sh`). The latter uses the NDK's

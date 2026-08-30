@@ -117,7 +117,7 @@ native. Opt-out with `VN_NO_ASTC_EMU=1`. ETC2 is not yet emulated.
 | gralloc | minigbm `gbm_mesa_driver/` | net-new `vtest_wrapper.c` allocating via `VCMD_RESOURCE_ALLOC_GPU` |
 | Display | android_hardware_waydroid (hwcomposer) | refresh override; direct (subsurface) composition with compositor-compatibility gate; opaque-layer alpha handling; fence lifecycle fixes; single-window layer selection |
 | Guest SurfaceFlinger | LineageOS 20 `frameworks/native` | prop-tunable vsync snap window (enables >333 Hz) |
-| Integration | waydroid `lxc.py`, `hardware_manager.py` | emit mounts/props in generators; `suspend_action=none` |
+| Integration | waydroid `lxc.py`, `hardware_manager.py`, `session_manager.py` | emit mounts/props in generators; `suspend_action=none`; session owns `wd-venus` |
 
 ## Waydroid integration points (`patches/waydroid`)
 
@@ -129,6 +129,12 @@ native. Opt-out with `VN_NO_ASTC_EMU=1`. ETC2 is not yet emulated.
   props live in `waydroid.cfg [properties]`.
 - `tools/services/hardware_manager.py` honors `suspend_action = none` so the
   container isn't `lxc-freeze`d when the Android screen blanks.
+- `tools/actions/session_manager.py` starts `wd-venus.service` with the
+  session (`systemctl --user restart`, then waits for the unix socket) and
+  stops it when the session/container stops. Leaving Venus up across a
+  session bounce keeps leftover vtest clients on the listen socket; the next
+  SurfaceFlinger `connect()` queues (Recv-Q) and never registers
+  `aidl/SurfaceFlinger`. Do not enable the unit for `default.target`.
 
 ## Host capabilities relied upon
 

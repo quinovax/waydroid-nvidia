@@ -21,42 +21,131 @@ index 6e088bb..c71d4fe 100644
              raise RuntimeError("Cannot start a session on behalf of another user")
          pid = dbus_info.GetConnectionUnixProcessID(sender)
 diff --git a/tools/actions/session_manager.py b/tools/actions/session_manager.py
-index 4e8426c..82443f6 100644
+index 4e8426c..7f3c086 100644
 --- a/tools/actions/session_manager.py
 +++ b/tools/actions/session_manager.py
-@@ -66,6 +66,32 @@ def start(args, unlocked_cb=None, background=True):
+@@ -3,7 +3,10 @@
+ import logging
+ import os
+ import signal
++import socket
++import subprocess
+ import sys
++import time
+ import tools.config
+ import tools.helpers.ipc
+ from tools import services
+@@ -13,6 +16,62 @@ import dbus.exceptions
+ from gi.repository import GLib
+ import copy
+ 
++VENUS_UNIT = "wd-venus.service"
++
++
++def _nvidia_venus_socket(args):
++    return tools.config.load(args)["waydroid"].get("nvidia_venus_socket")
++
++
++def _systemctl_user(verb, unit=VENUS_UNIT, timeout=20):
++    try:
++        return subprocess.run(
++            ["systemctl", "--user", verb, unit],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++            text=True, timeout=timeout)
++    except (OSError, subprocess.TimeoutExpired) as e:
++        logging.error("systemctl --user %s %s failed: %s", verb, unit, e)
++        return None
++
++
++def start_venus(args):
++    """Restart wd-venus for this session so leftover clients cannot block SF."""
++    venus_socket = _nvidia_venus_socket(args)
++    if not venus_socket:
++        return
++    logging.info("Starting %s for this session", VENUS_UNIT)
++    result = _systemctl_user("restart")
++    if result is None or result.returncode != 0:
++        err = (result.stderr or result.stdout or "").strip() if result else "systemctl failed"
++        logging.error("Could not start %s: %s", VENUS_UNIT, err)
++        logging.error("Is the waydroid-nvidia user unit installed?")
++        sys.exit(1)
++    last_err = None
++    for _ in range(25):
++        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        try:
++            sock.settimeout(0.5)
++            sock.connect(venus_socket)
++            return
++        except OSError as e:
++            last_err = e
++            time.sleep(0.2)
++        finally:
++            sock.close()
++    why = last_err.strerror if last_err is not None else "unknown error"
++    logging.error("Venus render server socket '%s' is not accepting connections (%s).",
++                  venus_socket, why)
++    sys.exit(1)
++
++
++def stop_venus(args):
++    """Stop wd-venus with the session so the next start is a clean renderer."""
++    if not _nvidia_venus_socket(args):
++        return
++    logging.info("Stopping %s with the session", VENUS_UNIT)
++    _systemctl_user("stop")
++
++
+ class DbusSessionManager(dbus.service.Object):
+     def __init__(self, looper, bus, object_path, args):
+         self.args = args
+@@ -23,10 +82,12 @@ class DbusSessionManager(dbus.service.Object):
+     def Stop(self):
+         do_stop(self.args, self.looper)
+         stop_container(quit_session=False)
++        stop_venus(self.args)
+ 
+ def handle_disconnect(args, looper):
+     do_stop(args, looper)
+     stop_container(quit_session=False)
++    stop_venus(args)
+ 
+ def service(args, looper):
+     bus = dbus.SessionBus()
+@@ -66,6 +127,10 @@ def start(args, unlocked_cb=None, background=True):
          logging.error(f"Wayland socket '{wayland_socket_path}' doesn't exist; are you running a Wayland compositor?")
          sys.exit(1)
  
-+    # NVIDIA Venus mode (nvidia_venus_socket set by waydroid-nvidia-setup):
-+    # the guest renders through this socket; without it SurfaceFlinger can
-+    # only crash-loop. Refuse to start and say exactly what is wrong.
-+    venus_socket = tools.config.load(args)["waydroid"].get("nvidia_venus_socket")
-+    if venus_socket:
-+        # Short retry: wd-venus and session start race on cold login.
-+        import socket as _socket
-+        import time as _time
-+        last_err = None
-+        for _attempt in range(25):
-+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-+            try:
-+                sock.settimeout(0.5)
-+                sock.connect(venus_socket)
-+                last_err = None
-+                break
-+            except OSError as e:
-+                last_err = e
-+                _time.sleep(0.2)
-+            finally:
-+                sock.close()
-+        if last_err is not None:
-+            logging.error(f"Venus render server socket '{venus_socket}' is not accepting connections ({last_err.strerror}).")
-+            logging.error("Start it as your desktop user: systemctl --user enable --now wd-venus.service")
-+            sys.exit(1)
++    # NVIDIA Venus: session owns wd-venus so leftover clients cannot poison
++    # the next SurfaceFlinger connect. No-op when nvidia_venus_socket is unset.
++    start_venus(args)
 +
      waydroid_data = session["waydroid_data"]
      if not os.path.isdir(waydroid_data):
          os.makedirs(waydroid_data)
+@@ -86,6 +151,7 @@ def start(args, unlocked_cb=None, background=True):
+     def sigint_handler(data):
+         do_stop(args, mainloop)
+         stop_container(quit_session=False)
++        stop_venus(args)
+ 
+     def sigusr_handler(data):
+         do_stop(args, mainloop)
+@@ -97,6 +163,7 @@ def start(args, unlocked_cb=None, background=True):
+     try:
+         tools.helpers.ipc.DBusContainerService().Start(session)
+     except dbus.DBusException as e:
++        stop_venus(args)
+         logging.debug(e)
+         if e.get_dbus_name().startswith("org.freedesktop.DBus.Python"):
+             logging.error(e.get_dbus_message().splitlines()[-1])
+@@ -120,6 +187,7 @@ def stop(args):
+         tools.helpers.ipc.DBusSessionService().Stop()
+     except dbus.DBusException:
+         stop_container(quit_session=True)
++        stop_venus(args)
+ 
+ def stop_container(quit_session):
+     try:
 diff --git a/tools/helpers/gpu.py b/tools/helpers/gpu.py
 index 92190ab..c1d96fe 100644
 --- a/tools/helpers/gpu.py
