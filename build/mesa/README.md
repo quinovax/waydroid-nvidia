@@ -98,8 +98,8 @@ yay -S waydroid-nvidia-bin
 waydroid init
 sudo waydroid-nvidia-setup
 sudo systemctl enable --now waydroid-container.service
-systemctl --user enable --now wd-venus.service
 waydroid session start
+# patched session starts/stops wd-venus; do not enable that unit
 ```
 
 Inside the guest, verify the ABI list and renderer:
