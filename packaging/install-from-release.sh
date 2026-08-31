@@ -25,7 +25,7 @@ SKIP_BUILD=0
 # repository's last release that includes them.
 PREBUILTS_FALLBACK_URL="https://github.com/CinQwQeggs01/waydroid-nvidia/releases/download/v0.1.1"
 PREBUILTS_FALLBACK_FILE="waydroid-nvidia-guest-prebuilts-v0.1.1.tar.gz"
-PREBUILTS_FALLBACK_SHA256="a3f49671dd460134f38433c7a89b8916bc95329c68f413bd94c1c22a5ab48ca6"
+PREBUILTS_FALLBACK_SHA256="31a76fe8f811295ef9ccbd5ffb7005249978a128ce0cf95e32148c3de11515d7"
 
 die()  { echo "FATAL: $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*"; }
@@ -515,7 +515,7 @@ ok "waydroid entry point pinned to $PYBIN"
 
 # ---- install systemd units, udev rules, tmpfiles, setup script ----
 info "installing host integration files"
-P="$REPO_SRC/packaging/aur/waydroid-nvidia-bin"
+P="$REPO_SRC/packaging/host"
 
 install -Dm644 "$P/wd-venus.service"        /usr/lib/systemd/user/wd-venus.service
 install -Dm644 "$P/waydroid-venus.tmpfiles" /usr/lib/tmpfiles.d/waydroid-venus.conf

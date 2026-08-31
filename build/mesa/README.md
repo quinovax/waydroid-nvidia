@@ -14,8 +14,7 @@ Waydroid by itself.
 | `build/angle/args-x86.gn` | 32-bit Android ANGLE GN arguments. |
 | `build/angle/args-x86_64.gn` | 64-bit Android ANGLE GN arguments. |
 | `patches/waydroid/0001-nvidia-integration.patch` | Adds the NVIDIA Venus LXC mounts, including the dual-ABI `vendor/lib` and `vendor/lib64` layout. |
-| `packaging/aur/waydroid-nvidia-bin/PKGBUILD` | Installs the path-preserving guest payload. |
-| `packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-setup` | Validates and installs the guest payload, then regenerates Waydroid mounts. |
+| `packaging/host/waydroid-nvidia-setup` | Validates and installs the guest payload, then regenerates Waydroid mounts. |
 | `packaging/host/wd-deploy` | Validates and deploys one development artifact into the guest tree. |
 | `dev/build` and `dev/deploy` | Incremental build/deploy wrappers for the development loop. |
 | `docs/building.md` and `docs/dev-workflow.md` | Full clean-room and development workflows. |
@@ -94,7 +93,7 @@ current `sudo waydroid-nvidia-setup` before the first development deploy.
 Use a release containing the dual-ABI guest tarballs, then run:
 
 ```sh
-yay -S waydroid-nvidia-bin
+sudo ./packaging/install-from-release.sh
 waydroid init
 sudo waydroid-nvidia-setup
 sudo systemctl enable --now waydroid-container.service

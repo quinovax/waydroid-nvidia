@@ -21,7 +21,7 @@ often via sudo mcp, get NOPASSWD rights for it.
 
 - Orientation: README.md, then docs/building.md (repo layout, per-component
   recipes, pins), docs/architecture.md, docs/transport-design.md.
-- Everything builds locally: `packaging/aur/reproduce.sh` runs the same
+- Everything builds locally: `packaging/reproduce.sh` runs the same
   clone→apply→build path CI does. Validate hermetically (a container with
   CI parity) before pushing — do NOT use CI as a remote grep/build/debug
   service.

@@ -1,12 +1,12 @@
 # dev/ — the change → test loop
 
-This repo is **patches + net-new source + build glue** (the AUR artifact). The
-code is edited and built in three external trees; these scripts orchestrate them
-so you never think about where anything lives.
+This repo is **patches + net-new source + build glue**. The code is edited
+and built in three external trees; these scripts orchestrate them so you
+never think about where anything lives.
 
 | Role | Path | What it is |
 |---|---|---|
-| **This repo** | `~/repos/waydroid-nvidia` | AUR source of truth: `patches/`, `src/`, build glue, `dev/` |
+| **This repo** | `~/repos/waydroid-nvidia` | `patches/`, `src/`, build glue, `dev/` |
 | **Runtime** | `~/repos/waydroid` | the waydroid python checkout that actually runs (`waydroid.py`) |
 | **Build trees** | `~/repos/waydroid-nv/{mesa,virglrenderer,hwcomposer-src,angle-src}` | native components; hold the WIP the patches capture |
 
@@ -21,7 +21,7 @@ All paths live in **`dev/env.sh`** and are overridable from the environment
 dev/iter mesa          # or: hwc | virgl | angle | none
 
 # 3. read the frame numbers, iterate. when a change is good:
-dev/sync-patches       # regenerate patches/ + src/ from the trees (AUR honesty)
+dev/sync-patches       # regenerate patches/ + src/ from the trees
 git add -A patches/ src/ && git commit
 ```
 
@@ -41,18 +41,18 @@ git add -A patches/ src/ && git commit
 | `dev/status` / `dev/logs` | truth snapshot / aggregated logs (`-f`, `gfx`, `crash`, `units`) |
 | `dev/wd` / `dev/wdu` | run the runtime checkout as root / user |
 
-## One recipe, dev + AUR share it
+## One recipe, dev and clean-room share it
 
 `dev/build` doesn't hardcode build commands — it calls `build/<comp>/build.sh`
-against the persistent tree. The AUR validator `packaging/aur/reproduce.sh`
-calls the *same* recipes against a fresh checkout at `patches/<comp>/BASE`. So
-what you dev-test is what a stranger builds. Run the clean-room check anytime:
+against the persistent tree. `packaging/reproduce.sh` calls the same recipes
+against a fresh checkout at `patches/<comp>/BASE`. Run the clean-room check
+anytime:
 
 ```sh
-packaging/aur/reproduce.sh mesa virgl     # fully reproducible components
+packaging/reproduce.sh mesa virgl     # fully reproducible components
 ```
 
-See `packaging/aur/README.md` + `PREREQS.md` for the full story and the gaps.
+See `packaging/PREREQS.md` for per-component provisioning.
 
 ## Rules baked in (learned the hard way — see STATE.md)
 
@@ -75,6 +75,6 @@ trailing `wip` patch:
 | Component | BASE | committed → | WIP → |
 |---|---|---|---|
 | mesa | `a8ce4d8` | `0001`,`0002` | `0003-wip-ahb-memory-steering` |
-| virglrenderer | `dc35e4d` | `0001`–`0003` | `0004-wip-gpu-alloc-and-global-priority` + net-new `src/` |
+| virglrenderer | `dc35e4d` | `0001`–`0005` | `0006-wip-gpu-alloc-and-global-priority` + net-new `src/` |
 | hwcomposer | `7750307` | — | `0001-wip-nvidia-fixes` |
 | waydroid | `a33a5c0` | — | `0001-nvidia-integration` |

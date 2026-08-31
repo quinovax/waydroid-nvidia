@@ -5,7 +5,7 @@
 #   WAYDROID_SRC=/somewhere/else dev/restart
 #
 # The three trees this repo orchestrates (see docs/dev-workflow.md):
-#   REPO         this repo — AUR source of truth (patches/ + src/ + build glue)
+#   REPO         this repo (patches/ + src/ + build glue)
 #   WAYDROID_SRC the runtime waydroid python checkout (waydroid.py, live lxc.py)
 #   WNV/*        native component build trees (mesa / virgl / hwcomposer / angle)
 
