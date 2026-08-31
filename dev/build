@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build — compile one (or all) native component(s) by calling the shared build
 # recipe (build/<comp>/build.sh) against the PERSISTENT working tree
-# (incremental). packaging/aur reproduce.sh calls the SAME recipes against a
+# (incremental). packaging/reproduce.sh calls the SAME recipes against a
 # fresh checkout — one recipe, two front-ends. Does NOT deploy (see dev/deploy).
 # Usage: dev/build <mesa[-x86|-x86_64]|virgl|hwc|gralloc|angle[-x86|-x86_64]|all>
 source "$(dirname "$(readlink -f "$0")")/env.sh"

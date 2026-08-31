@@ -3,9 +3,9 @@
 # Standalone NDK build of hwcomposer.waydroid.so (waydroid hwcomposer, vendor
 # module) against headers from AOSP android-13 clones and the image's own
 # shared libraries. No AOSP build system required. Produces both the .so and a
-# stripped .so. The ONE hwcomposer recipe (dev/build + packaging/aur).
+# stripped .so. The ONE hwcomposer recipe (dev/build + packaging/reproduce.sh).
 #
-# PREREQS (hand-provisioned today; see packaging/aur/PREREQS.md — the remaining
+# PREREQS (hand-provisioned today; see packaging/PREREQS.md — the remaining
 # gap before a fully clean-room build). All under $WNV by default:
 #   aosp_* shallow header clones (libhidl, libhwbinder, fmq, system_core,
 #     frameworks_native, libbase, libhardware, ...), android_system_logging,

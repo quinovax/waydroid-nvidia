@@ -1,4 +1,4 @@
-# Manual installation (non-Arch distros)
+# Manual installation
 
 The release binaries install anywhere systemd + Waydroid's dependencies exist.
 Host binaries are CI-built on Ubuntu 24.04 (glibc ≥ 2.39) and link `libepoxy`,
@@ -62,7 +62,7 @@ checks every ANGLE/Venus ELF before changing the Waydroid configuration.
 ## 4. Units, tmpfiles, udev rule, setup helper
 
 ```sh
-P=packaging/aur/waydroid-nvidia-bin
+P=packaging/host
 sudo install -Dm644 $P/wd-venus.service        /etc/systemd/user/wd-venus.service
 sudo install -Dm644 $P/waydroid-venus.tmpfiles /etc/tmpfiles.d/waydroid-venus.conf
 sudo install -Dm644 $P/waydroid-nvidia.rules   /etc/udev/rules.d/70-waydroid-nvidia.rules
@@ -77,8 +77,8 @@ installing it.
 
 ## 5. Initialize and start
 
-Same as the AUR steps from `waydroid init` onward — the container unit is
-`waydroid-container.service`, installed by `make install` in step 1:
+The container unit is `waydroid-container.service`, installed by
+`make install` in step 1:
 
 ```sh
 waydroid init

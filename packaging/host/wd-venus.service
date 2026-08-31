@@ -1,0 +1,23 @@
+[Unit]
+Description=Venus vtest render server for waydroid-nvidia
+# The patched waydroid session starts and stops this unit. Do not enable it
+# for default.target: leftover vtest clients after a session restart block
+# the next SurfaceFlinger connect (listen Recv-Q stuck on venus.sock).
+
+[Service]
+Environment=RENDER_SERVER_EXEC_PATH=/usr/lib/waydroid-nvidia/virgl_render_server
+Environment=LD_LIBRARY_PATH=/usr/lib/waydroid-nvidia
+# Multi-client Venus (SF + HWUI + apps) holds many dmabuf/sync_file fds.
+# The default 1024 rlimit turns GetFenceFdKHR into TOO_MANY_OBJECTS and a
+# monotonic FPS collapse (issue #4).
+LimitNOFILE=65536
+# --no-virgl: this stack is Venus-only. Leaving vrend/EGL enabled makes
+# virgl_egl_init abort on NVIDIA proprietary (libepoxy eglCreateSyncKHR)
+# and SurfaceFlinger crash-loops against the dead socket.
+ExecStart=/usr/lib/waydroid-nvidia/virgl_test_server --no-virgl --venus --multi-clients --socket-path /run/waydroid-venus/venus.sock
+Restart=on-failure
+RestartSec=1
+
+[Install]
+# Optional always-on. Session start/stop owns the lifecycle by default.
+WantedBy=default.target

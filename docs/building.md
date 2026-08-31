@@ -26,8 +26,8 @@ build/              one build recipe per component
   angle/              pinned gn args
   lineage-20/         surfaceflinger / full image build scripts
 packaging/ci/       pinned upstream SHAs (pins.env, hwc-pins.env) consumed by CI
-packaging/aur/      PKGBUILD (waydroid-nvidia-bin), release docs, reproduce.sh
-packaging/host/     host helpers (wd-deploy, wd-launch desktop launcher)
+packaging/host/     setup helper, systemd/udev/tmpfiles, wd-deploy, wd-launch
+packaging/reproduce.sh  clean-room clone → apply → build (same recipes as CI)
 tests/              C probes that de-risked each step + the portable GPU probe kit
 docs/               architecture, transport design, install, troubleshooting
 ```
@@ -35,7 +35,7 @@ docs/               architecture, transport design, install, troubleshooting
 ## Components and recipes
 
 Every binary in a release is CI-built from these exact recipes
-(`.github/workflows/build.yml`); `packaging/aur/reproduce.sh` runs the same
+(`.github/workflows/build.yml`); `packaging/reproduce.sh` runs the same
 clone → apply → build path locally.
 
 1. **Host renderer** — virglrenderer at `patches/virglrenderer/BASE`, apply
@@ -65,7 +65,7 @@ clone → apply → build path locally.
    that carries the ~150 GB synced tree. Note: AOSP's `envsetup.sh` is not
    `set -u` clean — don't source it from strict-mode scripts.
 7. **waydroid** — python patches only (`patches/waydroid/`), applied at the
-   pinned base by the PKGBUILD / manual install.
+   pinned base by the installer / manual install.
 
 ## CI notes
 

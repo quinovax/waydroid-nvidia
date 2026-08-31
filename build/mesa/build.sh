@@ -3,7 +3,7 @@
 # Cross-build the guest Venus driver (libvulkan_virtio.so) for Android x86_64
 # or x86.
 # The ONE mesa build recipe: used by dev/build (persistent tree, incremental)
-# and packaging/aur reproduce (fresh checkout). Generates a portable meson
+# and packaging/reproduce.sh (fresh checkout). Generates a portable meson
 # cross file from env — no hardcoded home path, no ccache dependency.
 #
 # Env:

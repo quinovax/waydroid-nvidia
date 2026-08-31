@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sync-patches — regenerate patches/ and net-new src/ in THIS repo from the
-# working trees, so the AUR build (clone BASE -> apply series -> build)
+# working trees, so packaging/reproduce.sh (clone BASE -> apply series -> build)
 # reproduces exactly what was tested. Run before every commit of a code change.
 # Does NOT commit — prints a git-status summary for you to review.
 #

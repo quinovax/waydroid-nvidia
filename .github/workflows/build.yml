@@ -1,10 +1,10 @@
 ---
 # Clean-room CI builds of the waydroid-nvidia components that are fully
-# scripted today (see packaging/aur/PREREQS.md): the dual-ABI guest Venus drivers
+# scripted today (see packaging/PREREQS.md): the dual-ABI guest Venus drivers
 # (mesa), the host renderer (virglrenderer) and the gralloc backend.
 # Each job reproduces the stranger's path: fetch upstream at the pinned
 # BASE commit, apply patches/, build via the same build/<comp>/build.sh
-# the dev loop uses (one recipe, see packaging/aur/README.md).
+# the dev loop uses (one recipe, see packaging/reproduce.sh).
 #
 # On v* tags the release job packages the artifacts with SHA256SUMS and a
 # SLSA build-provenance attestation, so users can verify that a downloaded
@@ -19,7 +19,7 @@ name: build
 
 on:
   push:
-    branches: [main, ci-aur]
+    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:

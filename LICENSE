@@ -42,5 +42,5 @@ by those upstreams' licenses:
     patches/hwcomposer/     Apache-2.0    (android_hardware_waydroid)
     patches/waydroid/       GPL-3.0       (waydroid)
 
-When built and distributed (e.g. as an AUR package), the combined work must
+When built and distributed, the combined work must
 respect each upstream component's license.

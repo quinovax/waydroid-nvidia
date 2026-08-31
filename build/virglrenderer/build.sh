@@ -2,10 +2,10 @@
 # build/virglrenderer/build.sh SRCDIR [BUILDDIR]
 # Build the host Venus renderer (virgl_test_server + render server). The ONE
 # virgl build recipe: drops the net-new vtest allocator source into the tree,
-# then meson + ninja. Used by dev/build and packaging/aur reproduce.
+# then meson + ninja. Used by dev/build and packaging/reproduce.sh.
 #
 # The net-new src (src/virglrenderer-vtest/vtest_gpu_alloc.{c,h}) is referenced
-# by the vtest/meson.build change in patch 0004, so it must sit in vtest/.
+# by the vtest/meson.build change in patch 0006, so it must sit in vtest/.
 set -euo pipefail
 SRCDIR="${1:?usage: build.sh SRCDIR [BUILDDIR]}"
 BUILDDIR="${2:-$SRCDIR/build}"
