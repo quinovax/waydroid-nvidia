@@ -128,6 +128,17 @@ MODESET=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo miss
 Add nvidia_drm.modeset=1 to your kernel parameters or modprobe.d and reboot."
 echo "== nvidia-drm.modeset: Y"
 
+HOST_VTEST=/usr/lib/waydroid-nvidia/virgl_test_server
+[ -x "$HOST_VTEST" ] || die "$HOST_VTEST missing (broken package?)"
+if command -v strings >/dev/null 2>&1 && \
+   ! strings "$HOST_VTEST" | grep -q RESOURCE_ALLOC_GPU; then
+    die "$HOST_VTEST was built without VCMD_RESOURCE_ALLOC_GPU (issue #7).
+The v0.1.1 host tarball applied virgl patches 0001–0004 only, so guest
+gralloc cannot allocate scanout buffers and SurfaceFlinger abort-loops
+(black screen). Rebuild the host renderer from current main and reinstall."
+fi
+echo "== host renderer: VCMD_RESOURCE_ALLOC_GPU present"
+
 # The stack hooks the AIDL minigbm gralloc; pre-minigbm vendor images give
 # SurfaceFlinger buffers our driver never sees -> crash loop (issue #1:
 # system and vendor images version independently, and 'upgrade -o' never
@@ -172,13 +183,23 @@ for k in list(cp["properties"].keys()):
         print("   removing stale gralloc override: {} = {}".format(
             k, cp["properties"][k]))
         cp.remove_option("properties", k)
+# skiagl (ANGLE GLES) rather than skiavk: every HWUI process as a Venus
+# Vulkan client serialises through the single-threaded vtest server and
+# races SurfaceFlinger. skiagl shares ANGLE with RenderEngine, which is
+# the stable UI path (WebView, Play Store, SystemUI). Games still use
+# virtio Vulkan / ANGLE GLES directly. Override with skiavk if wanted.
+#
+# supportsYUVSamplerConversion: ANGLE's hardware YCbCr sampler aborts
+# when a decoder buffer is not a real multi-planar VkImage (issue #16).
+# Shader conversion is correct for both the NV12 path and the blob fallback.
 props = {
     "ro.hardware.egl": "angle",
     "ro.hardware.vulkan": "virtio",
     "mesa.vn.debug": "vtest",
     "mesa.vtest.socket.name": "/dev/venus/venus.sock",
-    "debug.hwui.renderer": "skiavk",
+    "debug.hwui.renderer": "skiagl",
     "debug.renderengine.backend": "skiaglthreaded",
+    "debug.angle.feature_overrides_disabled": "supportsYUVSamplerConversion",
     "debug.sf.nobootanimation": "1",
     "persist.waydroid.use_subsurface": "true",
     "ro.surface_flinger.vsync_event_phase_offset_ns": "0",
@@ -250,6 +271,70 @@ PYEOF
     fi
 else
     echo "   $ABRT_SAVE not found (ABRT not installed? skipping)"
+fi
+
+echo "== clearing stale HWUI shader caches (issue #13)"
+# Stock Waydroid on NVIDIA writes a SwiftShader BlobCache. After switching
+# to Venus/skiagl that cache SIGFPEs SystemUI in BlobCache::clean() (% 0).
+# App userdata is the session dir (~/.local/share/waydroid/data), NOT
+# /var/lib/waydroid/data. Wipe both, plus the skia/opengl cache files.
+wipe_hwui_caches() {
+    local data="$1" n=0 root
+    [ -d "$data" ] || { echo 0; return 0; }
+    for root in "$data/user_de/0" "$data/data"; do
+        [ -d "$root" ] || continue
+        # `read -d ''` returns 1 on EOF; with set -e that would abort
+        # the function before any caches are removed.
+        while IFS= read -r -d '' d || [ -n "${d:-}" ]; do
+            rm -rf "$d" || true
+            n=$((n + 1))
+        done < <(find "$root" -type d -name code_cache -print0 2>/dev/null) || true
+        while IFS= read -r -d '' f || [ -n "${f:-}" ]; do
+            rm -f "$f" || true
+            n=$((n + 1))
+        done < <(find "$root" \( -name 'com.android.opengl.shaders_cache' -o -name 'com.android.skia.shaders_cache' \) -print0 2>/dev/null) || true
+    done
+    echo "$n"
+    return 0
+}
+# Session userdata is ~/.local/share/waydroid/data; /var/lib/waydroid/data
+# is often absent. Scan invoking-user home first so a later abort still
+# cleared the SIGFPE caches.
+DATASETS=()
+add_home_data() {
+    local h="$1"
+    # `set -e` is inherited here; a non-waydroid home (e.g. /home/linuxbrew)
+    # makes the guarded `[ -d … ]` chain return 1, and that bare call in the
+    # /home/* loop used to abort the whole setup before the cache wipe and
+    # `waydroid upgrade -o` ran. Always report success so a missing dataset
+    # is a no-op, never a fatal error.
+    [ -n "$h" ] && [ -d "$h/.local/share/waydroid/data" ] && DATASETS+=("$h/.local/share/waydroid/data")
+    return 0
+}
+if [ -n "${PKEXEC_UID:-}" ]; then
+    add_home_data "$(getent passwd "$PKEXEC_UID" | cut -d: -f6)"
+fi
+if [ -n "${SUDO_USER:-}" ]; then
+    add_home_data "$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+fi
+for h in /home/*; do
+    add_home_data "$h"
+done
+DATASETS+=(/var/lib/waydroid/data)
+wiped=0
+seen=" "
+for DATA in "${DATASETS[@]}"; do
+    case "$seen" in *" $DATA "*) continue ;; esac
+    seen="$seen$DATA "
+    n=$(wipe_hwui_caches "$DATA" || true)
+    n=${n:-0}
+    wiped=$((wiped + n))
+    echo "   scanned $DATA ($n entries)"
+done
+if [ "$wiped" -gt 0 ]; then
+    echo "   removed $wiped shader-cache entries"
+else
+    echo "   no shader caches (fresh image or already clean)"
 fi
 
 echo "== regenerating container config (waydroid upgrade -o)"

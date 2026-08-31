@@ -326,16 +326,207 @@ index b718ef25..1a5c533a 100644
  }
  
  static bool
+diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+index dc42c5a1..229359a4 100644
+--- a/src/venus/vkr_command_buffer.c
++++ b/src/venus/vkr_command_buffer.c
+@@ -21,6 +21,19 @@
+       _vk->cmd_name(args->commandBuffer, ##__VA_ARGS__);                                 \
+    } while (0)
+ 
++/* Like VKR_CMD_CALL but bumps a per-command-buffer telemetry counter so
++ * the queue-submit / device-lost path knows which Vulkan command family a
++ * submission recorded (Xid-69 root-cause attribution). */
++#define VKR_CMD_CALL_STAT(cmd_name, args, field, ...)                                     \
++   do {                                                                                  \
++      struct vkr_command_buffer *_cmd =                                                  \
++         vkr_command_buffer_from_handle(args->commandBuffer);                            \
++      struct vn_device_proc_table *_vk = &_cmd->device->proc_table;                      \
++      _cmd->stats.field++;                                                               \
++      vn_replace_vk##cmd_name##_args_handle(args);                                       \
++      _vk->cmd_name(args->commandBuffer, ##__VA_ARGS__);                                 \
++   } while (0)
++
+ static void
+ vkr_dispatch_vkCreateCommandPool(struct vn_dispatch_context *dispatch,
+                                  struct vn_command_vkCreateCommandPool *args)
+@@ -125,6 +138,7 @@ vkr_dispatch_vkBeginCommandBuffer(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+    struct vn_device_proc_table *vk = &cmd->device->proc_table;
+ 
++   vkr_command_buffer_reset_stats(cmd);
+    vn_replace_vkBeginCommandBuffer_args_handle(args);
+    args->ret = vk->BeginCommandBuffer(args->commandBuffer, args->pBeginInfo);
+ }
+@@ -145,6 +159,8 @@ static void
+ vkr_dispatch_vkCmdBindPipeline(UNUSED struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCmdBindPipeline *args)
+ {
++   vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 3,
++                          (uint32_t)(uintptr_t)args->pipeline, args->pipelineBindPoint, 0, 0);
+    VKR_CMD_CALL(CmdBindPipeline, args, args->pipelineBindPoint, args->pipeline);
+ }
+ 
+@@ -242,7 +258,10 @@ static void
+ vkr_dispatch_vkCmdDraw(UNUSED struct vn_dispatch_context *dispatch,
+                        struct vn_command_vkCmdDraw *args)
+ {
+-   VKR_CMD_CALL(CmdDraw, args, args->vertexCount, args->instanceCount, args->firstVertex,
++   vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 0,
++                          args->vertexCount, args->instanceCount, args->firstVertex,
++                          args->firstInstance);
++   VKR_CMD_CALL_STAT(CmdDraw, args, draw, args->vertexCount, args->instanceCount, args->firstVertex,
+                 args->firstInstance);
+ }
+ 
+@@ -250,7 +269,10 @@ static void
+ vkr_dispatch_vkCmdDrawIndexed(UNUSED struct vn_dispatch_context *dispatch,
+                               struct vn_command_vkCmdDrawIndexed *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndexed, args, args->indexCount, args->instanceCount,
++   vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 1,
++                          args->indexCount, args->instanceCount, args->firstIndex,
++                          args->vertexOffset);
++   VKR_CMD_CALL_STAT(CmdDrawIndexed, args, draw_indexed, args->indexCount, args->instanceCount,
+                 args->firstIndex, args->vertexOffset, args->firstInstance);
+ }
+ 
+@@ -258,7 +280,9 @@ static void
+ vkr_dispatch_vkCmdDrawIndirect(UNUSED struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCmdDrawIndirect *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndirect, args, args->buffer, args->offset, args->drawCount,
++   vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 4,
++                          args->offset, args->drawCount, args->stride, 0);
++   VKR_CMD_CALL_STAT(CmdDrawIndirect, args, draw_indirect, args->buffer, args->offset, args->drawCount,
+                 args->stride);
+ }
+ 
+@@ -266,7 +290,9 @@ static void
+ vkr_dispatch_vkCmdDrawIndexedIndirect(UNUSED struct vn_dispatch_context *dispatch,
+                                       struct vn_command_vkCmdDrawIndexedIndirect *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndexedIndirect, args, args->buffer, args->offset, args->drawCount,
++   vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 5,
++                          args->offset, args->drawCount, args->stride, 0);
++   VKR_CMD_CALL_STAT(CmdDrawIndexedIndirect, args, draw_indexed_indirect, args->buffer, args->offset, args->drawCount,
+                 args->stride);
+ }
+ 
+@@ -274,7 +300,9 @@ static void
+ vkr_dispatch_vkCmdDispatch(UNUSED struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkCmdDispatch *args)
+ {
+-   VKR_CMD_CALL(CmdDispatch, args, args->groupCountX, args->groupCountY,
++   vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 2,
++                          args->groupCountX, args->groupCountY, args->groupCountZ, 0);
++   VKR_CMD_CALL_STAT(CmdDispatch, args, dispatch, args->groupCountX, args->groupCountY,
+                 args->groupCountZ);
+ }
+ 
+@@ -282,7 +310,9 @@ static void
+ vkr_dispatch_vkCmdDispatchIndirect(UNUSED struct vn_dispatch_context *dispatch,
+                                    struct vn_command_vkCmdDispatchIndirect *args)
+ {
+-   VKR_CMD_CALL(CmdDispatchIndirect, args, args->buffer, args->offset);
++   vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 6,
++                          args->offset, 0, 0, 0);
++   VKR_CMD_CALL_STAT(CmdDispatchIndirect, args, dispatch_indirect, args->buffer, args->offset);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_command_buffer.h b/src/venus/vkr_command_buffer.h
+index 90b6d384..de45b9e6 100644
+--- a/src/venus/vkr_command_buffer.h
++++ b/src/venus/vkr_command_buffer.h
+@@ -17,13 +17,75 @@ struct vkr_command_pool {
+ };
+ VKR_DEFINE_OBJECT_CAST(command_pool, VK_OBJECT_TYPE_COMMAND_POOL, VkCommandPool)
+ 
++/* Per-command-buffer draw/dispatch counters for Xid-69 telemetry.  The
++ * command stream is recorded by the guest and replayed here; these counters
++ * let the queue-submit path (and the device-lost handler) report what the
++ * faulting submission actually contained, so a recurring NVIDIA class error
++ * (Xid 69, Class 0xC197 Offset 0x19D0 Data 0x3C) can be attributed to a
++ * concrete Vulkan command family. */
++struct vkr_cmd_stats {
++   uint32_t draw;
++   uint32_t draw_indexed;
++   uint32_t draw_indirect;
++   uint32_t draw_indexed_indirect;
++   uint32_t dispatch;
++   uint32_t dispatch_indirect;
++   uint32_t other;
++};
++
++/* Per-draw parameter trace so a recurring Xid-69 (3D class) can be pinned to
++ * the exact draw call.  type 0=draw,1=draw_indexed,2=dispatch,3=bind_pipeline. */
++struct vkr_draw_trace_entry {
++   uint8_t type;
++   uint32_t p[4];
++};
++
++#define VKR_DRAW_TRACE_N 16
++
+ struct vkr_command_buffer {
+    struct vkr_object base;
+ 
+    struct vkr_device *device;
++
++   struct vkr_cmd_stats stats;
++   struct vkr_draw_trace_entry trace[VKR_DRAW_TRACE_N];
++   uint32_t trace_n;
+ };
++
++static inline void
++vkr_cmd_buffer_trace(struct vkr_command_buffer *cmd, uint8_t type,
++                     uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3)
++{
++   struct vkr_draw_trace_entry *t =
++      &cmd->trace[cmd->trace_n++ % VKR_DRAW_TRACE_N];
++   t->type = type;
++   t->p[0] = p0;
++   t->p[1] = p1;
++   t->p[2] = p2;
++   t->p[3] = p3;
++}
+ VKR_DEFINE_OBJECT_CAST(command_buffer, VK_OBJECT_TYPE_COMMAND_BUFFER, VkCommandBuffer)
+ 
++static inline void
++vkr_command_buffer_reset_stats(struct vkr_command_buffer *cmd)
++{
++   const struct vkr_cmd_stats zero = { 0 };
++   cmd->stats = zero;
++}
++
++static inline void
++vkr_command_buffer_accum_stats(const struct vkr_command_buffer *cmd,
++                               struct vkr_cmd_stats *out)
++{
++   out->draw += cmd->stats.draw;
++   out->draw_indexed += cmd->stats.draw_indexed;
++   out->draw_indirect += cmd->stats.draw_indirect;
++   out->draw_indexed_indirect += cmd->stats.draw_indexed_indirect;
++   out->dispatch += cmd->stats.dispatch;
++   out->dispatch_indirect += cmd->stats.dispatch_indirect;
++   out->other += cmd->stats.other;
++}
++
+ void
+ vkr_context_init_command_pool_dispatch(struct vkr_context *ctx);
+ 
 diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
-index c170bd32..9b8992ca 100644
+index c170bd32..3453acbd 100644
 --- a/src/venus/vkr_context.c
 +++ b/src/venus/vkr_context.c
-@@ -5,10 +5,19 @@
+@@ -5,10 +5,21 @@
  
  #include "vkr_context.h"
  
 +#include <fcntl.h>
++#include <signal.h>
 +#include <stdio.h>
++#include <stdlib.h>
 +#include <sys/ioctl.h>
  #include <sys/mman.h>
  #include <sys/types.h>
@@ -350,7 +541,7 @@ index c170bd32..9b8992ca 100644
  #include "util/anon_file.h"
  #include "venus-protocol/vn_protocol_renderer_dispatches.h"
  
-@@ -136,10 +145,11 @@ vkr_context_init_proc_table(struct vkr_context *ctx)
+@@ -136,10 +147,11 @@ vkr_context_init_proc_table(struct vkr_context *ctx)
  }
  
  bool
@@ -366,7 +557,7 @@ index c170bd32..9b8992ca 100644
  {
     /* retire fence on cpu timeline directly */
     if (ring_idx == 0) {
-@@ -155,11 +165,309 @@ vkr_context_submit_fence(struct vkr_context *ctx,
+@@ -155,11 +167,309 @@ vkr_context_submit_fence(struct vkr_context *ctx,
     /* always merge fences */
     assert(!(flags & ~VIRGL_RENDERER_FENCE_FLAG_MERGEABLE));
     flags = VIRGL_RENDERER_FENCE_FLAG_MERGEABLE;
@@ -677,7 +868,58 @@ index c170bd32..9b8992ca 100644
  int
  vkr_context_export_fence(struct vkr_context *ctx,
                           uint32_t ring_idx,
-@@ -644,6 +952,25 @@ vkr_context_destroy(struct vkr_context *ctx)
+@@ -472,6 +782,50 @@ vkr_context_on_ring_fatal(struct vkr_context *ctx)
+    mtx_unlock(&ctx->wait_ring.mutex);
+ }
+ 
++/* A guest-visible GPU fault (e.g. NVIDIA Xid 69 class error under 3D load)
++ * makes the physical device return VK_ERROR_DEVICE_LOST. NVIDIA poisons the
++ * whole GPU for the rest of this process tree: every subsequent
++ * vkCreateDevice -- even in a freshly forked render worker -- returns
++ * VK_ERROR_INITIALIZATION_FAILED, so SurfaceFlinger crash-loops forever
++ * against a still-running wd-venus (observed: same-error CreateDevice every
++ * ~17 s for minutes).
++ *
++ * Process layout under wd-venus.service: virgl_test_server (systemd main
++ * PID, session leader) -> virgl_render_server -> one virgl-N-gpu_render
++ * worker per guest client. The device-lost is seen by a worker, whose
++ * getppid() is only the render server. Signal the whole session instead:
++ * the session leader *is* the systemd main PID, so it exits, and systemd
++ * (Restart=always, KillMode=control-group) reclaims every worker and starts
++ * a fresh render server with a clean physical device -- the only thing that
++ * recovers an NVIDIA device after a class error.
++ */
++void
++vkr_context_device_lost(struct vkr_context *ctx)
++{
++   static int triggered;
++   if (__atomic_exchange_n(&triggered, 1, __ATOMIC_SEQ_CST))
++      return;
++
++   vkr_log("VK_ERROR_DEVICE_LOST: signaling render server restart (ctx %d, %s)",
++           ctx->ctx_id, ctx->debug_name ? ctx->debug_name : "unknown");
++
++   /* Dump what the faulting submission stream actually contained so the
++    * recurring Xid-69 (Class 0xC197) can be attributed to a command family. */
++   vkr_queue_telemetry_dump();
++
++   /* primary: the session leader == virgl_test_server == systemd main PID */
++   const pid_t sid = getsid(0);
++   if (sid > 1 && sid != getpid())
++      kill(sid, SIGTERM);
++   /* fallback: our own process group (render server + sibling workers) in
++    * case the session leader is stale or already re-parented */
++   kill(0, SIGTERM);
++
++   /* exit promptly instead of serving a dead physical device. systemd
++    * replaces the whole stack on the parent's restart. */
++   _exit(EXIT_FAILURE);
++}
++
+ bool
+ vkr_context_wait_ring_seqno(struct vkr_context *ctx,
+                             struct vkr_ring *ring,
+@@ -644,6 +998,25 @@ vkr_context_destroy(struct vkr_context *ctx)
  
     vkr_context_wait_ring_fini(ctx);
  
@@ -703,7 +945,7 @@ index c170bd32..9b8992ca 100644
     if (ctx->ring_monitor.started)
        vkr_context_ring_monitor_fini(ctx);
  
-@@ -727,6 +1054,11 @@ vkr_context_create(uint32_t ctx_id,
+@@ -727,6 +1100,11 @@ vkr_context_create(uint32_t ctx_id,
     if (!vkr_context_wait_ring_init(ctx))
        goto err_ctx_wait_ring_init;
  
@@ -716,7 +958,7 @@ index c170bd32..9b8992ca 100644
        goto err_ctx_object_mutex;
  
 diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
-index 7ba72eb8..ce1a8507 100644
+index 7ba72eb8..97659e90 100644
 --- a/src/venus/vkr_context.h
 +++ b/src/venus/vkr_context.h
 @@ -98,6 +98,50 @@ struct vkr_context {
@@ -811,8 +1053,20 @@ index 7ba72eb8..ce1a8507 100644
  bool
  vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size);
  
+@@ -269,6 +347,11 @@ vkr_context_get_wait_ring_seqno(struct vkr_context *ctx,
+ void
+ vkr_context_on_ring_fatal(struct vkr_context *ctx);
+ 
++/* Terminates the whole render-server process group (and exits) because the
++ * physical device was lost; wd-venus.service restarts the stack cleanly. */
++void
++vkr_context_device_lost(struct vkr_context *ctx);
++
+ bool
+ vkr_context_wait_ring_seqno(struct vkr_context *ctx,
+                             struct vkr_ring *ring,
 diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
-index 3e943bfd..3880c3ec 100644
+index 3e943bfd..f436bf5b 100644
 --- a/src/venus/vkr_device.c
 +++ b/src/venus/vkr_device.c
 @@ -108,6 +108,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
@@ -834,7 +1088,19 @@ index 3e943bfd..3880c3ec 100644
              args->ret = VK_ERROR_UNKNOWN;
              break;
           }
-@@ -176,7 +181,38 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+@@ -128,6 +133,11 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          return;
+    }
+ 
++   /* Save the guest's original extension list before we append our own so
++    * that the VK_ERROR_INITIALIZATION_FAILED retry path can fall back to it. */
++   const uint32_t guest_ext_count = args->pCreateInfo->enabledExtensionCount;
++   const char * const *guest_exts_ptr = args->pCreateInfo->ppEnabledExtensionNames;
++
+    /* append extensions for our own use */
+    const char **exts = NULL;
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
+@@ -176,9 +186,74 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
     vn_replace_vkCreateDevice_args_handle(args);
     args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
                                  &dev->base.handle.device);
@@ -867,17 +1133,83 @@ index 3e943bfd..3880c3ec 100644
 +      }
 +   }
 +
++   /* NVIDIA occasionally returns VK_ERROR_INITIALIZATION_FAILED (-3) for the
++    * combined extension list.  The virglrenderer-appended extensions
++    * (KHR_external_memory_fd, EXT_external_memory_dma_buf, KHR_external_fence_fd,
++    * …) are the most likely culprit because they were not present in the
++    * original guest request.  Retry with only the guest's list to isolate
++    * whether a virglrenderer-added extension is the cause.
++    *
++    * If the retry succeeds we lose dmabuf/fence-fd import for this device
++    * instance, but the session stays alive — which is far better than a crash.
++    * If it still fails we fall through to the error path with full logging.
++    */
++   if (args->ret == VK_ERROR_INITIALIZATION_FAILED && exts != NULL) {
++      vkr_log("CreateDevice: VK_ERROR_INITIALIZATION_FAILED with %u extensions "
++              "(guest %u + virglrenderer %u); retrying with guest-only list",
++              args->pCreateInfo->enabledExtensionCount,
++              guest_ext_count,
++              args->pCreateInfo->enabledExtensionCount - guest_ext_count);
++      ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames =
++         guest_exts_ptr;
++      ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount =
++         guest_ext_count;
++      args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo,
++                                   NULL, &dev->base.handle.device);
++      if (args->ret == VK_SUCCESS)
++         vkr_log("CreateDevice: guest-only retry succeeded — "
++                 "dmabuf/fence-fd import disabled for this device");
++   }
++
     if (args->ret != VK_SUCCESS) {
 +      vkr_log("CreateDevice: host driver returned %d (extCount=%u)", args->ret,
 +              args->pCreateInfo->enabledExtensionCount);
++      for (uint32_t i = 0; i < args->pCreateInfo->enabledExtensionCount; i++)
++         vkr_log("  ext[%u]: %s", i, args->pCreateInfo->ppEnabledExtensionNames[i]);
        free(exts);
        free(dev);
++      /* A poisoned physical device rejects even a retried CreateDevice; treat
++       * it like the queue-submit device-lost so wd-venus restarts cleanly. */
++      if (args->ret == VK_ERROR_DEVICE_LOST)
++         vkr_context_device_lost(ctx);
        return;
+    }
+ 
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index 76709b9b..9e8dd26d 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -11,7 +11,6 @@ static void
+ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkCreateShaderModule *args)
+ {
+-   struct vkr_context *ctx = dispatch->data;
+ 
+    /* Reject invalid codeSize.
+     *
+@@ -37,8 +36,15 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
+     * validating codeSize here.
+     */
+    if (args->pCreateInfo->codeSize % 4 != 0) {
+-      vkr_context_set_fatal(ctx);
+-      return;
++      /* The venus encoder/decoder already transmitted only codeSize & ~3 bytes,
++       * so the driver would read out-of-bounds if we passed the unaligned size.
++       * Truncate to the nearest 4-byte boundary instead of fatally killing the
++       * whole Vulkan context (which broke every subsequent pipeline creation,
++       * causing AnTuTu 3D / Geekbench GPU tests to black-screen or crash). */
++      vkr_log("vkCreateShaderModule: codeSize %zu not 4-byte aligned, truncating to %zu",
++              args->pCreateInfo->codeSize,
++              args->pCreateInfo->codeSize & ~(size_t)3);
++      ((VkShaderModuleCreateInfo *)args->pCreateInfo)->codeSize &= ~(size_t)3;
+    }
+ 
+    vkr_shader_module_create_and_add(dispatch->data, args);
 diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
-index 08c7b07f..cec48f53 100644
+index 08c7b07f..5808e271 100644
 --- a/src/venus/vkr_queue.c
 +++ b/src/venus/vkr_queue.c
-@@ -5,6 +5,9 @@
+@@ -5,12 +5,156 @@
  
  #include "vkr_queue.h"
  
@@ -886,8 +1218,155 @@ index 08c7b07f..cec48f53 100644
 +#include "util/libsync.h"
  #include "venus-protocol/vn_protocol_renderer_queue.h"
  
++#include "vkr_command_buffer.h"
  #include "vkr_context.h"
-@@ -55,6 +58,8 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+ #include "vkr_physical_device.h"
+ #include "vkr_queue_gen.h"
+ 
++/* Xid-69 command-stream telemetry ring.  Every vkQueueSubmit records a
++ * summary of the draw/dispatch command families in the submitted command
++ * buffers; the device-lost handler dumps the ring so a recurring NVIDIA
++ * class error (Xid 69, Class 0xC197 Offset 0x19D0 Data 0x3C) can be
++ * attributed to the submission (and command family) that faulted on the GPU.
++ */
++struct vkr_telem_entry {
++   uint64_t seq;
++   uint32_t ctx_id;
++   uint32_t cb_count;
++   struct vkr_cmd_stats stats;
++   struct vkr_command_buffer *last_cb;
++};
++
++#define VKR_TELEM_RING 64
++static struct vkr_telem_entry vkr_telem_ring[VKR_TELEM_RING];
++static uint32_t vkr_telem_idx;
++
++static void
++vkr_telem_store(struct vkr_queue *queue, uint32_t cb_count,
++                const struct vkr_cmd_stats *sum,
++                struct vkr_command_buffer *last_cb)
++{
++   struct vkr_telem_entry *e =
++      &vkr_telem_ring[__atomic_fetch_add(&vkr_telem_idx, 1, __ATOMIC_RELAXED) %
++                      VKR_TELEM_RING];
++   e->seq = queue->tel_submit_seq++;
++   e->ctx_id = queue->context->ctx_id;
++   e->cb_count = cb_count;
++   e->stats = *sum;
++   e->last_cb = last_cb;
++}
++
++/* Accumulate the per-command-buffer stats of one guest-encoded handle (the
++ * host-pointer value is still intact pre-replace) into *sum. */
++static inline void
++vkr_telem_accum_cb(struct vkr_cmd_stats *sum, uint32_t *cb_count,
++                   struct vkr_command_buffer **last_cb, VkCommandBuffer handle)
++{
++   struct vkr_command_buffer *cb = vkr_command_buffer_from_handle(handle);
++   if (cb) {
++      vkr_command_buffer_accum_stats(cb, sum);
++      (*cb_count)++;
++      *last_cb = cb;
++   }
++}
++
++void
++vkr_queue_telemetry_record(struct vkr_queue *queue,
++                           uint32_t submit_count,
++                           const VkSubmitInfo *submits)
++{
++   struct vkr_cmd_stats sum = { 0 };
++   uint32_t cb_count = 0;
++   struct vkr_command_buffer *last_cb = NULL;
++
++   /* pSubmits still holds the guest-encoded (host-pointer) command-buffer
++    * handles here — read the per-cb stats before the replace helper swaps
++    * them for real VkCommandBuffer handles. */
++   for (uint32_t i = 0; i < submit_count; i++) {
++      for (uint32_t j = 0; j < submits[i].commandBufferCount; j++)
++         vkr_telem_accum_cb(&sum, &cb_count, &last_cb, submits[i].pCommandBuffers[j]);
++   }
++
++   vkr_telem_store(queue, cb_count, &sum, last_cb);
++}
++
++static void
++vkr_telem_dump_trace(const struct vkr_command_buffer *cb)
++{
++   if (!cb)
++      return;
++   const uint32_t total = cb->trace_n;
++   const uint32_t cnt = total < VKR_DRAW_TRACE_N ? total : VKR_DRAW_TRACE_N;
++   const uint32_t begin = total - cnt;
++   for (uint32_t i = 0; i < cnt; i++) {
++      const struct vkr_draw_trace_entry *t =
++         &cb->trace[(begin + i) % VKR_DRAW_TRACE_N];
++      switch (t->type) {
++      case 0:
++         vkr_log("    draw vc=%u inst=%u firstV=%u firstI=%u",
++                 t->p[0], t->p[1], t->p[2], t->p[3]);
++         break;
++      case 1:
++         vkr_log("    drawIdx idxC=%u inst=%u firstIdx=%u vertOff=%u",
++                 t->p[0], t->p[1], t->p[2], t->p[3]);
++         break;
++      case 2:
++         vkr_log("    dispatch %ux%ux%u", t->p[0], t->p[1], t->p[2]);
++         break;
++      case 3:
++         vkr_log("    bindPipeline pl=0x%08x bp=%u", t->p[0], t->p[1]);
++         break;
++      case 4:
++         vkr_log("    drawIndirect off=%u cnt=%u stride=%u", t->p[0], t->p[1], t->p[2]);
++         break;
++      case 5:
++         vkr_log("    drawIdxIndirect off=%u cnt=%u stride=%u", t->p[0], t->p[1], t->p[2]);
++         break;
++      case 6:
++         vkr_log("    dispatchIndirect off=%u", t->p[0]);
++         break;
++      default:
++         vkr_log("    unknown-cmd type=%u", t->type);
++         break;
++      }
++   }
++}
++
++void
++vkr_queue_telemetry_dump(void)
++{
++   const uint32_t idx = __atomic_load_n(&vkr_telem_idx, __ATOMIC_RELAXED);
++   const uint32_t n = idx < VKR_TELEM_RING ? idx : VKR_TELEM_RING;
++   const uint32_t start = idx - n;
++
++   vkr_log("== Xid-69 telemetry: %u most recent submissions (oldest first) ==", n);
++   for (uint32_t i = 0; i < n; i++) {
++      const struct vkr_telem_entry *e =
++         &vkr_telem_ring[(start + i) % VKR_TELEM_RING];
++      vkr_log("  submit #%" PRIu64 " ctx=%u cb=%u draw=%u di=%u drI=%u diI=%u "
++              "disp=%u dispI=%u",
++              e->seq, e->ctx_id, e->cb_count, e->stats.draw, e->stats.draw_indexed,
++              e->stats.draw_indirect, e->stats.draw_indexed_indirect,
++              e->stats.dispatch, e->stats.dispatch_indirect);
++   }
++
++   /* Print the exact draw/dispatch parameter stream for the last few
++    * submissions so the faulting GPU draw can be identified directly. */
++   const uint32_t detail = n < 6 ? n : 6;
++   vkr_log("-- draw-trace for the last %u submissions (oldest first) --", detail);
++   for (uint32_t i = n - detail; i < n; i++) {
++      const struct vkr_telem_entry *e =
++         &vkr_telem_ring[(start + i) % VKR_TELEM_RING];
++      vkr_log("  submit #%" PRIu64 " draw-trace:", e->seq);
++      vkr_telem_dump_trace(e->last_cb);
++   }
++   vkr_log("== end Xid-69 telemetry ==");
++}
++
+ static struct vkr_queue_sync *
+ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+                             uint32_t fence_flags,
+@@ -55,6 +199,8 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
     sync->flags = fence_flags;
     sync->ring_idx = ring_idx;
     sync->fence_id = fence_id;
@@ -896,7 +1375,7 @@ index 08c7b07f..cec48f53 100644
  
     return sync;
  }
-@@ -62,6 +67,12 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+@@ -62,6 +208,12 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
  static void
  vkr_device_free_queue_sync(struct vkr_device *dev, struct vkr_queue_sync *sync)
  {
@@ -909,7 +1388,7 @@ index 08c7b07f..cec48f53 100644
     mtx_lock(&dev->free_sync_mutex);
     list_addtail(&sync->head, &dev->free_syncs);
     mtx_unlock(&dev->free_sync_mutex);
-@@ -79,7 +90,8 @@ bool
+@@ -79,7 +231,8 @@ bool
  vkr_queue_sync_submit(struct vkr_queue *queue,
                        uint32_t flags,
                        uint32_t ring_idx,
@@ -919,20 +1398,43 @@ index 08c7b07f..cec48f53 100644
  {
     TRACE_FUNC();
     struct vkr_device *dev = queue->device;
-@@ -103,6 +115,62 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+@@ -90,19 +243,84 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+    if (!sync)
        return false;
-    }
  
-+   /* One GetFenceFdKHR, here, before the sync thread can WaitForFences.
-+    * vkGetFenceFdKHR requires the fence to be externally synchronized;
-+    * doing it later races the waiter and NVIDIA returns
++   /* Hold vk_mutex across QueueSubmit AND GetFenceFdKHR. NVIDIA's
++    * proprietary driver treats GetFenceFdKHR as a queue operation:
++    * a guest vkQueueSubmit on the same VkQueue while export is in
++    * flight has been observed to return VK_ERROR_DEVICE_LOST, which
++    * the Venus protocol then promotes to a fatal CS error and kills
++    * SurfaceFlinger. vkGetFenceFdKHR also requires the fence to be
++    * externally synchronized with WaitForFences; doing export later
++    * races the waiter and NVIDIA returns
 +    * VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003), after which the
 +    * VkFence is reset and will never signal.
 +    *
 +    * Never WaitForFences on the vtest command/select thread: --no-fork
 +    * --multi-clients is one loop, so an infinite wait wedges SF, HWUI and
 +    * system_server together (browser ANR).
++    *
++    * Unlock before vkr_context_timeline_import: that path takes other
++    * locks and must not nest under vk_mutex.
 +    */
+    mtx_lock(&queue->vk_mutex);
+    VkResult result = vk->QueueSubmit(queue->base.handle.queue, 0, NULL, sync->fence);
+-   mtx_unlock(&queue->vk_mutex);
+-
+    if (result == VK_ERROR_DEVICE_LOST) {
+       sync->device_lost = true;
+       vkr_log("sync submit hit device lost for fence_id %" PRIu64, fence_id);
++      vkr_context_device_lost(queue->context);
+    } else if (result != VK_SUCCESS) {
++      mtx_unlock(&queue->vk_mutex);
+       vkr_device_free_queue_sync(dev, sync);
+       vkr_log("sync submit failed (vk ret %d) for fence_id %" PRIu64, result, fence_id);
+       return false;
+    }
+ 
 +   if (dev->physical_device->KHR_external_fence_fd && !sync->device_lost) {
 +      const VkFenceGetFdInfoKHR info = {
 +         .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
@@ -963,6 +1465,7 @@ index 08c7b07f..cec48f53 100644
 +      }
 +      /* SUCCESS && fd < 0: already signaled. export_fd stays -1. */
 +   }
++   mtx_unlock(&queue->vk_mutex);
 +
 +   if (timeline_point && !sync->deferred_timeline_point) {
 +      int import_fd = -1;
@@ -982,7 +1485,7 @@ index 08c7b07f..cec48f53 100644
     mtx_lock(&queue->sync_thread.mutex);
     list_addtail(&sync->head, &queue->sync_thread.syncs);
     cnd_signal(&queue->sync_thread.cond);
-@@ -124,43 +192,46 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
+@@ -124,43 +342,46 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
  
     int ret = 1;
     mtx_lock(&queue->sync_thread.mutex);
@@ -1061,7 +1564,7 @@ index 08c7b07f..cec48f53 100644
     }
     mtx_unlock(&queue->sync_thread.mutex);
  
-@@ -173,7 +244,7 @@ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
+@@ -173,7 +394,7 @@ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
     /* vkDeviceWaitIdle has been called */
     mtx_lock(&queue->sync_thread.mutex);
     queue->sync_thread.join = true;
@@ -1070,7 +1573,7 @@ index 08c7b07f..cec48f53 100644
     mtx_unlock(&queue->sync_thread.mutex);
  
     thrd_join(queue->sync_thread.thread, NULL);
-@@ -227,11 +298,26 @@ vkr_queue_thread(void *arg)
+@@ -227,11 +448,26 @@ vkr_queue_thread(void *arg)
        struct vkr_queue_sync *sync =
           list_first_entry(&queue->sync_thread.syncs, struct vkr_queue_sync, head);
  
@@ -1098,7 +1601,7 @@ index 08c7b07f..cec48f53 100644
        } else {
           result = vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
                                      ns_per_sec * 3);
-@@ -244,6 +330,19 @@ vkr_queue_thread(void *arg)
+@@ -244,6 +480,19 @@ vkr_queue_thread(void *arg)
  
        list_del(&sync->head);
  
@@ -1118,8 +1621,60 @@ index 08c7b07f..cec48f53 100644
        vkr_queue_sync_retire(queue, sync);
     }
     mtx_unlock(&queue->sync_thread.mutex);
+@@ -429,12 +678,20 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
+    struct vn_device_proc_table *vk = &queue->device->proc_table;
+ 
++   vkr_queue_telemetry_record(queue, args->submitCount, args->pSubmits);
+    vn_replace_vkQueueSubmit_args_handle(args);
+ 
+    mtx_lock(&queue->vk_mutex);
+    args->ret =
+       vk->QueueSubmit(args->queue, args->submitCount, args->pSubmits, args->fence);
+    mtx_unlock(&queue->vk_mutex);
++
++   if (args->ret != VK_SUCCESS) {
++      vkr_log("vkQueueSubmit host ret %d submitCount=%u fence=%s", args->ret,
++              args->submitCount, args->fence ? "yes" : "no");
++      if (args->ret == VK_ERROR_DEVICE_LOST)
++         vkr_context_device_lost(queue->context);
++   }
+ }
+ 
+ static void
+@@ -470,12 +727,30 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
+    struct vn_device_proc_table *vk = &queue->device->proc_table;
+ 
++   {
++      struct vkr_cmd_stats sum = { 0 };
++      uint32_t cb_count = 0;
++      struct vkr_command_buffer *last_cb = NULL;
++      for (uint32_t i = 0; i < args->submitCount; i++) {
++         for (uint32_t j = 0; j < args->pSubmits[i].commandBufferInfoCount; j++)
++            vkr_telem_accum_cb(&sum, &cb_count, &last_cb,
++                              args->pSubmits[i].pCommandBufferInfos[j].commandBuffer);
++      }
++      vkr_telem_store(queue, cb_count, &sum, last_cb);
++   }
+    vn_replace_vkQueueSubmit2_args_handle(args);
+ 
+    mtx_lock(&queue->vk_mutex);
+    args->ret =
+       vk->QueueSubmit2(args->queue, args->submitCount, args->pSubmits, args->fence);
+    mtx_unlock(&queue->vk_mutex);
++
++   if (args->ret != VK_SUCCESS) {
++      vkr_log("vkQueueSubmit2 host ret %d submitCount=%u fence=%s", args->ret,
++              args->submitCount, args->fence ? "yes" : "no");
++      if (args->ret == VK_ERROR_DEVICE_LOST)
++         vkr_context_device_lost(queue->context);
++   }
+ }
+ 
+ static void
 diff --git a/src/venus/vkr_queue.h b/src/venus/vkr_queue.h
-index 5246a5a2..717abfc0 100644
+index 5246a5a2..c8bdc11e 100644
 --- a/src/venus/vkr_queue.h
 +++ b/src/venus/vkr_queue.h
 @@ -16,6 +16,17 @@ struct vkr_queue_sync {
@@ -1140,7 +1695,17 @@ index 5246a5a2..717abfc0 100644
     struct list_head head;
  };
  
-@@ -95,10 +106,14 @@ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
+@@ -32,6 +43,9 @@ struct vkr_queue {
+    /* only used when client driver uses multiple timelines */
+    uint32_t ring_idx;
+ 
++   /* Xid-69 telemetry: monotonic submit sequence + running per-queue totals */
++   uint64_t tel_submit_seq;
++
+    /* Ensure host access to VkQueue being externally synchronized between renderer main
+     * thread and ring thread.
+     */
+@@ -95,10 +109,26 @@ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
  int
  vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int *out_fd);
  
@@ -1154,6 +1719,18 @@ index 5246a5a2..717abfc0 100644
 -                      uint64_t fence_id);
 +                      uint64_t fence_id,
 +                      uint64_t timeline_point);
++
++/* Xid-69 command-stream telemetry.  Record is called from the queue-submit
++ * dispatch with the still-Venus-encoded command-buffer handles (so the per-cb
++ * stats can be read via vkr_command_buffer_from_handle).  Dump is called from
++ * the device-lost handler to print the most recent submissions before the
++ * whole process group is restarted. */
++void
++vkr_queue_telemetry_record(struct vkr_queue *queue,
++                           uint32_t submit_count,
++                           const VkSubmitInfo *submits);
++void
++vkr_queue_telemetry_dump(void);
  
  #endif /* VKR_QUEUE_H */
 diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c

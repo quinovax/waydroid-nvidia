@@ -312,6 +312,13 @@ drm_format_to_vk(uint32_t drm_format)
    case VTEST_FORMAT_ABGR16161616F:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
    case VTEST_FORMAT_NV12:
+   case VTEST_FORMAT_NV21:
+   case VTEST_FORMAT_YVU420:
+   case VTEST_FORMAT_YVU420_ANDROID:
+   case VTEST_FORMAT_FLEX_YCBCR_420_888:
+      /* minigbm's Android YV12 / flexible 420 fourccs. One NV12 VkImage is a
+       * valid flexible-420 layout; YVU chroma order is a software-decoder
+       * concern, not an allocation one (issue #16). */
       return VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
    case VTEST_FORMAT_P010:
       return VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
@@ -326,6 +333,10 @@ drm_format_bpp(uint32_t drm_format)
    switch (drm_format) {
    case VTEST_FORMAT_R8:
    case VTEST_FORMAT_NV12:
+   case VTEST_FORMAT_NV21:
+   case VTEST_FORMAT_YVU420:
+   case VTEST_FORMAT_YVU420_ANDROID:
+   case VTEST_FORMAT_FLEX_YCBCR_420_888:
       return 1;
    case VTEST_FORMAT_RGB565:
    case VTEST_FORMAT_P010:
@@ -581,10 +592,14 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
             vk->GetPhysicalDeviceFormatProperties2(vk->physical_device, format,
                                                    &fmt_props);
 
-            const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-            const uint32_t expected_planes =
-               (drm_format == VTEST_FORMAT_NV12 || drm_format == VTEST_FORMAT_P010) ? 2 : 1;
+            /* Multi-planar YUV is never a color attachment (issue #16). */
+            const bool yuv = vtest_drm_format_is_yuv(drm_format);
+            const VkFormatFeatureFlags need = yuv
+               ? (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                  VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
+               : (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+            const uint32_t expected_planes = yuv ? 2 : 1;
 
             for (uint32_t i = 0; i < mod_list.drmFormatModifierCount; i++) {
                if (props[i].drmFormatModifierPlaneCount == expected_planes &&
@@ -618,8 +633,12 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
       .arrayLayers = 1,
       .samples = VK_SAMPLE_COUNT_1_BIT,
       .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      .usage = vtest_drm_format_is_yuv(drm_format)
+                  ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+                  : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT),
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    };
@@ -760,12 +779,20 @@ vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
     * Upstream Shiro836#12. */
    pthread_once(&g_present_once, present_init);
 
-   uint64_t modifier = 0;
-   if (vtest_gpu_alloc_image(width, height, drm_format, true, true, out_stride,
-                             &modifier, out_size, out_fd) == 0) {
-      log_alloc("cpu", width, height, drm_format, "nvidia-linear-hostvis", true,
-                modifier, *out_stride, *out_size, 0);
-      return 0;
+   /* WAYDROID_NVIDIA_CPU_LINEAR=0 forces the udmabuf fallback so the
+    * NVIDIA-LINEAR as render-target hypothesis (Xid 69 regression) can be
+    * A/B tested without a rebuild. */
+   const char *cpu_linear_env = getenv("WAYDROID_NVIDIA_CPU_LINEAR");
+   bool use_nvidia_linear = !cpu_linear_env || cpu_linear_env[0] != '0';
+
+   if (use_nvidia_linear) {
+      uint64_t modifier = 0;
+      if (vtest_gpu_alloc_image(width, height, drm_format, true, true, out_stride,
+                                &modifier, out_size, out_fd) == 0) {
+         log_alloc("cpu", width, height, drm_format, "nvidia-linear-hostvis", true,
+                   modifier, *out_stride, *out_size, 0);
+         return 0;
+      }
    }
 
    fprintf(stderr,
@@ -776,7 +803,7 @@ vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
    uint32_t stride = 0;
    uint64_t size = 0;
 
-   if (drm_format == VTEST_FORMAT_NV12) {
+   if (vtest_drm_format_is_yuv8_420(drm_format)) {
       stride = (uint32_t)ALLOC_ALIGN((uint64_t)width, 256);
       size = ALLOC_ALIGN((uint64_t)stride * height * 3 / 2, 4096);
    } else if (drm_format == VTEST_FORMAT_P010) {
