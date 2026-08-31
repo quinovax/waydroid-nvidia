@@ -1,4 +1,4 @@
-From 07f6438db1dd0c9db81ef6bbe98534817b519a4b Mon Sep 17 00:00:00 2001
+From f84a202f497b298ecaeb11d72ac168bb656c2e4c Mon Sep 17 00:00:00 2001
 From: forsen <gazikkamalov2@gmail.com>
 Date: Fri, 10 Jul 2026 20:06:20 +0300
 Subject: [PATCH 2/2] venus/vtest: implement bo_create_from_dma_buf over the
@@ -15,7 +15,7 @@ buffer import) for venus-over-vtest in containers.
  2 files changed, 98 insertions(+), 2 deletions(-)
 
 diff --git a/src/virtio/vtest/vtest_protocol.h b/src/virtio/vtest/vtest_protocol.h
-index 88ccdd7..c8a1bbf 100644
+index 88ccdd7f9c6..c8a1bbfaacf 100644
 --- a/src/virtio/vtest/vtest_protocol.h
 +++ b/src/virtio/vtest/vtest_protocol.h
 @@ -96,6 +96,8 @@
@@ -40,7 +40,7 @@ index 88ccdd7..c8a1bbf 100644
     VCMD_SUBMIT_CMD2_FLAG_RING_IDX = 1 << 0,
     VCMD_SUBMIT_CMD2_FLAG_IN_FENCE_FD = 1 << 1,
 diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
-index fb876a0..7aaebd2 100644
+index fb876a0a379..7aaebd2de34 100644
 --- a/src/virtio/vulkan/vn_renderer_vtest.c
 +++ b/src/virtio/vulkan/vn_renderer_vtest.c
 @@ -145,6 +145,31 @@ vtest_receive_fd(struct vtest *vtest)

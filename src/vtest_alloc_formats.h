@@ -25,6 +25,11 @@
 #define VTEST_FORMAT_XBGR2101010   VTEST_FOURCC('X', 'B', '3', '0')
 #define VTEST_FORMAT_ABGR16161616F VTEST_FOURCC('A', 'B', '4', 'H')
 #define VTEST_FORMAT_NV12          VTEST_FOURCC('N', 'V', '1', '2')
+#define VTEST_FORMAT_NV21          VTEST_FOURCC('N', 'V', '2', '1')
+#define VTEST_FORMAT_YVU420        VTEST_FOURCC('Y', 'V', '1', '2')
+/* minigbm extras (drv.h): Android YV12 and flexible YCbCr. */
+#define VTEST_FORMAT_YVU420_ANDROID        VTEST_FOURCC('9', '9', '9', '7')
+#define VTEST_FORMAT_FLEX_YCBCR_420_888    VTEST_FOURCC('9', '9', '9', '9')
 #define VTEST_FORMAT_P010          VTEST_FOURCC('P', '0', '1', '0')
 
 static inline int
@@ -41,6 +46,10 @@ vtest_is_supported_drm_format(uint32_t drm_format)
    case VTEST_FORMAT_XBGR2101010:
    case VTEST_FORMAT_ABGR16161616F:
    case VTEST_FORMAT_NV12:
+   case VTEST_FORMAT_NV21:
+   case VTEST_FORMAT_YVU420:
+   case VTEST_FORMAT_YVU420_ANDROID:
+   case VTEST_FORMAT_FLEX_YCBCR_420_888:
    case VTEST_FORMAT_P010:
       return 1;
    default:
@@ -62,9 +71,36 @@ vtest_format_name(uint32_t drm_format)
    case VTEST_FORMAT_XBGR2101010:   return "XBGR2101010";
    case VTEST_FORMAT_ABGR16161616F: return "ABGR16161616F";
    case VTEST_FORMAT_NV12:          return "NV12";
+   case VTEST_FORMAT_NV21:          return "NV21";
+   case VTEST_FORMAT_YVU420:        return "YVU420";
+   case VTEST_FORMAT_YVU420_ANDROID: return "YVU420_ANDROID";
+   case VTEST_FORMAT_FLEX_YCBCR_420_888: return "FLEX_YCbCr_420_888";
    case VTEST_FORMAT_P010:          return "P010";
    default:                         return "UNKNOWN";
    }
+}
+
+/* 8-bit 4:2:0 family (not P010). Host allocates these as NV12 VkImages. */
+static inline int
+vtest_drm_format_is_yuv8_420(uint32_t drm_format)
+{
+   switch (drm_format) {
+   case VTEST_FORMAT_NV12:
+   case VTEST_FORMAT_NV21:
+   case VTEST_FORMAT_YVU420:
+   case VTEST_FORMAT_YVU420_ANDROID:
+   case VTEST_FORMAT_FLEX_YCBCR_420_888:
+      return 1;
+   default:
+      return 0;
+   }
+}
+
+static inline int
+vtest_drm_format_is_yuv(uint32_t drm_format)
+{
+   return vtest_drm_format_is_yuv8_420(drm_format) ||
+          drm_format == VTEST_FORMAT_P010;
 }
 
 #endif /* VTEST_ALLOC_FORMATS_H */

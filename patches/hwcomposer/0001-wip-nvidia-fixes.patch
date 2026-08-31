@@ -1,5 +1,5 @@
 diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
-index a86b9aa..940c89b 100644
+index a86b9aa..77e5c5e 100644
 --- a/hwcomposer/gralloc_handler.cpp
 +++ b/hwcomposer/gralloc_handler.cpp
 @@ -25,6 +25,7 @@
@@ -10,13 +10,46 @@ index a86b9aa..940c89b 100644
  #include <cstdint>
  #include <memory>
  
-@@ -162,6 +163,32 @@ namespace {
+@@ -162,6 +163,65 @@ namespace {
          return fmt;
      }
  }
 +namespace {
++#ifndef DRM_FORMAT_MOD_VENDOR_NVIDIA
++#define DRM_FORMAT_MOD_VENDOR_NVIDIA 0x03
++#endif
++
++/* NVIDIA EGL binds LINEAR dma_bufs only as GL_TEXTURE_EXTERNAL_OES.
++ * Mutter/Cogl and KWin sample Wayland buffers as GL_TEXTURE_2D, so attaching
++ * a LINEAR buffer is a fatal zwp_linux_buffer_params error 7
++ * ("Could not bind the given EGLImage to a CoglTexture2D") — Shiro836#11.
++ * The compositor still *advertises* LINEAR, so a naive format+modifier check
++ * is not enough. If it also advertises any NVIDIA vendor modifier, it is
++ * compositing on NVIDIA: force LINEAR layers through SurfaceFlinger. Hybrid
++ * iGPU compositors advertise Intel/AMD modifiers, not NVIDIA 0x03, so LINEAR
++ * (the hybrid present path) still attaches. */
++bool compositor_uses_nvidia_egl(display *display) {
++    static int cached = -1;
++    if (cached >= 0)
++        return cached != 0;
++    for (const auto &kv : display->modifiers) {
++        for (uint64_t m : kv.second) {
++            if (fourcc_mod_get_vendor(m) == DRM_FORMAT_MOD_VENDOR_NVIDIA) {
++                cached = 1;
++                ALOGI("compositor advertises NVIDIA modifiers; LINEAR dmabufs "
++                      "will be client-composited (cannot bind as TEXTURE_2D)");
++                return true;
++            }
++        }
++    }
++    cached = 0;
++    return false;
++}
++
 +bool compositor_supports(display *display, uint32_t drm_format, uint64_t modifier) {
 +    if (modifier == DRM_FORMAT_MOD_INVALID)
++        return false;
++    if (modifier == DRM_FORMAT_MOD_LINEAR && compositor_uses_nvidia_egl(display))
 +        return false;
 +    auto it = display->modifiers.find(drm_format);
 +    if (it == display->modifiers.end())
@@ -43,7 +76,7 @@ index a86b9aa..940c89b 100644
  std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_metadata& metadata,
                                                                  int prime_fd, int drm_format, int byte_stride,
                                                                  int offset, uint64_t modifier, buffer_handle_t handle)
-@@ -178,6 +205,15 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_m
+@@ -178,6 +238,15 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_m
      }
      assert(drm_format >= 0);
  
@@ -59,11 +92,11 @@ index a86b9aa..940c89b 100644
      zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(display->dmabuf);
      zwp_linux_buffer_params_v1_add(params, prime_fd, 0, offset, byte_stride, modifier >> 32, modifier & 0xffffffff);
      zwp_linux_buffer_params_v1_add_listener(params, &params_listener, nullptr);
-@@ -264,6 +300,11 @@ std::unique_ptr<buffer> create_buffer_gbm(display *display, const buffer_metadat
+@@ -264,6 +333,11 @@ std::unique_ptr<buffer> create_buffer_gbm(display *display, const buffer_metadat
  }
  std::unique_ptr<buffer> create_buffer_cros(display *display, const buffer_metadata& metadata, buffer_handle_t handle) {
      auto *cros_handle = reinterpret_cast<const cros_gralloc_handle *>(handle);
-+    ALOGI("attach dmabuf: %ux%u fmt 0x%x stride %u mod 0x%llx usage 0x%x",
++    ALOGV("attach dmabuf: %ux%u fmt 0x%x stride %u mod 0x%llx usage 0x%x",
 +          metadata.width, metadata.height, cros_handle->format,
 +          cros_handle->strides[0],
 +          (unsigned long long)cros_handle->format_modifier,
@@ -71,7 +104,7 @@ index a86b9aa..940c89b 100644
      return create_dmabuf_wl_buffer(display, metadata, cros_handle->fds[0], cros_handle->format, cros_handle->strides[0], cros_handle->offsets[0], cros_handle->format_modifier, handle);
  }
  std::unique_ptr<buffer> create_buffer_android(display *display, const buffer_metadata& metadata, buffer_handle_t handle) {
-@@ -314,6 +355,8 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
+@@ -314,6 +388,8 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
  }
  
  gralloc_handler::create_buffer_func gralloc_handler::select_create_buffer_impl(display *display, GrallocType gralloc_type) {
@@ -80,7 +113,7 @@ index a86b9aa..940c89b 100644
      if (gralloc_type == GrallocType::GRALLOC_GBM && display->dmabuf) {
          return create_buffer_gbm;
      } else if (gralloc_type == GrallocType::GRALLOC_CROS && display->dmabuf) {
-@@ -333,7 +376,39 @@ gralloc_handler::update_shm_buffer_func gralloc_handler::select_update_shm_buffe
+@@ -333,7 +409,39 @@ gralloc_handler::update_shm_buffer_func gralloc_handler::select_update_shm_buffe
      }
  }
  
@@ -159,10 +192,125 @@ index 1d045e3..73a173b 100644
  };
 \ No newline at end of file
 diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
-index f509ed7..4e921d3 100644
+index f509ed7..259a9b6 100644
 --- a/hwcomposer/hwcomposer.cpp
 +++ b/hwcomposer/hwcomposer.cpp
-@@ -104,9 +104,25 @@ namespace {
+@@ -17,10 +17,13 @@
+ 
+ #include "hwcomposer.h"
+ 
++#include <cmath>
+ #include <errno.h>
++#include <math.h>
+ #include <pthread.h>
+ #include <semaphore.h>
+ #include <stdlib.h>
++#include <time.h>
+ #include <sys/time.h>
+ #include <sys/resource.h>
+ #include <unistd.h>
+@@ -86,6 +89,100 @@ namespace {
+         return src;
+     }
+ 
++    /* Clip sourceCrop to the buffer and displayFrame to the output, keeping
++     * the crop↔dest mapping. AnTuTu 3D uses a 1920² cube scaled ~1.10 at
++     * pos=(-96,-516): crop.bottom can be 1451 on a 1080-tall buffer and
++     * dest.bottom 1189 past the 1080 output. Clamping crop only (old path)
++     * stretched the visible strip across the full dest — the warped overlay
++     * over Smart Dock. Empty sourceCrop still means "whole buffer"; only dest
++     * is clipped then. Returns false if nothing is visible. */
++    static bool prepare_layer_geom(waydroid_hwc_composer_device_1 *pdev,
++                                   const hwc_layer_1 *layer, const buffer *buf,
++                                   hwc_frect_t *crop_out, hwc_rect_t *dest_out) {
++        hwc_frect_t crop = rect_apply_transform(layer->sourceCropf, layer->transform);
++        hwc_rect_t dest = layer->displayFrame;
++        const int disp_w = (int)lround(pdev->display->width * pdev->display->scale);
++        const int disp_h = (int)lround(pdev->display->height * pdev->display->scale);
++        const float buf_w = buf ? (float)buf->metadata.width : 0.f;
++        const float buf_h = buf ? (float)buf->metadata.height : 0.f;
++
++        float crop_w = crop.right - crop.left;
++        float crop_h = crop.bottom - crop.top;
++        bool empty_crop = crop_w <= 0.f || crop_h <= 0.f
++                          || !std::isfinite(crop_w) || !std::isfinite(crop_h)
++                          || !std::isfinite(crop.left) || !std::isfinite(crop.top);
++
++        auto clip_src = [](float &c0, float &c1, int &d0, int &d1, float cmax) {
++            float cw = c1 - c0;
++            int dw = d1 - d0;
++            if (cw <= 0.f || dw == 0)
++                return;
++            if (c0 < 0.f) {
++                d0 += (int)lround((-c0 / cw) * (float)dw);
++                c0 = 0.f;
++                cw = c1 - c0;
++                dw = d1 - d0;
++            }
++            if (c1 > cmax && cw > 0.f) {
++                d1 -= (int)lround(((c1 - cmax) / cw) * (float)dw);
++                c1 = cmax;
++            }
++        };
++        if (!empty_crop && buf_w > 0.f && buf_h > 0.f) {
++            clip_src(crop.left, crop.right, dest.left, dest.right, buf_w);
++            clip_src(crop.top, crop.bottom, dest.top, dest.bottom, buf_h);
++            crop_w = crop.right - crop.left;
++            crop_h = crop.bottom - crop.top;
++            empty_crop = crop_w <= 0.f || crop_h <= 0.f;
++        }
++
++        auto clip_dst = [&](int &d0, int &d1, float &c0, float &c1, int dmax) {
++            int dw = d1 - d0;
++            float cw = c1 - c0;
++            if (dw <= 0)
++                return;
++            if (d0 < 0) {
++                if (!empty_crop)
++                    c0 += (-(float)d0 / (float)dw) * cw;
++                d0 = 0;
++                dw = d1 - d0;
++                cw = c1 - c0;
++            }
++            if (d1 > dmax && dw > 0) {
++                if (!empty_crop)
++                    c1 -= ((float)(d1 - dmax) / (float)dw) * cw;
++                d1 = dmax;
++            }
++        };
++        if (disp_w > 0 && disp_h > 0) {
++            clip_dst(dest.left, dest.right, crop.left, crop.right, disp_w);
++            clip_dst(dest.top, dest.bottom, crop.top, crop.bottom, disp_h);
++        }
++
++        if (dest.right <= dest.left || dest.bottom <= dest.top)
++            return false;
++
++        if ((layer->displayFrame.left != dest.left || layer->displayFrame.top != dest.top
++             || layer->displayFrame.right != dest.right
++             || layer->displayFrame.bottom != dest.bottom)) {
++            static int clip_log = 0;
++            if ((clip_log++ % 120) == 0) {
++                ALOGI("hwc: clipped dest (%d,%d)-(%d,%d) -> (%d,%d)-(%d,%d) "
++                      "crop=(%g,%g)-(%g,%g) buf=%ux%u out=%dx%d",
++                      layer->displayFrame.left, layer->displayFrame.top,
++                      layer->displayFrame.right, layer->displayFrame.bottom,
++                      dest.left, dest.top, dest.right, dest.bottom,
++                      crop.left, crop.top, crop.right, crop.bottom,
++                      buf ? buf->metadata.width : 0, buf ? buf->metadata.height : 0,
++                      disp_w, disp_h);
++            }
++        }
++
++        *crop_out = crop;
++        *dest_out = dest;
++        return true;
++    }
++
+     buffer *find_cached_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata &metadata, buffer_handle_t handle) {
+         auto it = pdev->display->buffer_map.find(handle);
+         if (it != pdev->display->buffer_map.end()) {
+@@ -104,13 +201,29 @@ namespace {
      buffer *get_wl_buffer(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1_t *layer, size_t pos) {
          const auto& gralloc_handler = pdev->gralloc_handler;
          auto metadata = gralloc_handler.get_buffer_metadata(pdev->display, layer, pos);
@@ -171,24 +319,181 @@ index f509ed7..4e921d3 100644
          buffer *buf = find_cached_buffer(pdev, metadata, layer->handle);
  
          if (!buf) {
-+            /* set-time backstop for the prepare-time displayable gate: a layer
-+             * whose buffer the compositor cannot import must never reach
-+             * create_immed — INVALID_WL_BUFFER is a fatal protocol error that
-+             * kills the wayland connection (seen with LINEAR CPU buffers on
-+             * NVIDIA/KWin). prepare() will route it through SF next frame. */
-+            if (layer->compositionType != HWC_FRAMEBUFFER_TARGET
++            /* NVIDIA EGL compositors cannot bind LINEAR dma_bufs as
++             * GL_TEXTURE_2D (Shiro836#11). compositing_window_mode routes
++             * those layers through SurfaceFlinger; multi_window_mode has no
++             * client-target, so fall back to wl_shm instead of returning
++             * nullptr (that left the app window with no buffer = black). */
++            const bool undisplayable = layer->compositionType != HWC_FRAMEBUFFER_TARGET
 +                && !(layer->flags & HWC_IS_CURSOR_LAYER)
 +                && layer->handle
-+                && !gralloc_handler.displayable_buffer(pdev->display, layer->handle)) {
-+                static int undisp_count = 0;
-+                if ((undisp_count++ % 500) == 0)
-+                    ALOGW("layer buffer not importable by compositor (fmt/mod not advertised), skipping direct attach");
-+                return nullptr;
-+            }
++                && !gralloc_handler.displayable_buffer(pdev->display, layer->handle);
              std::unique_ptr<buffer> result;
              if (layer->flags & HWC_IS_CURSOR_LAYER)
                  result = pdev->display->cursor_handler->create_buffer(pdev, metadata, layer);
-@@ -351,6 +367,26 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
+-            else
++            else if (undisplayable) {
++                static int undisp_count = 0;
++                if ((undisp_count++ % 500) == 0)
++                    ALOGW("layer buffer not importable by compositor; wl_shm fallback");
++                result = create_shm_wl_buffer(pdev->display, metadata, layer->handle);
++            } else
+                 result = gralloc_handler.create_buffer(pdev->display, metadata, layer->handle);
+             if (!result) {
+                 ALOGE("failed to create a wayland buffer");
+@@ -119,8 +232,14 @@ namespace {
+             auto emplace_result = pdev->display->buffer_map.emplace(layer->handle, std::move(result));
+             assert(emplace_result.second);
+             buf = emplace_result.first->second.get();
++            static int created = 0;
++            if ((created++ % 200) == 0)
++                ALOGI("new wl_buffer #%d %ux%u cache=%zu", created - 1,
++                      buf->metadata.width, buf->metadata.height,
++                      pdev->display->buffer_map.size());
+         }
+ 
++        buf->unused_frames = 0;
+         if (buf->isShm)
+             gralloc_handler.update_shm_buffer(pdev->display, buf);
+         return buf;
+@@ -214,12 +333,34 @@ static int hwc_prepare(hwc_composer_device_1_t* dev,
+     return 0;
+ }
+ 
+-static long time_to_sleep_to_next_vsync(struct timespec *rt, uint64_t last_vsync_ns, unsigned vsync_period_ns)
++static uint64_t timespec_to_ns(const struct timespec *rt)
++{
++    return (uint64_t)rt->tv_sec * NS_PER_SEC + (uint64_t)rt->tv_nsec;
++}
++
++static void ns_to_timespec(uint64_t ns, struct timespec *ts)
++{
++    ts->tv_sec = (time_t)(ns / NS_PER_SEC);
++    ts->tv_nsec = (long)(ns % NS_PER_SEC);
++}
++
++static uint64_t time_to_sleep_to_next_vsync(struct timespec *rt, uint64_t last_vsync_ns, unsigned vsync_period_ns)
+ {
+-    uint64_t now = (uint64_t)rt->tv_sec * 1e9 + rt->tv_nsec;
++    uint64_t now = timespec_to_ns(rt);
++    if (vsync_period_ns == 0)
++        vsync_period_ns = 16666666; /* ~60 Hz */
++
++    if (now < last_vsync_ns) {
++        uint64_t remaining = last_vsync_ns - now;
++        /* Presentation timestamps on a different clock make last_vsync_ns
++         * look like it is far in the future; treat that as stale. */
++        if (remaining > (uint64_t)vsync_period_ns * 4)
++            return vsync_period_ns;
++        return remaining;
++    }
++
+     uint64_t frames_since_last_vsync = (now - last_vsync_ns) / vsync_period_ns + 1;
+     uint64_t next_vsync = last_vsync_ns + frames_since_last_vsync * vsync_period_ns;
+-
+     return next_vsync - now;
+ }
+ 
+@@ -235,8 +376,7 @@ static void* hwc_vsync_thread(void* data) {
+     bool vsync_enabled = false;
+ 
+     struct timespec wait_time;
+-    wait_time.tv_sec = 0;
+-    wait_time.tv_nsec = time_to_sleep_to_next_vsync(&rt, pdev->last_vsync_ns, pdev->vsync_period_ns);
++    ns_to_timespec(time_to_sleep_to_next_vsync(&rt, pdev->last_vsync_ns, pdev->vsync_period_ns), &wait_time);
+ 
+     while (true) {
+         ATRACE_BEGIN("hwc_vsync_thread");
+@@ -257,14 +397,14 @@ static void* hwc_vsync_thread(void* data) {
+                   __FILE__, __LINE__, strerror(errno));
+         }
+ 
+-        wait_time.tv_nsec = time_to_sleep_to_next_vsync(&rt, pdev->last_vsync_ns, pdev->vsync_period_ns);
++        ns_to_timespec(time_to_sleep_to_next_vsync(&rt, pdev->last_vsync_ns, pdev->vsync_period_ns), &wait_time);
+ 
+         if (!vsync_enabled || !pdev->procs || !pdev->procs->vsync) {
+             ATRACE_END();
+             continue;
+         }
+ 
+-        int64_t timestamp = (uint64_t)rt.tv_sec * 1e9 + rt.tv_nsec;
++        int64_t timestamp = (int64_t)timespec_to_ns(&rt);
+         pdev->procs->vsync(pdev->procs, 0, timestamp);
+         ATRACE_END();
+     }
+@@ -292,7 +432,13 @@ feedback_presented(void *data,
+     auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(data);
+     wp_presentation_feedback_destroy(feedback);
+ 
+-    pdev->last_vsync_ns = (((uint64_t)tv_sec_hi << 32) + tv_sec_lo) * 1e9 + tv_nsec;
++    /* Mixing CLOCK_REALTIME presentation timestamps into last_vsync_ns
++     * underflows the vsync-thread sleep (compared against CLOCK_MONOTONIC)
++     * and stalls Choreographer. */
++    if (!pdev->display || pdev->display->presentation_clk_id != CLOCK_MONOTONIC)
++        return;
++
++    pdev->last_vsync_ns = (((uint64_t)tv_sec_hi << 32) + tv_sec_lo) * NS_PER_SEC + tv_nsec;
+ }
+ 
+ static void
+@@ -333,50 +479,111 @@ static void apply_surface_damage(hwc_layer_1 *hwc_layer, surface_context &surfac
+     });
+ }
+ 
+-static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, surface_context &surface_context, buffer *buf = nullptr) {
+-    constexpr int acquireWarningMS = 100;
+-    int res = -1;
++static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, surface_context &surface_context, buffer *buf = nullptr, const hwc_frect_t *crop_in = nullptr, const hwc_rect_t *dest_in = nullptr) {
++    /* Venus first frames of a new client routinely exceed 100ms. The old
++     * 100ms wait logged ETIME then still committed, but returned -1 so
++     * apply_hwc_layer_to_window skipped set_position and wp_presentation
++     * feedback — WindowManager stayed in DRAW_PENDING / enter-animation
++     * (AnTuTu black window, 2 frames). Wait longer; still present; treat
++     * timeout as a warning so position + presented callbacks are installed. */
++    constexpr int acquireTimeoutMS = 1000;
+ 
+     if (!buf) {
+         buf = get_wl_buffer(pdev, hwc_layer, hwc_layer_index);
+         if (!buf) {
+             ALOGE("Failed to get wayland buffer");
+-            goto out;
++            if (hwc_layer->acquireFenceFd != -1) {
++                close(hwc_layer->acquireFenceFd);
++                hwc_layer->acquireFenceFd = -1;
++            }
++            return -1;
+         }
+     }
+ 
+     // TODO: Implement per-hwc_layer explicit synchronization
+     hwc_layer->releaseFenceFd = -1;
+ 
++    if (hwc_layer->acquireFenceFd != -1) {
++        int wres = sync_wait(hwc_layer->acquireFenceFd, acquireTimeoutMS);
++        if (wres < 0) {
++            if (errno == ETIME) {
++                ALOGW("hwcomposer waited on fence %d for %d ms; presenting anyway",
++                      hwc_layer->acquireFenceFd, acquireTimeoutMS);
++            } else {
++                ALOGE("hwcomposer acquire fence %d wait failed: %s",
++                      hwc_layer->acquireFenceFd, strerror(errno));
++            }
++        }
++    }
++
++    hwc_frect_t crop;
++    hwc_rect_t dest;
++    if (crop_in && dest_in) {
++        crop = *crop_in;
++        dest = *dest_in;
++    } else if (!prepare_layer_geom(pdev, hwc_layer, buf, &crop, &dest)) {
++        if (hwc_layer->acquireFenceFd != -1) {
++            close(hwc_layer->acquireFenceFd);
++            hwc_layer->acquireFenceFd = -1;
++        }
++        return 1;
++    }
++
      surface_context.attach_buffer(*buf);
      apply_surface_damage(hwc_layer, surface_context);
      surface_context.set_buffer_transform(hwc_transform_to_buffer_transform(hwc_layer->transform));
@@ -197,16 +502,20 @@ index f509ed7..4e921d3 100644
 +     * their buffers often carry garbage alpha (games leave the sky at a=0).
 +     * Without an opaque region the compositor premult-blends the subsurface
 +     * and "transparent" content shows the black window behind it — while
-+     * SF-side screenshots look correct. */
++     * SF-side screenshots look correct.
++     * Do not mark FRAMEBUFFER_TARGET opaque: it is the SF client target and
++     * may have holes for DEVICE overlays; a full opaque region on it flickers
++     * or blacks out windows that mix CLIENT + DEVICE layers. */
 +    {
 +        struct wl_region *opaque = nullptr;
-+        if (hwc_layer->blending == HWC_BLENDING_NONE) {
++        if (hwc_layer->blending == HWC_BLENDING_NONE
++            && hwc_layer->compositionType != HWC_FRAMEBUFFER_TARGET) {
 +            opaque = wl_compositor_create_region(pdev->display->compositor);
 +            /* finite surface-local rect: INT32_MAX regions overflow region
 +             * math in some compositors and get silently dropped */
 +            wl_region_add(opaque, 0, 0,
-+                          (int32_t)ceil((hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / pdev->display->scale),
-+                          (int32_t)ceil((hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / pdev->display->scale));
++                          (int32_t)ceil((dest.right - dest.left) / pdev->display->scale),
++                          (int32_t)ceil((dest.bottom - dest.top) / pdev->display->scale));
 +        }
 +        wl_surface_set_opaque_region(surface_context.surface, opaque);
 +        if (opaque)
@@ -214,9 +523,190 @@ index f509ed7..4e921d3 100644
 +    }
      // Scaling can only be supported correctly with wp_viewport
      if (surface_context.viewport) {
-         surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform));
-@@ -446,6 +482,14 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+-        surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform));
+-        surface_context.set_display_frame(hwc_layer->displayFrame, pdev->display->scale);
+-    } else {
+-        surface_context.set_buffer_scale(pdev->display->scale);
+-    }
+-
+-    // TODO: Implement explicit synchronization
+-    if (hwc_layer->acquireFenceFd != -1) {
+-        res = sync_wait(hwc_layer->acquireFenceFd, acquireWarningMS);
+-        if (res < 0 && errno == ETIME) {
+-            ALOGE("hwcomposer waited on fence %d for %d ms", hwc_layer->acquireFenceFd,
+-                  acquireWarningMS);
++        float crop_w = crop.right - crop.left;
++        float crop_h = crop.bottom - crop.top;
++        if (crop_w <= 0.f || crop_h <= 0.f) {
++            static int empty_crop_count = 0;
++            if ((empty_crop_count++ % 120) == 0) {
++                ALOGI("hwc: empty sourceCropf layer[%zu] dest=%dx%d crop=(%g,%g)-(%g,%g) -> full buffer %ux%u",
++                      hwc_layer_index,
++                      dest.right - dest.left,
++                      dest.bottom - dest.top,
++                      crop.left, crop.top, crop.right, crop.bottom,
++                      buf->metadata.width, buf->metadata.height);
++            }
+         }
++        surface_context.set_crop(crop, buf->metadata.width, buf->metadata.height);
++        surface_context.set_display_frame(dest, pdev->display->scale);
+     } else {
+-        res = 0;
++        surface_context.set_buffer_scale(pdev->display->scale);
      }
+ 
+     wl_surface_commit(surface_context.surface);
+ 
+-out:
+     if (hwc_layer->acquireFenceFd != -1) {
+         close(hwc_layer->acquireFenceFd);
++        hwc_layer->acquireFenceFd = -1;
+     }
+-    return res;
++    return 0;
+ }
+ 
+ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, window *window) {
+@@ -389,28 +596,79 @@ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1
+         return -1;
+     }
+ 
++    hwc_frect_t crop;
++    hwc_rect_t dest;
++    if (!prepare_layer_geom(pdev, hwc_layer, buf, &crop, &dest)) {
++        /* Fully off-screen after clip (portrait freeform past 1080p, etc.). */
++        if (hwc_layer->acquireFenceFd != -1) {
++            close(hwc_layer->acquireFenceFd);
++            hwc_layer->acquireFenceFd = -1;
++        }
++        return 0;
++    }
++
++    if (window->has_frame) {
++        const int ox = window->origin_x;
++        const int oy = window->origin_y;
++        const int fw = window->frame_w;
++        const int fh = window->frame_h;
++        dest.left -= ox;
++        dest.right -= ox;
++        dest.top -= oy;
++        dest.bottom -= oy;
++        auto clip_edge = [](int &d0, int &d1, float &c0, float &c1, int lo, int hi) {
++            int dw = d1 - d0;
++            float cw = c1 - c0;
++            if (dw <= 0)
++                return;
++            if (d0 < lo) {
++                if (cw > 0.f)
++                    c0 += ((float)(lo - d0) / (float)dw) * cw;
++                d0 = lo;
++                dw = d1 - d0;
++                cw = c1 - c0;
++            }
++            if (d1 > hi && dw > 0) {
++                if (cw > 0.f)
++                    c1 -= ((float)(d1 - hi) / (float)dw) * cw;
++                d1 = hi;
++            }
++        };
++        clip_edge(dest.left, dest.right, crop.left, crop.right, 0, fw);
++        clip_edge(dest.top, dest.bottom, crop.top, crop.bottom, 0, fh);
++        if (dest.right <= dest.left || dest.bottom <= dest.top) {
++            if (hwc_layer->acquireFenceFd != -1) {
++                close(hwc_layer->acquireFenceFd);
++                hwc_layer->acquireFenceFd = -1;
++            }
++            return 0;
++        }
++    }
++
+     auto &window_layer = window->get_next_layer();
+ 
+-    if (apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, window_layer, buf) != 0) {
++    if (apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, window_layer, buf, &crop, &dest) != 0) {
+         return -1;
+     }
+ 
+     window_layer.set_position(
+-        floor(hwc_layer->displayFrame.left / pdev->display->scale),
+-        floor(hwc_layer->displayFrame.top / pdev->display->scale)
++        floor(dest.left / pdev->display->scale),
++        floor(dest.top / pdev->display->scale)
+     );
+ 
+     if (window->input_region) {
+         wl_region_add(window->input_region,
+-                      -WINDOW_DECORATION_OUTSET + floor(hwc_layer->displayFrame.left / pdev->display->scale),
+-                      -WINDOW_DECORATION_OUTSET + floor(hwc_layer->displayFrame.top / pdev->display->scale),
+-                      2*WINDOW_DECORATION_OUTSET + ceil((hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / pdev->display->scale),
+-                      2*WINDOW_DECORATION_OUTSET + ceil((hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / pdev->display->scale));
++                      -WINDOW_DECORATION_OUTSET + floor(dest.left / pdev->display->scale),
++                      -WINDOW_DECORATION_OUTSET + floor(dest.top / pdev->display->scale),
++                      2*WINDOW_DECORATION_OUTSET + ceil((dest.right - dest.left) / pdev->display->scale),
++                      2*WINDOW_DECORATION_OUTSET + ceil((dest.bottom - dest.top) / pdev->display->scale));
+     }
+ 
++    /* InputFlinger wants display coords. After translating dest into the
++     * window, reconstruct them from the content-frame origin. */
+     pdev->display->layers[window_layer.surface] = {
+-            .x = hwc_layer->displayFrame.left,
+-            .y = hwc_layer->displayFrame.top };
++            .x = dest.left + (window->has_frame ? window->origin_x : 0),
++            .y = dest.top + (window->has_frame ? window->origin_y : 0) };
+ 
+     if (window->display->presentation) {
+         auto feedback = wp_presentation_feedback(window->display->presentation, window_layer.surface);
+@@ -431,6 +689,35 @@ static void reset_per_commit_state_window(waydroid_hwc_composer_device_1 *pdev)
+     }
+ }
+ 
++/* Drop wl_buffers that have not appeared in a layer list for several frames.
++ * Must not destroy a buffer a window still holds as last_layer_buffer
++ * (snapshot_inactive_app_window reads that raw pointer). */
++static void prune_stale_cached_buffers(waydroid_hwc_composer_device_1 *pdev,
++                                       hwc_display_contents_1_t *contents) {
++    auto &map = pdev->display->buffer_map;
++    for (auto &kv : map)
++        kv.second->unused_frames++;
++    for (size_t l = 0; l < contents->numHwLayers; l++) {
++        auto *h = contents->hwLayers[l].handle;
++        if (!h)
++            continue;
++        auto it = map.find(h);
++        if (it != map.end())
++            it->second->unused_frames = 0;
++    }
++    for (auto &[id, window] : pdev->display->windows) {
++        if (window->last_layer_buffer)
++            window->last_layer_buffer->unused_frames = 0;
++    }
++    constexpr int kMaxUnusedFrames = 8;
++    for (auto it = map.begin(); it != map.end(); ) {
++        if (it->second->unused_frames > kMaxUnusedFrames)
++            it = map.erase(it);
++        else
++            ++it;
++    }
++}
++
+ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+                    hwc_display_contents_1_t** displays) {
+     if (HWC_DISPLAY_PRIMARY >= numDisplays || !displays)
+@@ -441,11 +728,24 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+     hwc_display_contents_1_t* contents = displays[HWC_DISPLAY_PRIMARY];
+     assert(contents);
+ 
+-    if (pdev->should_compose && contents->flags & HWC_GEOMETRY_CHANGED) {
+-        pdev->display->buffer_map.clear();
+-    }
++    /* Do not drop the whole cache on HWC_GEOMETRY_CHANGED. Destroying
++     * wl_buffers that are still attached blanks the window for a frame
++     * (flicker) and forces zwp_linux_buffer_params.create_immed on every
++     * geometry tweak. SurfaceFlinger sets GEOMETRY_CHANGED on freeform
++     * caption/size changes and splash→activity, i.e. nearly every frame
++     * while AnTuTu/Jelly start. Recycled gralloc handles are caught by
++     * find_cached_buffer's metadata check; unused entries are pruned
++     * after a few unseen frames (covers the 3-buffer ring). */
  
      auto& mode = pdev->selected_mode;
 +    static int set_count = 0;
@@ -230,7 +720,7 @@ index f509ed7..4e921d3 100644
      mode->setup_set(pdev, contents);
  
      std::scoped_lock lock(pdev->display->windowsMutex);
-@@ -459,9 +503,13 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+@@ -459,9 +759,13 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
          if (layer->flags & HWC_IS_CURSOR_LAYER) {
              found_cursor = true;
              pdev->display->cursor_handler->apply_cursor(pdev, layer, l);
@@ -247,7 +737,24 @@ index f509ed7..4e921d3 100644
          }
      }
      if (!found_cursor) {
-@@ -792,6 +840,20 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+@@ -469,6 +773,7 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+     }
+ 
+     mode->post_processing(pdev, contents);
++    prune_stale_cached_buffers(pdev, contents);
+ 
+     for (auto& [key, window] : pdev->display->windows) {
+         if (window->input_region) {
+@@ -483,6 +788,8 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+ 
+     if (pdev->display->needHotplug && pdev->procs && pdev->procs->hotplug) {
+         pdev->procs->hotplug(pdev->procs, 0, 1);
++        for (auto &[id, window] : pdev->display->windows)
++            window->last_layer_buffer = nullptr;
+         pdev->display->buffer_map.clear();
+         pdev->display->needHotplug = false;
+     }
+@@ -792,13 +1099,27 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
      if (pdev->display->refresh > 1000 && pdev->display->refresh < 1000000)
          pdev->vsync_period_ns = 1000 * 1000 * 1000 / (pdev->display->refresh / 1000);
  
@@ -268,9 +775,26 @@ index f509ed7..4e921d3 100644
      struct timespec rt;
      if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
         ALOGE("%s:%d error in vsync thread clock_gettime: %s",
-@@ -924,6 +986,8 @@ int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev,
+             __FILE__, __LINE__, strerror(errno));
+     }
+ 
+-    pdev->last_vsync_ns = int64_t(rt.tv_sec) * 1e9 + rt.tv_nsec;
++    pdev->last_vsync_ns = timespec_to_ns(&rt);
+ 
+     if (!pdev->vsync_thread) {
+         ret = pthread_create (&pdev->vsync_thread, NULL, hwc_vsync_thread, pdev);
+@@ -919,11 +1240,16 @@ void wl_cursor_cursor_handler::set_cursor(display* display) const {
+ 
+ int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev, hwc_layer_1* hwc_layer, size_t hwc_layer_index) {
+     if (pdev->display->pointer) {
+-        if (apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, cursor_surface_context) != 0) {
++        int r = apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, cursor_surface_context);
++        if (r < 0) {
+             ALOGE("Failed to prepare cursur surface");
              return -1;
          }
++        if (r == 1)
++            return 0;
          set_cursor(pdev->display);
 +    } else if (hwc_layer->acquireFenceFd != -1) {
 +        close(hwc_layer->acquireFenceFd);
@@ -289,6 +813,126 @@ index 351d780..52d27c6 100644
          return windows.add(pdev, "Waydroid", "Waydroid", "0");
      }
  }
+diff --git a/hwcomposer/modes/multi-window.cpp b/hwcomposer/modes/multi-window.cpp
+index bfc251a..555f7c7 100644
+--- a/hwcomposer/modes/multi-window.cpp
++++ b/hwcomposer/modes/multi-window.cpp
+@@ -25,10 +25,15 @@
+ 
+ #include "multi-window.h"
+ 
++#include <algorithm>
++#include <cmath>
++
+ #include <log/log.h>
+ #include <cutils/properties.h>
+ 
+-constexpr hwc_color_t color_transparent = {0, 0, 0, 0};
++/* Opaque black, same as full-ui. A fully-transparent 1×1 parent made
++ * Denial fill the xdg_toplevel white and clip AnTuTu 3D subsurfaces. */
++constexpr hwc_color_t color_opaque_black = {0, 0, 0, 255};
+ 
+ window *multi_window_mode::get_window(waydroid_hwc_composer_device_1 *pdev, layer_info &layer_info) {
+     auto &windows = pdev->display->windows;
+@@ -41,7 +46,7 @@ window *multi_window_mode::get_window(waydroid_hwc_composer_device_1 *pdev, laye
+         if (it != windows.end()) {
+             return it->second.get();
+         } else {
+-            return windows.add(pdev, layer_info.tid, layer_info.aid, layer_info.tid, color_transparent);
++            return windows.add(pdev, layer_info.tid, layer_info.aid, layer_info.tid, color_opaque_black);
+         }
+     } else if (layer_info.type == LayerSplitType::RawName) {
+         if (layer_info.aid == "InputMethod") {
+@@ -49,7 +54,7 @@ window *multi_window_mode::get_window(waydroid_hwc_composer_device_1 *pdev, laye
+             if (it != windows.end()) {
+                 return it->second.get();
+             } else {
+-                return windows.add(pdev, "InputMethod", "InputMethod", "none", color_transparent);
++                return windows.add(pdev, "InputMethod", "InputMethod", "none", color_opaque_black);
+             }
+         }
+     }
+@@ -70,6 +75,33 @@ int multi_window_mode::prepare(hwc_layer_1* hwc_layer, size_t) {
+ 
+ int multi_window_mode::setup_set(waydroid_hwc_composer_device_1* pdev, hwc_display_contents_1_t* contents) {
+     layer_infos.setup(pdev, contents->hwLayers, contents->numHwLayers);
++    m_bounds.clear();
++    const int disp_w = (int)std::lround(pdev->display->width * pdev->display->scale);
++    const int disp_h = (int)std::lround(pdev->display->height * pdev->display->scale);
++    for (size_t i = 0; i < contents->numHwLayers; ++i) {
++        const auto &layer = contents->hwLayers[i];
++        if (!can_handle_layer(layer) || !layer.handle)
++            continue;
++        const auto &info = layer_infos[i];
++        if (info.type == LayerSplitType::Empty)
++            continue;
++        int l = std::max(layer.displayFrame.left, 0);
++        int t = std::max(layer.displayFrame.top, 0);
++        int r = disp_w > 0 ? std::min(layer.displayFrame.right, disp_w) : layer.displayFrame.right;
++        int b = disp_h > 0 ? std::min(layer.displayFrame.bottom, disp_h) : layer.displayFrame.bottom;
++        if (r <= l || b <= t)
++            continue;
++        const std::string &key = info.key();
++        auto it = m_bounds.find(key);
++        if (it == m_bounds.end()) {
++            m_bounds.emplace(key, hwc_rect_t{l, t, r, b});
++        } else {
++            it->second.left = std::min(it->second.left, l);
++            it->second.top = std::min(it->second.top, t);
++            it->second.right = std::max(it->second.right, r);
++            it->second.bottom = std::max(it->second.bottom, b);
++        }
++    }
+     return 0;
+ }
+ 
+@@ -109,6 +141,16 @@ int multi_window_mode::handle_layer(waydroid_hwc_composer_device_1* pdev, hwc_la
+     window *window = get_window(pdev, layer_infos[i]);
+ 
+     if (window) {
++        const auto &info = layer_infos[i];
++        if (info.type != LayerSplitType::Empty) {
++            auto it = m_bounds.find(info.key());
++            if (it != m_bounds.end()) {
++                const auto &b = it->second;
++                window->apply_content_frame(b.left, b.top,
++                                            b.right - b.left, b.bottom - b.top,
++                                            pdev->display->scale);
++            }
++        }
+         return apply_hwc_layer_to_window(pdev, hwc_layer, i, window);
+     } else {
+         if (hwc_layer->acquireFenceFd != -1) {
+@@ -118,9 +160,7 @@ int multi_window_mode::handle_layer(waydroid_hwc_composer_device_1* pdev, hwc_la
+     }
+ }
+ 
+-int multi_window_mode::post_processing(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *contents) {
+-    if (contents->flags & HWC_GEOMETRY_CHANGED) {
+-        neutralize_remaining_subsurfaces(pdev);
+-    }
++int multi_window_mode::post_processing(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *) {
++    neutralize_remaining_subsurfaces(pdev);
+     return 0;
+ }
+\ No newline at end of file
+diff --git a/hwcomposer/modes/multi-window.h b/hwcomposer/modes/multi-window.h
+index e5afee6..8a8a16c 100644
+--- a/hwcomposer/modes/multi-window.h
++++ b/hwcomposer/modes/multi-window.h
+@@ -27,8 +27,12 @@
+ 
+ #include "waydroid_mode.h"
+ 
++#include <string>
++#include <unordered_map>
++
+ class multi_window_mode : public waydroid_mode {
+     split_layer_names_helper layer_infos;
++    std::unordered_map<std::string, hwc_rect_t> m_bounds;
+ 
+     static window *get_window(waydroid_hwc_composer_device_1 *pdev, layer_info &layer_info);
+     static bool can_handle_layer(const hwc_layer_1& layer);
 diff --git a/hwcomposer/modes/single-window.cpp b/hwcomposer/modes/single-window.cpp
 index 14ffccb..f3027a6 100644
 --- a/hwcomposer/modes/single-window.cpp
@@ -354,10 +998,41 @@ index 14ffccb..f3027a6 100644
      }
  
 diff --git a/hwcomposer/modes/waydroid_mode.cpp b/hwcomposer/modes/waydroid_mode.cpp
-index a4a214a..757ab06 100644
+index a4a214a..16060ae 100644
 --- a/hwcomposer/modes/waydroid_mode.cpp
 +++ b/hwcomposer/modes/waydroid_mode.cpp
-@@ -47,8 +47,15 @@ void neutralize_remaining_subsurfaces(waydroid_hwc_composer_device_1 *pdev) {
+@@ -35,20 +35,41 @@ void clear_open_windows(waydroid_hwc_composer_device_1 *pdev) {
+ void neutralize_remaining_subsurfaces(waydroid_hwc_composer_device_1 *pdev) {
+     auto& windows = pdev->display->windows;
+     for (const auto& [key, window] : windows) {
+-        // Nothing was rendered. Skip
+-        if (window->lastLayer == 0)
+-            continue;
+-        // Neutralize unused surfaces
+-        for (size_t l = window->lastLayer; l < window->layers.size(); ++l) {
++        /* Always detach leftover subsurfaces, including lastLayer==0
++         * (no overlay this frame). AnTuTu 3D add/remove/resize without
++         * HWC_GEOMETRY_CHANGED used to leave a stale larger subsurface
++         * covering the dock as a stretched texture.
++         * When the first overlay lives on the parent (no dedicated
++         * background), never detach layers[0] — that blanks the toplevel. */
++        size_t start = static_cast<size_t>(window->lastLayer);
++        if (!window->dedicated_background_surface && start == 0)
++            start = 1;
++        size_t leftover = 0;
++        for (size_t l = start; l < window->layers.size(); ++l) {
+             wl_surface_attach(window->layers[l].surface, nullptr, 0, 0);
+             wl_surface_commit(window->layers[l].surface);
++            leftover++;
++        }
++        if (leftover) {
++            static int ncount = 0;
++            if ((ncount++ % 60) == 0) {
++                ALOGI("hwc: neutralized %zu leftover subsurface(s) on '%s' lastLayer=%d layers=%zu",
++                      leftover, key.c_str(), window->lastLayer, window->layers.size());
++            }
+         }
+     }
  }
  
  
@@ -394,7 +1069,7 @@ index a93cb50..2d5daa8 100644
  
      // Safe to call after setup_for_each_layer
 diff --git a/hwcomposer/modes/waydroid_mode_impl.h b/hwcomposer/modes/waydroid_mode_impl.h
-index 000b388..a874a73 100644
+index 000b388..0409349 100644
 --- a/hwcomposer/modes/waydroid_mode_impl.h
 +++ b/hwcomposer/modes/waydroid_mode_impl.h
 @@ -31,14 +31,28 @@ template<class T>
@@ -504,6 +1179,21 @@ index 000b388..a874a73 100644
              ALOGW("Encountered unsupported compositionType: %" PRId32, hwc_layer->compositionType);
              // TODO: Support HWC_BACKGROUND
              if (hwc_layer->acquireFenceFd != -1) {
+@@ -107,10 +136,10 @@ class compositing_window_mode : public virtual waydroid_mode {
+         return apply_hwc_layer_to_window(pdev, hwc_layer, i, window);
+     }
+ 
+-    int post_processing(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *contents) override {
+-        if (contents->flags & HWC_GEOMETRY_CHANGED) {
+-            neutralize_remaining_subsurfaces(pdev);
+-        }
++    int post_processing(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *) override {
++        /* Layer count can drop without HWC_GEOMETRY_CHANGED (AnTuTu 3D
++         * add/remove/resize). Neutralize leftover subsurfaces every frame. */
++        neutralize_remaining_subsurfaces(pdev);
+         return 0;
+     }
+ };
 @@ -136,9 +165,20 @@ class non_compositing_window_mode : public virtual waydroid_mode {
      }
  
@@ -526,10 +1216,288 @@ index 000b388..a874a73 100644
                  m_draw_framebuffer_at = i;
              }
 diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
-index 0bd2f35..d5d1eeb 100644
+index 0bd2f35..69c001a 100644
 --- a/hwcomposer/wayland-hwc.cpp
 +++ b/hwcomposer/wayland-hwc.cpp
-@@ -2047,7 +2047,17 @@ static void* hwc_wayland_thread(void* data) {
+@@ -52,6 +52,7 @@
+ #include <syscall.h>
+ #include <cmath>
+ #include <algorithm>
++#include <cstring>
+ 
+ #include <libsync/sw_sync.h>
+ #include <sync/sync.h>
+@@ -346,13 +347,55 @@ void surface_context::set_buffer_scale(double d_scale) {
+     wl_surface_set_buffer_scale(surface, scale);
+ }
+ 
+-void surface_context::set_crop(hwc_frect_t crop) {
++void surface_context::set_crop(hwc_frect_t crop, uint32_t buffer_width, uint32_t buffer_height) {
+     assert(viewport);
+ 
+-    float x = fmax(0, crop.left);
+-    float y = fmax(0, crop.top);
+-    float width = fmax(1, crop.right - crop.left);
+-    float height = fmax(1, crop.bottom - crop.top);
++    float crop_w = crop.right - crop.left;
++    float crop_h = crop.bottom - crop.top;
++    bool empty = crop_w <= 0.f || crop_h <= 0.f
++                 || !std::isfinite(crop_w) || !std::isfinite(crop_h)
++                 || !std::isfinite(crop.left) || !std::isfinite(crop.top);
++
++    /* Empty sourceCropf used to become 1x1 via fmax(1, 0) and wp_viewport
++     * stretched that texel across displayFrame — the huge warped overlay
++     * seen during AnTuTu 3D. Unset source so the compositor samples the
++     * whole buffer. Window parent bg still sets 1x1 directly on its own
++     * viewport (solid-color shm), not through this path. */
++    if (empty) {
++        wp_viewport_set_source(viewport,
++                               wl_fixed_from_int(-1),
++                               wl_fixed_from_int(-1),
++                               wl_fixed_from_int(-1),
++                               wl_fixed_from_int(-1));
++        return;
++    }
++
++    float x = fmax(0.f, crop.left);
++    float y = fmax(0.f, crop.top);
++    float width = crop_w;
++    float height = crop_h;
++
++    /* Clamp to buffer so we don't raise wp_viewport.out_of_buffer. */
++    if (buffer_width > 0 && buffer_height > 0) {
++        if (x >= (float)buffer_width || y >= (float)buffer_height) {
++            wp_viewport_set_source(viewport,
++                                   wl_fixed_from_int(-1),
++                                   wl_fixed_from_int(-1),
++                                   wl_fixed_from_int(-1),
++                                   wl_fixed_from_int(-1));
++            return;
++        }
++        width = fmin(width, (float)buffer_width - x);
++        height = fmin(height, (float)buffer_height - y);
++    }
++    if (width <= 0.f || height <= 0.f) {
++        wp_viewport_set_source(viewport,
++                               wl_fixed_from_int(-1),
++                               wl_fixed_from_int(-1),
++                               wl_fixed_from_int(-1),
++                               wl_fixed_from_int(-1));
++        return;
++    }
+ 
+     wp_viewport_set_source(viewport,
+                            wl_fixed_from_double(x),
+@@ -380,6 +423,27 @@ void window::reset_per_set_state() {
+     }
+ }
+ 
++void window::apply_content_frame(int ox, int oy, int width, int height, double scale) {
++    if (width <= 0)
++        width = 1;
++    if (height <= 0)
++        height = 1;
++    has_frame = true;
++    origin_x = ox;
++    origin_y = oy;
++    frame_w = width;
++    frame_h = height;
++    if (scale <= 0.0)
++        scale = 1.0;
++    const int logical_w = std::max(1, (int)std::ceil((double)width / scale));
++    const int logical_h = std::max(1, (int)std::ceil((double)height / scale));
++    if (viewport && dedicated_background_surface) {
++        wp_viewport_set_destination(viewport, logical_w, logical_h);
++    }
++    if (xdg_surface)
++        xdg_surface_set_window_geometry(xdg_surface, 0, 0, logical_w, logical_h);
++}
++
+ void window::set_maximize(bool enabled) {
+     if (xdg_toplevel) {
+         if (enabled) {
+@@ -472,6 +536,55 @@ static const struct wp_fractional_scale_v1_listener fractional_scale_listener =
+     .preferred_scale = fractional_scale_handle_preferred_scale
+ };
+ 
++/* Solid-color parent buffer at the configured window size.
++ * A 1×1 SHM texel stretched with wp_viewport is compositor-dependent:
++ * Denial (NVIDIA EGL) treats a fully-transparent 1×1 as empty and fills
++ * the xdg_toplevel with default white, which hid AnTuTu 3D subsurfaces
++ * during 测评 (host window ~92% white vs guest SF content). */
++static struct wl_buffer *
++create_solid_shm_buffer(struct display *display, int width, int height, hwc_color_t color)
++{
++    if (width <= 0)
++        width = 1;
++    if (height <= 0)
++        height = 1;
++    const size_t n = (size_t)width * (size_t)height;
++    const size_t bytes = n * 4;
++    if (bytes > (size_t)INT32_MAX) {
++        ALOGE("background %dx%d exceeds wl_shm pool", width, height);
++        return nullptr;
++    }
++    int fd = syscall(SYS_memfd_create, "waydroid-bg", 0);
++    if (fd < 0 || ftruncate(fd, (off_t)bytes) < 0) {
++        ALOGE("background memfd failed: %s", strerror(errno));
++        if (fd >= 0)
++            close(fd);
++        return nullptr;
++    }
++    void *data = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (data == MAP_FAILED) {
++        ALOGE("background mmap failed");
++        close(fd);
++        return nullptr;
++    }
++    uint32_t pixel = ((uint32_t)color.a << 24) | ((uint32_t)color.r << 16) |
++                     ((uint32_t)color.g << 8) | (uint32_t)color.b;
++    if (pixel == 0) {
++        memset(data, 0, bytes);
++    } else {
++        uint32_t *pixels = static_cast<uint32_t *>(data);
++        for (size_t i = 0; i < n; i++)
++            pixels[i] = pixel;
++    }
++    struct wl_shm_pool *bg_pool = wl_shm_create_pool(display->shm, fd, (int32_t)bytes);
++    close(fd);
++    munmap(data, bytes);
++    struct wl_buffer *buf = wl_shm_pool_create_buffer(bg_pool, 0, width, height,
++                                                      width * 4, WL_SHM_FORMAT_ARGB8888);
++    wl_shm_pool_destroy(bg_pool);
++    return buf;
++}
++
+ std::unique_ptr<window>
+ window::create(struct display *display, bool use_subsurfaces, std::string appID, std::string taskID, hwc_color_t color)
+ {
+@@ -597,14 +710,17 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
+         wl_region_destroy(region);
+     }
+ 
+-    // TODO: Fix background when viewport is not supported
++    munmap(shm_data, 4);
++    shm_data = nullptr;
++    wl_shm_pool_destroy(pool);
++    pool = nullptr;
++
+     // No subsurface background for us!
+     if (!display->subcompositor ||
+         !display->viewporter ||
+         property_get_bool("persist.waydroid.no_background_subsurface", false)) {
+         window->dedicated_background_surface = false;
+         window->layers.emplace_back(window->surface, window->viewport);
+-        wl_shm_pool_destroy(pool);
+         wl_surface_commit(window->surface);
+         return window;
+     } else if (!use_subsurfaces) {
+@@ -615,16 +731,27 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
+         wl_subsurface_set_desync(window->layers[0].subsurface);
+     }
+ 
+-    uint32_t *buf = (uint32_t*)shm_data;
+-    *buf = color.a << 24 | color.r << 16 | color.g << 8 | color.b;
+-    window->bg_buffer = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4, WL_SHM_FORMAT_ARGB8888);
+-    wl_shm_pool_destroy(pool);
++    window->bg_buffer = create_solid_shm_buffer(display, display->width, display->height, color);
++    if (!window->bg_buffer) {
++        ALOGW("window '%s': no dedicated parent buffer; first overlay attaches to xdg_toplevel",
++              window->appID.c_str());
++        if (window->layers.empty()) {
++            window->dedicated_background_surface = false;
++            window->layers.emplace_back(window->surface, window->viewport);
++        }
++        wl_surface_commit(window->surface);
++        return window;
++    }
+ 
+     wl_surface_attach(window->surface, window->bg_buffer, 0, 0);
+     wl_surface_damage(window->surface, 0, 0, INT32_MAX, INT32_MAX);
+-    wp_viewport_set_source(window->viewport, wl_fixed_from_int(0), wl_fixed_from_int(0), wl_fixed_from_int(1), wl_fixed_from_int(1));
++    wp_viewport_set_source(window->viewport,
++                           wl_fixed_from_int(-1), wl_fixed_from_int(-1),
++                           wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+     wp_viewport_set_destination(window->viewport, display->width, display->height);
+     wl_surface_commit(window->surface);
++    ALOGI("window '%s': dedicated %dx%d parent a=%u",
++          window->appID.c_str(), display->width, display->height, color.a);
+ 
+     return window;
+ }
+@@ -732,6 +859,24 @@ ensure_pipe(struct display* display, int input_type)
+     event[n].value = value_;                       \
+     n++;
+ 
++/* Map Wayland surface-local coords into the Android display. Portrait
++ * freeform windows (AnTuTu, Soul Knight) overflow 1080p; without this
++ * clamp Unity logs "position out of bounds" and the privacy page never
++ * sees the tap that would dismiss it. */
++static void clamp_to_display(const struct display *display, int *x, int *y)
++{
++    int max_x = (int)lround(display->width * display->scale);
++    int max_y = (int)lround(display->height * display->scale);
++    if (max_x > 0) {
++        if (*x < 0) *x = 0;
++        if (*x >= max_x) *x = max_x - 1;
++    }
++    if (max_y > 0) {
++        if (*y < 0) *y = 0;
++        if (*y >= max_y) *y = max_y - 1;
++    }
++}
++
+ static void
+ send_key_event(display *data, uint32_t key, wl_keyboard_key_state state)
+ {
+@@ -908,6 +1053,7 @@ pointer_handle_motion(void *data, struct wl_pointer *,
+     }
+     x += display->layers[display->pointer_surface].x;
+     y += display->layers[display->pointer_surface].y;
++    clamp_to_display(display, &x, &y);
+ 
+     ADD_EVENT(EV_ABS, ABS_X, x);
+     ADD_EVENT(EV_ABS, ABS_Y, y);
+@@ -1147,6 +1293,7 @@ touch_handle_down(void *data, struct wl_touch *,
+     }
+     x += display->layers[surface].x;
+     y += display->layers[surface].y;
++    clamp_to_display(display, &x, &y);
+ 
+     ADD_EVENT(EV_ABS, ABS_MT_SLOT, touch_id);
+     ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, touch_id);
+@@ -1219,6 +1366,7 @@ touch_handle_motion(void *data, struct wl_touch *,
+         }
+         x += display->layers[display->touch_surfaces[id]].x;
+         y += display->layers[display->touch_surfaces[id]].y;
++        clamp_to_display(display, &x, &y);
+ 
+         ADD_EVENT(EV_ABS, ABS_MT_SLOT, touch_id);
+         ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, touch_id);
+@@ -1475,10 +1623,12 @@ static const struct wl_output_listener output_listener = {
+ };
+ 
+ static void
+-presentation_clock_id(void *, struct wp_presentation *,
++presentation_clock_id(void *data, struct wp_presentation *,
+               uint32_t clk_id)
+ {
+-    ALOGE("*** %s: clk_id %d CLOCK_MONOTONIC %d", __func__, clk_id, CLOCK_MONOTONIC);
++    auto *d = static_cast<struct display *>(data);
++    d->presentation_clk_id = clk_id;
++    ALOGI("wp_presentation clock_id=%u (CLOCK_MONOTONIC=%d)", clk_id, CLOCK_MONOTONIC);
+ }
+ 
+ static const struct wp_presentation_listener presentation_listener = {
+@@ -1687,6 +1837,7 @@ tablet_tool_motion(void *data, struct zwp_tablet_tool_v2 *,
+         }
+         x += display->layers[display->tablet_surface].x;
+         y += display->layers[display->tablet_surface].y;
++        clamp_to_display(display, &x, &y);
+ 
+         ADD_EVENT(EV_ABS, ABS_X, x);
+         ADD_EVENT(EV_ABS, ABS_Y, y);
+@@ -2047,7 +2198,17 @@ static void* hwc_wayland_thread(void* data) {
      while (ret != -1)
          ret = wl_display_dispatch(display);
  
@@ -548,8 +1516,16 @@ index 0bd2f35..d5d1eeb 100644
  
      abort();
  }
+@@ -2064,6 +2225,7 @@ create_display(const char *gralloc)
+     display->system_version = property_get_int32("ro.system.build.version.sdk", 0);
+     display->gtype = get_gralloc_type(gralloc);
+     display->refresh = 0;
++    display->presentation_clk_id = UINT32_MAX;
+     display->isMaximized = true;
+     display->supports_cursor_viewport = true;
+     display->supports_cursor_hw_buffer = property_get_bool("persist.waydroid.cursor_force_shm", false);
 diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
-index 82ebbd5..07d1210 100644
+index 82ebbd5..9bcb874 100644
 --- a/hwcomposer/wayland-hwc.h
 +++ b/hwcomposer/wayland-hwc.h
 @@ -107,18 +107,21 @@ struct buffer_metadata {
@@ -579,3 +1555,56 @@ index 82ebbd5..07d1210 100644
  }
  
  struct buffer {
+@@ -130,6 +133,10 @@ struct buffer {
+     bool isShm;
+     void *shm_data;
+     int size;
++    /* Frames this cached wl_buffer has not been in the current layer list.
++     * Evicted after a few unseen frames so a 3-buffer ring stays cached
++     * without leaking closed-app GEM objects. */
++    int unused_frames = 0;
+ 
+     ~buffer();
+ };
+@@ -162,8 +169,9 @@ struct surface_context {
+     void damage_surface(int32_t x, int32_t y, int32_t width, int32_t height);
+     void set_buffer_transform(BufferTransform transform);
+     void set_buffer_scale(double scale);
+-    // Requires the transformed rectangle
+-    void set_crop(hwc_frect_t crop);
++    // Requires the transformed rectangle. Empty/invalid crop uses the
++    // whole buffer (unset wp_viewport source) instead of a 1x1 texel.
++    void set_crop(hwc_frect_t crop, uint32_t buffer_width, uint32_t buffer_height);
+     // TODO: This should not require scale. Scaling handling is broken
+     void set_display_frame(hwc_rect_t rect, double scale);
+ };
+@@ -212,6 +220,18 @@ struct window {
+     int lastLayer;
+     struct buffer *last_layer_buffer;
+ 
++    /* Multi-window: Android displayFrame is display-absolute, but the
++     * xdg_toplevel is only as large as this app. Without a frame origin
++     * a portrait freeform window (AnTuTu 758×1152) sits at (581,0) inside
++     * a 1920×1080 black parent — host shows a postage-stamp, taps miss,
++     * 3D dest overflows onto the rest of the display. */
++    bool has_frame {false};
++    int origin_x {0};
++    int origin_y {0};
++    int frame_w {0};
++    int frame_h {0};
++    void apply_content_frame(int origin_x, int origin_y, int width, int height, double scale);
++
+     ~window();
+ 
+     static std::unique_ptr<window> create(struct display *display, bool use_subsurfaces, std::string appID, std::string taskID, hwc_color_t color);
+@@ -314,6 +334,10 @@ struct display {
+     struct wl_touch *touch;
+     struct wl_output *output;
+     struct wp_presentation *presentation;
++    /* wp_presentation.clock_id; UINT32_MAX until the compositor advertises it.
++     * last_vsync_ns is CLOCK_MONOTONIC; only apply presentation timestamps
++     * when they use the same clock. */
++    uint32_t presentation_clk_id;
+     struct wp_viewporter *viewporter;
+     struct android_wlegl *android_wlegl;
+     struct zwp_linux_dmabuf_v1 *dmabuf;

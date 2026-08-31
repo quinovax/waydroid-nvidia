@@ -54,7 +54,11 @@ Android app ── Vulkan ──▶ guest Mesa Venus (bionic, vulkan.virtio.so)
 
 All end up on NVIDIA via Venus:
 
-- HWUI: `debug.hwui.renderer=skiavk` (Skia Vulkan).
+- HWUI: `debug.hwui.renderer=skiagl` (Skia GL on ANGLE). `skiavk` makes
+  every app a Venus Vulkan client and serialises UI with SurfaceFlinger
+  through the single-threaded vtest server; it is the usual source of
+  garbled app chrome, WebView crashes, and extra CPU during benches.
+  Games still talk Vulkan via `ro.hardware.vulkan=virtio`.
 - SurfaceFlinger RenderEngine: `skiaglthreaded` on **ANGLE**
   (`ro.hardware.egl=angle`) — GL-on-Vulkan-on-Venus, composition on a
   dedicated RenderEngine thread (the old prebuilt-ANGLE crash that forced

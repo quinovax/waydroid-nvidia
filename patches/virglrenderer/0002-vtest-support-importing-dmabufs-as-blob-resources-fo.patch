@@ -1,7 +1,7 @@
 From 520e8e6ac6b02405ef37cca5c5ce422b7dcaaa4c Mon Sep 17 00:00:00 2001
 From: forsen <gazikkamalov2@gmail.com>
 Date: Fri, 10 Jul 2026 20:06:20 +0300
-Subject: [PATCH 2/5] vtest: support importing dmabufs as blob resources for
+Subject: [PATCH 2/3] vtest: support importing dmabufs as blob resources for
  venus
 
 New VCMD_RESOURCE_IMPORT_BLOB: receives a dmabuf fd over SCM_RIGHTS,

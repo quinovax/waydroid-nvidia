@@ -31,6 +31,18 @@ die()  { echo "FATAL: $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*"; }
 ok()   { echo -e "\033[1;32m  OK\033[0m $*"; }
 
+assert_host_alloc_gpu() {
+    local bin="${1:-$PREFIX/virgl_test_server}"
+    [ -x "$bin" ] || die "$bin missing"
+    if command -v strings >/dev/null 2>&1 && \
+       ! strings "$bin" | grep -q RESOURCE_ALLOC_GPU; then
+        die "$bin has no VCMD_RESOURCE_ALLOC_GPU (issue #7).
+The v0.1.1 host tarball was built without virgl patch 0006, so guest
+gralloc cannot allocate scanout buffers (black screen). Rebuild with
+--source from current main, or install a release that includes ALLOC_GPU."
+    fi
+}
+
 [ "$(id -u)" = 0 ] || die "must run as root"
 
 while [ $# -gt 0 ]; do
@@ -259,11 +271,26 @@ build_from_source() {
         "$(grep '^VIRGL_UPSTREAM=' "$pins" | cut -d= -f2)" \
         "$VIRGL_SHA"
 
+    # Same series CI uses. Skipping 0006 ships a virgl_test_server without
+    # VCMD_RESOURCE_ALLOC_GPU (v0.1.1 / issue #7: black screen at boot).
+    info "applying virglrenderer patches"
+    git -C "$WNV/virglrenderer" config user.email "ci@waydroid-nvidia"
+    git -C "$WNV/virglrenderer" config user.name ci
+    git -C "$WNV/virglrenderer" am \
+        "$repo_src"/patches/virglrenderer/0001-*.patch \
+        "$repo_src"/patches/virglrenderer/0002-*.patch \
+        "$repo_src"/patches/virglrenderer/0003-*.patch \
+        "$repo_src"/patches/virglrenderer/0004-*.patch \
+        "$repo_src"/patches/virglrenderer/0005-*.patch
+    git -C "$WNV/virglrenderer" apply \
+        "$repo_src"/patches/virglrenderer/0006-wip-*.patch
+
     # ---- build using the repo's canonical build recipes ----
     export REPO="$repo_src"
 
     info "building virglrenderer (host renderer)"
     REPO="$repo_src" "$repo_src/build/virglrenderer/build.sh" "$WNV/virglrenderer" "$WNV/virglrenderer/build"
+    assert_host_alloc_gpu "$WNV/virglrenderer/build/vtest/virgl_test_server"
     ok "virglrenderer built"
 
     info "building mesa (guest Venus, x86_64)"
@@ -399,6 +426,7 @@ fi
 if [ "$SKIP_BUILD" -eq 1 ]; then
     [ -x "$PREFIX/virgl_test_server" ] || \
         die "--skip-build requires existing $PREFIX/virgl_test_server (install a release first)"
+    assert_host_alloc_gpu
     info "keeping existing host/guest binaries in $PREFIX"
     mkdir -p "$PREFIX/guest"
     install_prebuilts "$PREFIX/guest"
@@ -456,6 +484,7 @@ else
     info "installing host binaries to $PREFIX"
     mkdir -p "$PREFIX"
     tar -C "$PREFIX" -xf "$WORK/waydroid-nvidia-host-x86_64-${TAG}.tar.gz"
+    assert_host_alloc_gpu
 
     info "installing guest binaries to $PREFIX/guest"
     mkdir -p "$PREFIX/guest"

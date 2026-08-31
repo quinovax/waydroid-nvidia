@@ -2,5 +2,11 @@ upstream: https://github.com/waydroid/android_hardware_waydroid
 base-commit: 7750307  (hwcomposer: restart touch input on resize)
 # Apply: git checkout 7750307 && git apply 0001-wip-nvidia-fixes.patch
 # WIP: single-window blacklist ordering, bufferless-SKIP draw index, refresh override
-# prop, full-ui window creation fixes, gralloc_handler tweaks.
+# prop, full-ui window creation fixes, gralloc_handler tweaks, LINEAR-on-NVIDIA
+# client composition (issue #11: CoglTexture2D bind of mod 0x0), acquire-fence
+# wait 1000ms + still present (so position/wp_presentation are installed),
+# no opaque region on FRAMEBUFFER_TARGET, LINEAR wl_shm fallback in
+# multi-window, vsync integer ns + ignore non-CLOCK_MONOTONIC presentation,
+# keep wl_buffer cache across HWC_GEOMETRY_CHANGED (prune unused instead
+# of dropping the whole map — that recreated dmabufs every frame).
 # Built standalone (no AOSP tree) via build/hwcomposer/build.sh.

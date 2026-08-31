@@ -112,11 +112,17 @@ build_virgl() {
   for pf in "$REPO"/patches/virglrenderer/0001-*.patch \
             "$REPO"/patches/virglrenderer/0002-*.patch \
             "$REPO"/patches/virglrenderer/0003-*.patch \
-            "$REPO"/patches/virglrenderer/0004-wip-*.patch; do
+            "$REPO"/patches/virglrenderer/0004-*.patch \
+            "$REPO"/patches/virglrenderer/0005-*.patch \
+            "$REPO"/patches/virglrenderer/0006-wip-*.patch; do
     [[ -f "$pf" ]] || die "expected patch not found: $pf"
     git -C "$src" apply --3way "$pf" || die "failed to apply $(basename "$pf")"
   done
   REPO="$REPO" "$REPO/build/virglrenderer/build.sh" "$src" "$src/build"
+  local bin="$src/build/vtest/virgl_test_server"
+  [ -f "$bin" ] || die "virgl_test_server missing after build"
+  strings "$bin" | grep -q RESOURCE_ALLOC_GPU \
+    || die "virgl_test_server missing RESOURCE_ALLOC_GPU (patch 0006 not linked; issue #7)"
   ok "virglrenderer built"
 }
 

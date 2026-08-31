@@ -102,12 +102,16 @@ do_mesa() {
 do_virgl() {
     say "virgl: fresh $VIRGL_BASE + series -> build virgl_test_server"
     local d; d=$(checkout virgl) || { bad virgl "checkout"; return; }
-    git -C "$d" am -q "$REPO"/patches/virglrenderer/000{1,2,3}-*.patch \
-        && git -C "$d" apply "$REPO/patches/virglrenderer/0004-wip-gpu-alloc-and-global-priority.patch" \
+    git -C "$d" am -q "$REPO"/patches/virglrenderer/000{1,2,3,4,5}-*.patch \
+        && git -C "$d" apply "$REPO"/patches/virglrenderer/0006-wip-*.patch \
         || { bad virgl "patch apply"; return; }
     if REPO="$REPO" "$REPO/build/virglrenderer/build.sh" "$d" "$d/build"; then
-        [ -f "$d/build/vtest/virgl_test_server" ] \
-            && ok virgl "virgl_test_server built" || bad virgl "artifact missing"
+        if [ -f "$d/build/vtest/virgl_test_server" ] && \
+           strings "$d/build/vtest/virgl_test_server" | grep -q RESOURCE_ALLOC_GPU; then
+            ok virgl "virgl_test_server built with ALLOC_GPU"
+        else
+            bad virgl "artifact missing ALLOC_GPU (patch 0006 not linked)"
+        fi
     else bad virgl "build"; fi
 }
 

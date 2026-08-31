@@ -68,8 +68,12 @@ sock_write_all(int fd, const void *buf, size_t len)
       ssize_t n = write(fd, p, len);
       if (n < 0 && errno == EINTR)
          continue;
-      if (n <= 0)
+      if (n < 0)
          return -1;
+      if (n == 0) {
+         errno = EPIPE;
+         return -1;
+      }
       p += n;
       len -= (size_t)n;
    }
@@ -84,8 +88,12 @@ sock_read_all(int fd, void *buf, size_t len)
       ssize_t n = read(fd, p, len);
       if (n < 0 && errno == EINTR)
          continue;
-      if (n <= 0)
+      if (n < 0)
          return -1;
+      if (n == 0) {
+         errno = EPIPE;
+         return -1;
+      }
       p += n;
       len -= (size_t)n;
    }
@@ -143,8 +151,10 @@ vtest_connect(void)
       strcpy(path, DEFAULT_SOCKET);
 
    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-   if (sock < 0)
+   if (sock < 0) {
+      LOGE("socket(AF_UNIX): %s", strerror(errno));
       return -1;
+   }
 
    /* non-blocking connect + poll(1s) deadline */
    int orig_flags = fcntl(sock, F_GETFL, 0);
@@ -189,8 +199,17 @@ vtest_connect(void)
    const uint32_t hdr[VTEST_HDR_SIZE] = { sizeof(name), VCMD_CREATE_RENDERER };
    if (sock_write_all(sock, hdr, sizeof(hdr)) ||
        sock_write_all(sock, name, sizeof(name))) {
+      LOGE("CREATE_RENDERER write(%s): %s", path, strerror(errno));
       close(sock);
       return -1;
+   }
+
+   {
+      static int logged;
+      if (!logged) {
+         logged = 1;
+         LOGI("connected to %s", path);
+      }
    }
    return sock;
 }
@@ -200,6 +219,10 @@ vtest_connect(void)
 static uint32_t
 vtest_get_gbm_format(uint32_t drm_format)
 {
+   /* Non-zero = "I can allocate this fourcc". minigbm still sends the
+    * original fourcc to alloc(); returning 0 forces the R8 1D-blob path
+    * that makes ANGLE's YCbCr sampler abort (issue #16, fourcc 0x37393939
+    * = YVU420_ANDROID). YUV aliases are in the shared whitelist. */
    if (vtest_is_supported_drm_format(drm_format))
       return drm_format;
    return 0;
@@ -254,11 +277,24 @@ vtest_alloc(struct alloc_args *args)
          dev->sock = vtest_connect();
       if (dev->sock < 0)
          break;
-      if (sock_write_all(dev->sock, req, sizeof(req)) == 0 &&
-          sock_read_all(dev->sock, resp, sizeof(resp)) == 0)
-         goto have_resp;
-      close(dev->sock);
-      dev->sock = -1;
+      if (sock_write_all(dev->sock, req, sizeof(req)) != 0) {
+         LOGE("alloc %ux%u: ALLOC_GPU write: %s", args->width, args->height,
+              strerror(errno));
+         close(dev->sock);
+         dev->sock = -1;
+         continue;
+      }
+      if (sock_read_all(dev->sock, resp, sizeof(resp)) != 0) {
+         /* Immediate EPIPE = host closed after CREATE_RENDERER. v0.1.1's
+          * host tarball omitted patch 0006, so cmd 41 is
+          * VTEST_CLIENT_ERROR_COMMAND_ID (issue #7). */
+         LOGE("alloc %ux%u: ALLOC_GPU read: %s (host missing cmd 41 / patch 0006?)",
+              args->width, args->height, strerror(errno));
+         close(dev->sock);
+         dev->sock = -1;
+         continue;
+      }
+      goto have_resp;
    }
    pthread_mutex_unlock(&dev->mutex);
    LOGE("alloc: no vtest connection");
@@ -270,6 +306,14 @@ have_resp:;
     * on the socket, and the next vtest_alloc would recvmsg() the stale fd from
     * this failed request and hand it back as a valid buffer. The stream has no
     * resync point, so drop the connection instead. */
+   if (resp[1] != VCMD_RESOURCE_ALLOC_GPU) {
+      close(dev->sock);
+      dev->sock = -1;
+      pthread_mutex_unlock(&dev->mutex);
+      LOGE("alloc: unexpected vtest reply cmd %u (want %u)", resp[1],
+           VCMD_RESOURCE_ALLOC_GPU);
+      return -EIO;
+   }
    if (resp[0] < VCMD_RESOURCE_ALLOC_GPU_RESP_SIZE) {
       close(dev->sock);
       dev->sock = -1;

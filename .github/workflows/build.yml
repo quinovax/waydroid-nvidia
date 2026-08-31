@@ -118,10 +118,21 @@ jobs:
           git -C virgl-src config user.name ci
           git -C virgl-src am "$GITHUB_WORKSPACE"/patches/virglrenderer/0001-*.patch \
             "$GITHUB_WORKSPACE"/patches/virglrenderer/0002-*.patch \
-            "$GITHUB_WORKSPACE"/patches/virglrenderer/0003-*.patch
-          git -C virgl-src apply "$GITHUB_WORKSPACE"/patches/virglrenderer/0004-*.patch
+            "$GITHUB_WORKSPACE"/patches/virglrenderer/0003-*.patch \
+            "$GITHUB_WORKSPACE"/patches/virglrenderer/0004-*.patch \
+            "$GITHUB_WORKSPACE"/patches/virglrenderer/0005-*.patch
+          git -C virgl-src apply "$GITHUB_WORKSPACE"/patches/virglrenderer/0006-wip-*.patch
       - name: Build virgl_test_server + render server
         run: REPO="$GITHUB_WORKSPACE" ./build/virglrenderer/build.sh "$PWD/virgl-src" "$PWD/virgl-build"
+      - name: Verify VCMD_RESOURCE_ALLOC_GPU is linked
+        run: |
+          # v0.1.1 shipped a host tarball built without patch 0006 (issue #7):
+          # guest gralloc's cmd 41 became VTEST_CLIENT_ERROR_COMMAND_ID, SF
+          # abort-looped on "output buffer not gpu writeable", black screen.
+          bin=virgl-build/vtest/virgl_test_server
+          strings "$bin" | grep -q RESOURCE_ALLOC_GPU
+          strings "$bin" | grep -q 'vtest_gpu_alloc:'
+          echo "ALLOC_GPU command present in $bin"
       - name: Stage artifacts
         run: |
           mkdir -p stage
