@@ -40,6 +40,12 @@ case "$ANDROID_ABI" in
 esac
 BUILDDIR="${2:-$SRCDIR/build-android-$ANDROID_ABI}"
 
+# net-new ASTC-emulation source must be dropped into the tree before meson;
+# CI builds from a clean checkout (see dev/sync-patches -> src/mesa-vtest).
+REPO="${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
+install -m 0644 "$REPO/src/mesa-vtest/vn_astc_emu.c" "$SRCDIR/src/virtio/vulkan/"
+install -m 0644 "$REPO/src/mesa-vtest/vn_astc_emu.h" "$SRCDIR/src/virtio/vulkan/"
+
 NDK="${NDK:-/opt/android-ndk}"
 NDK_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 if [ -z "${NDK_PKGCONFIG:-}" ]; then
