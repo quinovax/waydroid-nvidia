@@ -183,7 +183,7 @@ install_build_deps_debian() {
     info "installing Debian/Ubuntu build dependencies"
     apt-get update -q
     apt-get install -yq meson ninja-build gcc g++ cmake pkg-config \
-        libdrm-dev libgbm-dev libepoxy-dev vulkan-headers \
+        libdrm-dev libgbm-dev libepoxy-dev libvulkan-dev   \
         libwayland-dev wayland-protocols \
         libx11-dev libxrandr-dev libxfixes-dev x11proto-dev \
         python3-yaml python3-mako python3-packaging \
