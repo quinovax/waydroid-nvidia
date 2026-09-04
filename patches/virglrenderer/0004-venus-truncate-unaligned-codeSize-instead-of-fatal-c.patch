@@ -1,19 +1,9 @@
-From 0cdeee6d841d45e2709f6eb6b1ac9cf40595ab05 Mon Sep 17 00:00:00 2001
-From: QuinOvaX <cinqwqeggs01@outlook.com>
-Date: Fri, 31 Jul 2026 21:02:24 +0800
+From ed36877b2926353189f97e2fb3efbbdd8a0f9937 Mon Sep 17 00:00:00 2001
+From: ci <ci@waydroid-nvidia>
+Date: Fri, 4 Sep 2026 22:30:29 +0800
 Subject: [PATCH 4/5] venus: truncate unaligned codeSize instead of fatal
  context kill
 
-Android apps compiled with some toolchains (AnTuTu, Geekbench 6) send
-vkCreateShaderModule with codeSize not divisible by 4.  The venus
-encoder/decoder already truncates the transmitted payload to codeSize&~3,
-so the driver never sees the extra bytes anyway.  Calling
-vkr_context_set_fatal() here poisoned the whole Vulkan context, causing
-every subsequent vkCreateGraphicsPipelines to fail with CS error and
-producing a black-screen / crash in all 3-D benchmarks.
-
-Truncate codeSize to the nearest 4-byte boundary and log a warning
-instead.  Remove the now-unused local ctx variable.
 ---
  src/venus/vkr_pipeline.c | 12 +++++++++---
  1 file changed, 9 insertions(+), 3 deletions(-)

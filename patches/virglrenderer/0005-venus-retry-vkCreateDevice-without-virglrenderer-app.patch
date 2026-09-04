@@ -1,27 +1,15 @@
-From f788639ae383f9140bb4df6e53f90496a1308632 Mon Sep 17 00:00:00 2001
-From: QuinOvaX <cinqwqeggs01@outlook.com>
-Date: Fri, 31 Jul 2026 22:00:27 +0800
+From 0e0bb092bfaf41a52100778fbdd7aeeb6665cf49 Mon Sep 17 00:00:00 2001
+From: ci <ci@waydroid-nvidia>
+Date: Fri, 4 Sep 2026 22:30:29 +0800
 Subject: [PATCH 5/5] venus: retry vkCreateDevice without
  virglrenderer-appended extensions on -3
 
-VK_ERROR_INITIALIZATION_FAILED (-3) is occasionally returned by NVIDIA
-drivers when the combined extension list (guest + virglrenderer-appended
-KHR_external_memory_fd / EXT_external_memory_dma_buf / KHR_external_fence_fd)
-is used.  The NOT_PERMITTED retry already strips the global queue priority
-chain; add a parallel path for -3 that falls back to the guest's original
-extension list.
-
-If the retry succeeds the session stays alive (dmabuf/fence-fd import
-disabled for that device instance only); if it still fails the error path
-logs the full list as before.  Save guest_ext_count / guest_exts_ptr
-before the append block so the original pointers are available at retry
-time.
 ---
- src/venus/vkr_device.c | 71 ++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 71 insertions(+)
+ src/venus/vkr_device.c | 75 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
 
 diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
-index 3e943bfd..a8c6d72f 100644
+index 3e943bfd..f436bf5b 100644
 --- a/src/venus/vkr_device.c
 +++ b/src/venus/vkr_device.c
 @@ -108,6 +108,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
@@ -55,7 +43,7 @@ index 3e943bfd..a8c6d72f 100644
     /* append extensions for our own use */
     const char **exts = NULL;
     uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
-@@ -176,7 +186,68 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+@@ -176,9 +186,74 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
     vn_replace_vkCreateDevice_args_handle(args);
     args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
                                  &dev->base.handle.device);
@@ -123,7 +111,13 @@ index 3e943bfd..a8c6d72f 100644
 +         vkr_log("  ext[%u]: %s", i, args->pCreateInfo->ppEnabledExtensionNames[i]);
        free(exts);
        free(dev);
++      /* A poisoned physical device rejects even a retried CreateDevice; treat
++       * it like the queue-submit device-lost so wd-venus restarts cleanly. */
++      if (args->ret == VK_ERROR_DEVICE_LOST)
++         vkr_context_device_lost(ctx);
        return;
+    }
+ 
 -- 
 2.55.0
 
