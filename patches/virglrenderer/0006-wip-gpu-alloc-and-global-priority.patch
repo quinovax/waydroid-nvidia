@@ -327,7 +327,7 @@ index b718ef25..1a5c533a 100644
  
  static bool
 diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
-index dc42c5a1..229359a4 100644
+index dc42c5a1..8a43d9a9 100644
 --- a/src/venus/vkr_command_buffer.c
 +++ b/src/venus/vkr_command_buffer.c
 @@ -21,6 +21,19 @@
@@ -367,7 +367,33 @@ index dc42c5a1..229359a4 100644
     VKR_CMD_CALL(CmdBindPipeline, args, args->pipelineBindPoint, args->pipeline);
  }
  
-@@ -242,7 +258,10 @@ static void
+@@ -152,6 +168,12 @@ static void
+ vkr_dispatch_vkCmdSetViewport(UNUSED struct vn_dispatch_context *dispatch,
+                               struct vn_command_vkCmdSetViewport *args)
+ {
++   if (args->viewportCount && args->pViewports)
++      vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 7,
++                           (uint32_t)args->pViewports[0].width,
++                           (uint32_t)args->pViewports[0].height,
++                           (uint32_t)args->pViewports[0].x,
++                           (uint32_t)args->pViewports[0].y);
+    VKR_CMD_CALL(CmdSetViewport, args, args->firstViewport, args->viewportCount,
+                 args->pViewports);
+ }
+@@ -160,6 +182,12 @@ static void
+ vkr_dispatch_vkCmdSetScissor(UNUSED struct vn_dispatch_context *dispatch,
+                              struct vn_command_vkCmdSetScissor *args)
+ {
++   if (args->scissorCount && args->pScissors)
++      vkr_cmd_buffer_trace(vkr_command_buffer_from_handle(args->commandBuffer), 8,
++                           args->pScissors[0].extent.width,
++                           args->pScissors[0].extent.height,
++                           args->pScissors[0].offset.x,
++                           args->pScissors[0].offset.y);
+    VKR_CMD_CALL(CmdSetScissor, args, args->firstScissor, args->scissorCount,
+                 args->pScissors);
+ }
+@@ -242,7 +270,10 @@ static void
  vkr_dispatch_vkCmdDraw(UNUSED struct vn_dispatch_context *dispatch,
                         struct vn_command_vkCmdDraw *args)
  {
@@ -379,7 +405,7 @@ index dc42c5a1..229359a4 100644
                  args->firstInstance);
  }
  
-@@ -250,7 +269,10 @@ static void
+@@ -250,7 +281,10 @@ static void
  vkr_dispatch_vkCmdDrawIndexed(UNUSED struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCmdDrawIndexed *args)
  {
@@ -391,7 +417,7 @@ index dc42c5a1..229359a4 100644
                  args->firstIndex, args->vertexOffset, args->firstInstance);
  }
  
-@@ -258,7 +280,9 @@ static void
+@@ -258,7 +292,9 @@ static void
  vkr_dispatch_vkCmdDrawIndirect(UNUSED struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkCmdDrawIndirect *args)
  {
@@ -402,7 +428,7 @@ index dc42c5a1..229359a4 100644
                  args->stride);
  }
  
-@@ -266,7 +290,9 @@ static void
+@@ -266,7 +302,9 @@ static void
  vkr_dispatch_vkCmdDrawIndexedIndirect(UNUSED struct vn_dispatch_context *dispatch,
                                        struct vn_command_vkCmdDrawIndexedIndirect *args)
  {
@@ -413,7 +439,7 @@ index dc42c5a1..229359a4 100644
                  args->stride);
  }
  
-@@ -274,7 +300,9 @@ static void
+@@ -274,7 +312,9 @@ static void
  vkr_dispatch_vkCmdDispatch(UNUSED struct vn_dispatch_context *dispatch,
                             struct vn_command_vkCmdDispatch *args)
  {
@@ -424,7 +450,7 @@ index dc42c5a1..229359a4 100644
                  args->groupCountZ);
  }
  
-@@ -282,7 +310,9 @@ static void
+@@ -282,7 +322,9 @@ static void
  vkr_dispatch_vkCmdDispatchIndirect(UNUSED struct vn_dispatch_context *dispatch,
                                     struct vn_command_vkCmdDispatchIndirect *args)
  {
@@ -1065,151 +1091,11 @@ index 7ba72eb8..97659e90 100644
  bool
  vkr_context_wait_ring_seqno(struct vkr_context *ctx,
                              struct vkr_ring *ring,
-diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
-index 3e943bfd..f436bf5b 100644
---- a/src/venus/vkr_device.c
-+++ b/src/venus/vkr_device.c
-@@ -108,6 +108,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
-          const uint32_t queue_count = args->pCreateInfo->pQueueCreateInfos[i].queueCount;
- 
-          if (queue_family_index >= physical_dev->queue_family_property_count) {
-+            vkr_log("CreateDevice: bad queueFamilyIndex %u (families %u)",
-+                    queue_family_index, physical_dev->queue_family_property_count);
-             args->ret = VK_ERROR_UNKNOWN;
-             break;
-          }
-@@ -117,6 +119,9 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
- 
-          if (queue_family_properties->queueCount - counts[queue_family_index] <
-              queue_count) {
-+            vkr_log("CreateDevice: family %u queueCount %u exceeds available %u",
-+                    queue_family_index, queue_count,
-+                    queue_family_properties->queueCount - counts[queue_family_index]);
-             args->ret = VK_ERROR_UNKNOWN;
-             break;
-          }
-@@ -128,6 +133,11 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
-          return;
-    }
- 
-+   /* Save the guest's original extension list before we append our own so
-+    * that the VK_ERROR_INITIALIZATION_FAILED retry path can fall back to it. */
-+   const uint32_t guest_ext_count = args->pCreateInfo->enabledExtensionCount;
-+   const char * const *guest_exts_ptr = args->pCreateInfo->ppEnabledExtensionNames;
-+
-    /* append extensions for our own use */
-    const char **exts = NULL;
-    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
-@@ -176,9 +186,74 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
-    vn_replace_vkCreateDevice_args_handle(args);
-    args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
-                                 &dev->base.handle.device);
-+
-+   /* Android clients (HWUI) request a global queue priority and expect it to
-+    * be honored best-effort, but desktop drivers (NVIDIA) reject unprivileged
-+    * priority requests with NOT_PERMITTED. Retry without the priority chain.
-+    */
-+   if (args->ret == VK_ERROR_NOT_PERMITTED_KHR) {
-+      bool stripped = false;
-+      for (uint32_t i = 0; i < args->pCreateInfo->queueCreateInfoCount; i++) {
-+         VkDeviceQueueCreateInfo *qci =
-+            (VkDeviceQueueCreateInfo *)&args->pCreateInfo->pQueueCreateInfos[i];
-+         VkBaseOutStructure *prev = (VkBaseOutStructure *)qci;
-+         for (VkBaseOutStructure *s = prev->pNext; s; s = s->pNext) {
-+            if (s->sType ==
-+                VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR) {
-+               prev->pNext = s->pNext;
-+               stripped = true;
-+            } else {
-+               prev = s;
-+            }
-+         }
-+      }
-+      if (stripped) {
-+         vkr_log("CreateDevice: NOT_PERMITTED; retrying without global queue "
-+                 "priority");
-+         args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo,
-+                                      NULL, &dev->base.handle.device);
-+      }
-+   }
-+
-+   /* NVIDIA occasionally returns VK_ERROR_INITIALIZATION_FAILED (-3) for the
-+    * combined extension list.  The virglrenderer-appended extensions
-+    * (KHR_external_memory_fd, EXT_external_memory_dma_buf, KHR_external_fence_fd,
-+    * …) are the most likely culprit because they were not present in the
-+    * original guest request.  Retry with only the guest's list to isolate
-+    * whether a virglrenderer-added extension is the cause.
-+    *
-+    * If the retry succeeds we lose dmabuf/fence-fd import for this device
-+    * instance, but the session stays alive — which is far better than a crash.
-+    * If it still fails we fall through to the error path with full logging.
-+    */
-+   if (args->ret == VK_ERROR_INITIALIZATION_FAILED && exts != NULL) {
-+      vkr_log("CreateDevice: VK_ERROR_INITIALIZATION_FAILED with %u extensions "
-+              "(guest %u + virglrenderer %u); retrying with guest-only list",
-+              args->pCreateInfo->enabledExtensionCount,
-+              guest_ext_count,
-+              args->pCreateInfo->enabledExtensionCount - guest_ext_count);
-+      ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames =
-+         guest_exts_ptr;
-+      ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount =
-+         guest_ext_count;
-+      args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo,
-+                                   NULL, &dev->base.handle.device);
-+      if (args->ret == VK_SUCCESS)
-+         vkr_log("CreateDevice: guest-only retry succeeded — "
-+                 "dmabuf/fence-fd import disabled for this device");
-+   }
-+
-    if (args->ret != VK_SUCCESS) {
-+      vkr_log("CreateDevice: host driver returned %d (extCount=%u)", args->ret,
-+              args->pCreateInfo->enabledExtensionCount);
-+      for (uint32_t i = 0; i < args->pCreateInfo->enabledExtensionCount; i++)
-+         vkr_log("  ext[%u]: %s", i, args->pCreateInfo->ppEnabledExtensionNames[i]);
-       free(exts);
-       free(dev);
-+      /* A poisoned physical device rejects even a retried CreateDevice; treat
-+       * it like the queue-submit device-lost so wd-venus restarts cleanly. */
-+      if (args->ret == VK_ERROR_DEVICE_LOST)
-+         vkr_context_device_lost(ctx);
-       return;
-    }
- 
-diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
-index 76709b9b..9e8dd26d 100644
---- a/src/venus/vkr_pipeline.c
-+++ b/src/venus/vkr_pipeline.c
-@@ -11,7 +11,6 @@ static void
- vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
-                                   struct vn_command_vkCreateShaderModule *args)
- {
--   struct vkr_context *ctx = dispatch->data;
- 
-    /* Reject invalid codeSize.
-     *
-@@ -37,8 +36,15 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
-     * validating codeSize here.
-     */
-    if (args->pCreateInfo->codeSize % 4 != 0) {
--      vkr_context_set_fatal(ctx);
--      return;
-+      /* The venus encoder/decoder already transmitted only codeSize & ~3 bytes,
-+       * so the driver would read out-of-bounds if we passed the unaligned size.
-+       * Truncate to the nearest 4-byte boundary instead of fatally killing the
-+       * whole Vulkan context (which broke every subsequent pipeline creation,
-+       * causing AnTuTu 3D / Geekbench GPU tests to black-screen or crash). */
-+      vkr_log("vkCreateShaderModule: codeSize %zu not 4-byte aligned, truncating to %zu",
-+              args->pCreateInfo->codeSize,
-+              args->pCreateInfo->codeSize & ~(size_t)3);
-+      ((VkShaderModuleCreateInfo *)args->pCreateInfo)->codeSize &= ~(size_t)3;
-    }
- 
-    vkr_shader_module_create_and_add(dispatch->data, args);
 diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
-index 08c7b07f..5808e271 100644
+index 08c7b07f..38932c13 100644
 --- a/src/venus/vkr_queue.c
 +++ b/src/venus/vkr_queue.c
-@@ -5,12 +5,156 @@
+@@ -5,12 +5,164 @@
  
  #include "vkr_queue.h"
  
@@ -1325,6 +1211,14 @@ index 08c7b07f..5808e271 100644
 +      case 6:
 +         vkr_log("    dispatchIndirect off=%u", t->p[0]);
 +         break;
++      case 7:
++         vkr_log("    setViewport w=%u h=%u x=%u y=%u",
++                 t->p[0], t->p[1], t->p[2], t->p[3]);
++         break;
++      case 8:
++         vkr_log("    setScissor w=%u h=%u x=%u y=%u",
++                 t->p[0], t->p[1], t->p[2], t->p[3]);
++         break;
 +      default:
 +         vkr_log("    unknown-cmd type=%u", t->type);
 +         break;
@@ -1366,7 +1260,7 @@ index 08c7b07f..5808e271 100644
  static struct vkr_queue_sync *
  vkr_device_alloc_queue_sync(struct vkr_device *dev,
                              uint32_t fence_flags,
-@@ -55,6 +199,8 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+@@ -55,6 +207,8 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
     sync->flags = fence_flags;
     sync->ring_idx = ring_idx;
     sync->fence_id = fence_id;
@@ -1375,7 +1269,7 @@ index 08c7b07f..5808e271 100644
  
     return sync;
  }
-@@ -62,6 +208,12 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+@@ -62,6 +216,12 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
  static void
  vkr_device_free_queue_sync(struct vkr_device *dev, struct vkr_queue_sync *sync)
  {
@@ -1388,7 +1282,7 @@ index 08c7b07f..5808e271 100644
     mtx_lock(&dev->free_sync_mutex);
     list_addtail(&sync->head, &dev->free_syncs);
     mtx_unlock(&dev->free_sync_mutex);
-@@ -79,7 +231,8 @@ bool
+@@ -79,7 +239,8 @@ bool
  vkr_queue_sync_submit(struct vkr_queue *queue,
                        uint32_t flags,
                        uint32_t ring_idx,
@@ -1398,7 +1292,7 @@ index 08c7b07f..5808e271 100644
  {
     TRACE_FUNC();
     struct vkr_device *dev = queue->device;
-@@ -90,19 +243,84 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+@@ -90,19 +251,84 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
     if (!sync)
        return false;
  
@@ -1485,7 +1379,7 @@ index 08c7b07f..5808e271 100644
     mtx_lock(&queue->sync_thread.mutex);
     list_addtail(&sync->head, &queue->sync_thread.syncs);
     cnd_signal(&queue->sync_thread.cond);
-@@ -124,43 +342,46 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
+@@ -124,43 +350,46 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
  
     int ret = 1;
     mtx_lock(&queue->sync_thread.mutex);
@@ -1564,7 +1458,7 @@ index 08c7b07f..5808e271 100644
     }
     mtx_unlock(&queue->sync_thread.mutex);
  
-@@ -173,7 +394,7 @@ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
+@@ -173,7 +402,7 @@ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
     /* vkDeviceWaitIdle has been called */
     mtx_lock(&queue->sync_thread.mutex);
     queue->sync_thread.join = true;
@@ -1573,7 +1467,7 @@ index 08c7b07f..5808e271 100644
     mtx_unlock(&queue->sync_thread.mutex);
  
     thrd_join(queue->sync_thread.thread, NULL);
-@@ -227,11 +448,26 @@ vkr_queue_thread(void *arg)
+@@ -227,11 +456,26 @@ vkr_queue_thread(void *arg)
        struct vkr_queue_sync *sync =
           list_first_entry(&queue->sync_thread.syncs, struct vkr_queue_sync, head);
  
@@ -1601,7 +1495,7 @@ index 08c7b07f..5808e271 100644
        } else {
           result = vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
                                      ns_per_sec * 3);
-@@ -244,6 +480,19 @@ vkr_queue_thread(void *arg)
+@@ -244,6 +488,19 @@ vkr_queue_thread(void *arg)
  
        list_del(&sync->head);
  
@@ -1621,7 +1515,7 @@ index 08c7b07f..5808e271 100644
        vkr_queue_sync_retire(queue, sync);
     }
     mtx_unlock(&queue->sync_thread.mutex);
-@@ -429,12 +678,20 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
+@@ -429,12 +686,20 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
     struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
     struct vn_device_proc_table *vk = &queue->device->proc_table;
  
@@ -1642,7 +1536,7 @@ index 08c7b07f..5808e271 100644
  }
  
  static void
-@@ -470,12 +727,30 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
+@@ -470,12 +735,30 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
     struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
     struct vn_device_proc_table *vk = &queue->device->proc_table;
  
