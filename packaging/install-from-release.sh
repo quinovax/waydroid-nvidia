@@ -386,8 +386,11 @@ install_prebuilts() {
 # ---- determine tag ----
 if [ "$SKIP_BUILD" -eq 0 ] && [ -z "$TAG" ]; then
     if [ "$SOURCE" -eq 1 ]; then
-        # source mode with no tag: use latest tag
-        TAG=$(git ls-remote --tags --sort=-v:refname "$REPO_URL" | head -1 | sed 's/.*refs\/tags\///')
+        # source mode with no tag: use latest tag.
+        # Peeled annotated-tag entries (hash refs/tags/vX.Y.Z^{}) sort first;
+        # keep only real refs so TAG is never 'v0.1.2^{}' (issue #9).
+        TAG=$(git ls-remote --tags --sort=-v:refname "$REPO_URL" \
+              | grep -v '\^{}' | head -1 | sed 's/.*refs\/tags\///')
     else
         # release mode with no tag: use latest release
         TAG=$(curl -fsSL "https://api.github.com/repos/CinQwQeggs01/waydroid-nvidia/releases/latest" | \
