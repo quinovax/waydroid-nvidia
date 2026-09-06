@@ -263,7 +263,7 @@ present_init(void)
 
 static void
 log_alloc(const char *kind, uint32_t w, uint32_t h, uint32_t fmt,
-          const char *path, bool host_visible, uint64_t modifier,
+          const char *path, const char *place, uint64_t modifier,
           uint32_t stride, uint64_t size, int ret)
 {
    unsigned i = __sync_fetch_and_add(&g_alloc_log_n, 1);
@@ -275,9 +275,13 @@ log_alloc(const char *kind, uint32_t w, uint32_t h, uint32_t fmt,
               kind, w, h, vtest_format_name(fmt), path, ret, i);
       return;
    }
+   /* place= reports the memory class the driver actually picked (vram, bar1
+    * or sysmem), not what was requested: the old hostvis= logged the request
+    * and hid both the issue #7 BAR1 selection and the Xid-13 block-linear
+    * sysmem regression behind a green-looking line. */
    fprintf(stderr,
-           "vtest_gpu_alloc: %s %ux%u %s path=%s hostvis=%d modifier=0x%llx stride=%u size=%llu (#%u)\n",
-           kind, w, h, vtest_format_name(fmt), path, (int)host_visible,
+           "vtest_gpu_alloc: %s %ux%u %s path=%s place=%s modifier=0x%llx stride=%u size=%llu (#%u)\n",
+           kind, w, h, vtest_format_name(fmt), path, place,
            (unsigned long long)modifier, stride, (unsigned long long)size, i);
 }
 
@@ -554,10 +558,20 @@ alloc_vk_init_locked(void)
    return 0;
 }
 
+/* Memory class actually backing a successful alloc, for place= logging. */
+static const char *
+mem_place(VkMemoryPropertyFlags flags)
+{
+   if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+      return (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "bar1" : "vram";
+   return "sysmem";
+}
+
 static int
 vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
                       bool linear, bool host_visible, uint32_t *out_stride,
-                      uint64_t *out_modifier, uint64_t *out_size, int *out_fd)
+                      uint64_t *out_modifier, uint64_t *out_size, int *out_fd,
+                      const char **out_place)
 {
    const VkFormat format = drm_format_to_vk(drm_format);
    if (format == VK_FORMAT_UNDEFINED)
@@ -692,19 +706,27 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
 
    /* Issue #7: a LINEAR dmabuf that lands in DEVICE_LOCAL (VRAM) cannot be
     * sampled by a cross-vendor iGPU compositor (AMD/Intel read it over BAR1
-    * and get black on RTD3 hybrids). When the caller asked for DEVICE_LOCAL
-    * but a HOST_VISIBLE|HOST_COHERENT type also satisfies the requirements,
-    * prefer sysmem: NVIDIA still exports and still renders cleanly, and the
-    * iGPU imports memory it can actually read. True VRAM placement stays the
-    * block-linear discrete-compositor path. */
-   if (!host_visible) {
+    * and get black on RTD3 hybrids). On the nvidia-linear hybrid path only,
+    * prefer a pure system-memory type (HOST_VISIBLE|HOST_COHERENT without
+    * DEVICE_LOCAL): NVIDIA still exports and still renders cleanly, and the
+    * iGPU imports memory it can actually read.
+    *
+    * Scope note: this must NOT touch the block-linear discrete-compositor
+    * path. NVIDIA block-linear layout metadata lives in VRAM; placing those
+    * images in sysmem triggers Xid 13 TEX LAYOUT device losses under heavy
+    * sampling (regression observed on GTX 1080 with AnTuTu UE4). BAR1 types
+    * (DEVICE_LOCAL|HOST_VISIBLE) are also rejected here: they still read
+    * over PCIe, which is exactly the failure mode being avoided. */
+   if (linear && !host_visible) {
       for (uint32_t i = 0; i < vk->mem_props.memoryTypeCount; i++) {
+         const VkMemoryPropertyFlags flags =
+            vk->mem_props.memoryTypes[i].propertyFlags;
          if ((reqs.memoryTypeBits & (1u << i)) &&
-             (vk->mem_props.memoryTypes[i].propertyFlags &
-              (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+             !(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+             (flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
             mem_type = i;
             break;
          }
@@ -766,6 +788,8 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
    *out_modifier = chosen.drmFormatModifier;
    *out_size = reqs.size;
    *out_fd = fd;
+   if (out_place)
+      *out_place = mem_place(vk->mem_props.memoryTypes[mem_type].propertyFlags);
    ret = 0;
 
 out:
@@ -794,19 +818,19 @@ vtest_gpu_alloc_gpu(uint32_t width, uint32_t height, uint32_t drm_format,
 
    const bool linear = (g_present_mode == PRESENT_NVIDIA_LINEAR);
    const char *path = linear ? "nvidia-linear" : "block-linear";
-   bool host_visible = false;
+   const char *place = "vram";
    int ret = vtest_gpu_alloc_image(width, height, drm_format, linear, false,
-                                   out_stride, out_modifier, out_size, out_fd);
+                                   out_stride, out_modifier, out_size, out_fd,
+                                   &place);
    if (ret && linear) {
       /* LINEAR refused outright; retry the same tiling in the other heap.
-       * The sysmem-preference inside alloc_image already keeps the hybrid
-       * path out of VRAM when a host-visible type exists. */
+       * The sysmem preference inside alloc_image already keeps this path out
+       * of VRAM and BAR1 when a pure system-memory type exists. */
       ret = vtest_gpu_alloc_image(width, height, drm_format, true, true,
-                                  out_stride, out_modifier, out_size, out_fd);
-      if (ret == 0)
-         host_visible = true;
+                                  out_stride, out_modifier, out_size, out_fd,
+                                  &place);
    }
-   log_alloc("gpu", width, height, drm_format, path, host_visible,
+   log_alloc("gpu", width, height, drm_format, path, place,
              ret ? 0 : *out_modifier, ret ? 0 : *out_stride,
              ret ? 0 : *out_size, ret);
    return ret;
@@ -881,7 +905,7 @@ vtest_udmabuf_alloc(uint32_t width, uint32_t height, uint32_t drm_format,
    *out_stride = stride;
    *out_size = size;
    *out_fd = dmabuf;
-   log_alloc("cpu", width, height, drm_format, "udmabuf-linear", true, 0,
+   log_alloc("cpu", width, height, drm_format, "udmabuf-linear", "sysmem", 0,
              stride, size, 0);
    return 0;
 }
@@ -910,17 +934,27 @@ vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
 
    if (use_nvidia_linear) {
       uint64_t modifier = 0;
+      const char *place = "sysmem";
       if (vtest_gpu_alloc_image(width, height, drm_format, true, true, out_stride,
-                                &modifier, out_size, out_fd) == 0) {
-         log_alloc("cpu", width, height, drm_format, "nvidia-linear-hostvis", true,
-                   modifier, *out_stride, *out_size, 0);
+                                &modifier, out_size, out_fd, &place) == 0) {
+         log_alloc("cpu", width, height, drm_format, "nvidia-linear-hostvis",
+                   place, modifier, *out_stride, *out_size, 0);
          return 0;
       }
    }
 
-   fprintf(stderr,
-           "vtest_gpu_alloc: cpu NVIDIA LINEAR failed for %ux%u %s, falling back to udmabuf\n",
-           width, height, vtest_format_name(drm_format));
+   /* Not an error when forced: WAYDROID_NVIDIA_CPU_LINEAR=0 pins this path
+    * to udmabuf for the Xid-69 A/B test (config cpu-linear-off.conf). */
+   if (cpu_linear_env)
+      fprintf(stderr,
+              "vtest_gpu_alloc: cpu NVIDIA LINEAR disabled for %ux%u %s "
+              "(WAYDROID_NVIDIA_CPU_LINEAR=0), using udmabuf\n",
+              width, height, vtest_format_name(drm_format));
+   else
+      fprintf(stderr,
+              "vtest_gpu_alloc: cpu NVIDIA LINEAR failed for %ux%u %s, "
+              "falling back to udmabuf\n",
+              width, height, vtest_format_name(drm_format));
 
    return vtest_udmabuf_alloc(width, height, drm_format, out_stride,
                               out_size, out_fd);

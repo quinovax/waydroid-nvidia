@@ -47,8 +47,32 @@ vtest_gpu_alloc: === presentation topology (hybrid issue #2) ===
 vtest_gpu_alloc:   card0 vendor=0x8086 (Intel) driver=i915 boot_vga=1 connected=yes [eDP-1]
 vtest_gpu_alloc:   card1 vendor=0x10de (NVIDIA) driver=nvidia boot_vga=0 connected=no
 vtest_gpu_alloc:   present=nvidia-linear  reason=non-NVIDIA GPU has the only connected display (iGPU compositor)
-vtest_gpu_alloc: gpu 1920x1080 ARGB8888 path=nvidia-linear hostvis=0 modifier=0x0 ...
+vtest_gpu_alloc: gpu 1920x1080 ARGB8888 path=nvidia-linear place=sysmem modifier=0x0 ...
 ```
+
+`place=` is the memory class the NVIDIA driver actually picked for the
+dmabuf: `vram` (device-local), `bar1` (device-local + host-visible) or
+`sysmem`. On the hybrid `nvidia-linear` path it must be `sysmem` — VRAM and
+BAR1 dmabufs import on the iGPU but read over PCIe, showing black (issue
+#7). Older builds printed `hostvis=0/1` there, which reported the
+*requested* placement, not the real one — ignore that field. The discrete
+`block-linear` path is supposed to stay `place=vram`.
+
+If a hybrid box still shows `place=bar1` or `place=vram` on the LINEAR path
+(no pure system-memory type was available), or you suspect the
+NVIDIA-as-exporter path itself (Xid 69 style faults), fall back to kernel
+memory entirely:
+
+```sh
+systemctl --user edit wd-venus.service
+# [Service]
+# Environment=WAYDROID_NVIDIA_PRESENT=udmabuf
+systemctl --user daemon-reload
+systemctl --user restart wd-venus.service
+```
+
+`udmabuf` skips NVIDIA allocation completely (compatibility fallback; guest
+renders may smear on some NVIDIA branches, but every driver imports it).
 
 Healthy discrete NVIDIA (no iGPU compositor): `present=block-linear` and
 `modifier=0x03...`. If a hybrid box chose `block-linear`, force LINEAR:

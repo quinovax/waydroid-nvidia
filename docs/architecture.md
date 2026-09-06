@@ -28,10 +28,14 @@ Which modifier depends on who composites:
   binds as `GL_TEXTURE_2D`, so GPU buffers use block-linear DRM modifiers.
 - **Compositor on an iGPU** (hybrid laptop panel on Intel/AMD): the iGPU
   cannot import NVIDIA block-linear. GPU buffers are exported as **NVIDIA
-  LINEAR**, which Intel/AMD bind as `GL_TEXTURE_2D` (`tests/crossimport.c`).
+  LINEAR**, which Intel/AMD bind as `GL_TEXTURE_2D` (`tests/crossimport.c`);
+  they are placed in **system memory** first — a VRAM/BAR1 placement imports
+  but reads over PCIe and shows black on RTD3 hybrids (issue #7).
   Detected from DRM connectors / `boot_vga`; override with
-  `WAYDROID_NVIDIA_PRESENT=linear|block-linear`. The host renderer logs the
-  chosen path on first alloc (`vtest_gpu_alloc: present=...`).
+  `WAYDROID_NVIDIA_PRESENT=linear|block-linear|udmabuf` (`udmabuf` = kernel
+  fallback, skips NVIDIA allocation entirely). The host renderer logs the
+  chosen path and the real memory class on first alloc
+  (`vtest_gpu_alloc: present=... place=sysmem|bar1|vram`).
 
 ## The pipeline
 
