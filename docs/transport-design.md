@@ -64,15 +64,21 @@ can't bind them. So gralloc allocates *through the host*.
 - Guest gralloc backend `src/minigbm-vtest/vtest_wrapper.c` replaces
   `libgbm_mesa_wrapper.so` — allocations go over the socket instead of guest libgbm.
 
-## AHB memory-type fixes (mesa `0003-wip`)
+## AHB / ANB memory-type fixes (mesa `0003-wip`)
 
-ANGLE adds `VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT` to every sampled AHB image;
-NVIDIA rejects the dedicated import (`vkAllocateMemory` → −11) for LINEAR-modifier
-images with that usage. Guest-mesa fixes:
+ANGLE adds `VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT` to every sampled AHB image
+*and* every Android swapchain image (`ColorNeedsInputAttachmentUsage`).
+NVIDIA rejects LINEAR-modifier CreateImage / dedicated import with that
+usage (`VK_ERROR_FORMAT_NOT_SUPPORTED` = −11). On a hybrid laptop the
+present path *is* LINEAR, so HWUI window surfaces (SystemUI, Settings)
+abort with `vkCreateImage w/ native buffer failed` then
+`drawRenderNode called on a context with no surface` (issue #7).
+Guest-mesa fixes:
 
 - Force `DRM_FORMAT_MODIFIER` tiling in deferred AHB init (older ANGLE passes
   legacy LINEAR).
-- Strip `INPUT_ATTACHMENT` for LINEAR-modifier imports.
+- Strip `INPUT_ATTACHMENT` for LINEAR-modifier AHB *and* `VK_ANDROID_native_buffer`
+  (ANB / swapchain) wraps. Nothing actually input-attaches those images.
 - Accept LINEAR tiling in AHB format queries.
 - UMA-style `DEVICE_LOCAL` on all memory types/heaps.
 

@@ -12,8 +12,9 @@
 //
 // The 5090/610.172 baseline: block-linear imports into type 0 with
 // INPUT_ATTACHMENT succeed; LINEAR + INPUT_ATTACHMENT fails (worked around
-// in guest mesa). Run this on other GPU generations to see which
-// combination their driver rejects.
+// in guest mesa for both AHB imports and VK_ANDROID_native_buffer swapchain
+// images — issue #7 SystemUI abort). Run this on other GPU generations to
+// see which combination their driver rejects.
 //
 // Build:  gcc -O1 -o nvimportprobe nvimportprobe.c -ldl
 // Run:    ./nvimportprobe            (picks the first NVIDIA device)

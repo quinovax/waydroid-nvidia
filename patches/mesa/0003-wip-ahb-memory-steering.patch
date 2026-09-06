@@ -62,7 +62,7 @@ index 02a3d371e75..2468e348767 100644
    'vn_instance.c',
    'vn_physical_device.c',
 diff --git a/src/virtio/vulkan/vn_android.c b/src/virtio/vulkan/vn_android.c
-index eaa82bcacf4..9d8025ca6f0 100644
+index eaa82bcacf4..1ff47d9e5af 100644
 --- a/src/virtio/vulkan/vn_android.c
 +++ b/src/virtio/vulkan/vn_android.c
 @@ -8,6 +8,7 @@
@@ -73,7 +73,67 @@ index eaa82bcacf4..9d8025ca6f0 100644
  #include "vn_android.h"
  
  #include <dlfcn.h>
-@@ -153,17 +154,42 @@ vn_android_ahb_image_init(struct vn_device *dev,
+@@ -23,6 +24,22 @@
+ 
+ #define VN_MAX_PLANES 4
+ 
++/* NVIDIA rejects dedicated import / CreateImage for LINEAR-modifier images
++ * that carry INPUT_ATTACHMENT (VkResult -11 FORMAT_NOT_SUPPORTED). ANGLE
++ * tacks that bit onto every sampled AHB *and* every Android swapchain
++ * image (SurfaceVk.cpp: ColorNeedsInputAttachmentUsage). Nothing actually
++ * input-attaches those images — drop the bit for LINEAR so HWUI window
++ * surfaces (VK_ANDROID_native_buffer) can wrap hybrid scanout buffers
++ * (issue #7: SystemUI abort "drawRenderNode called on a context with no
++ * surface"). */
++static void
++vn_android_strip_linear_input_attachment(VkImageCreateInfo *create_info,
++                                         uint64_t modifier)
++{
++   if (modifier == 0 /* DRM_FORMAT_MOD_LINEAR */)
++      create_info->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
++}
++
+ static int
+ vn_android_gralloc_get_dma_buf_fd(const native_handle_t *handle)
+ {
+@@ -59,8 +76,13 @@ vn_android_image_from_anb_internal(struct vn_device *dev,
+    VkSubresourceLayout layouts[VN_MAX_PLANES];
+    VkResult result = vk_android_get_anb_layout(create_info, &mod_info,
+                                                layouts, VN_MAX_PLANES);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      mesa_loge("NVWD: anb_image: get_anb_layout failed %d", result);
+       return result;
++   }
++
++   vn_android_strip_linear_input_attachment(create_info,
++                                            mod_info.drmFormatModifier);
+ 
+    mod_info.pNext = create_info->pNext;
+    const VkExternalMemoryImageCreateInfo external_info = {
+@@ -75,10 +97,18 @@ vn_android_image_from_anb_internal(struct vn_device *dev,
+    /* encoder will strip the Android specific pNext structs */
+    if (*out_img) {
+       /* driver side img obj has been created for deferred init like ahb */
+-      return vn_image_init_deferred(dev, create_info, *out_img);
++      result = vn_image_init_deferred(dev, create_info, *out_img);
++   } else {
++      result = vn_image_create(dev, create_info, alloc, out_img);
+    }
+-
+-   return vn_image_create(dev, create_info, alloc, out_img);
++   if (result != VK_SUCCESS) {
++      mesa_loge("NVWD: anb_image: create failed %d "
++                "(%ux%u fmt %u usage 0x%x mod 0x%" PRIx64 ")",
++                result, create_info->extent.width, create_info->extent.height,
++                create_info->format, create_info->usage,
++                mod_info.drmFormatModifier);
++   }
++   return result;
+ }
+ 
+ VkResult
+@@ -153,17 +183,36 @@ vn_android_ahb_image_init(struct vn_device *dev,
     VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info;
     VkSubresourceLayout layouts[VN_MAX_PLANES];
     result = vk_android_get_ahb_layout(ahb, &mod_info, layouts, VN_MAX_PLANES);
@@ -90,14 +150,8 @@ index eaa82bcacf4..9d8025ca6f0 100644
 +    */
 +   create_info->tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 +
-+   /* ANGLE tacks INPUT_ATTACHMENT onto every sampled AHB image "just in
-+    * case", but NVIDIA rejects the dedicated import for LINEAR-modifier
-+    * images with that usage (vkAllocateMemory -> INVALID_EXTERNAL_HANDLE),
-+    * which crashed SurfaceFlinger on every screen capture. Nothing input-
-+    * attaches EGLImage siblings; drop the bit for linear imports.
-+    */
-+   if (mod_info.drmFormatModifier == 0 /* DRM_FORMAT_MOD_LINEAR */)
-+      create_info->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
++   vn_android_strip_linear_input_attachment(create_info,
++                                            mod_info.drmFormatModifier);
 +
     VkExternalMemoryImageCreateInfo external_info = {
        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -118,7 +172,7 @@ index eaa82bcacf4..9d8025ca6f0 100644
  }
  
  VkResult
-@@ -177,13 +203,17 @@ vn_android_device_import_ahb(struct vn_device *dev,
+@@ -177,13 +226,17 @@ vn_android_device_import_ahb(struct vn_device *dev,
     const native_handle_t *handle =
        AHardwareBuffer_getNativeHandle(mem_vk->ahardware_buffer);
     int dma_buf_fd = vn_android_gralloc_get_dma_buf_fd(handle);
@@ -138,7 +192,7 @@ index eaa82bcacf4..9d8025ca6f0 100644
  
     const VkMemoryDedicatedAllocateInfo *dedicated_info =
        vk_find_struct_const(alloc_info->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
-@@ -192,8 +222,10 @@ vn_android_device_import_ahb(struct vn_device *dev,
+@@ -192,8 +245,10 @@ vn_android_device_import_ahb(struct vn_device *dev,
     if (dedicated_info && dedicated_info->image != VK_NULL_HANDLE) {
        struct vn_image *img = vn_image_from_handle(dedicated_info->image);
        result = vn_android_ahb_image_init(dev, mem_vk->ahardware_buffer, img);
@@ -150,7 +204,7 @@ index eaa82bcacf4..9d8025ca6f0 100644
  
        mem_reqs = img->requirements[0].memory.memoryRequirements;
        mem_reqs.memoryTypeBits &= mem_type_bits;
-@@ -206,11 +238,21 @@ vn_android_device_import_ahb(struct vn_device *dev,
+@@ -206,11 +261,21 @@ vn_android_device_import_ahb(struct vn_device *dev,
        mem_reqs.memoryTypeBits = mem_type_bits;
     }
  
@@ -175,7 +229,7 @@ index eaa82bcacf4..9d8025ca6f0 100644
  
     mem_vk->size = mem_reqs.size;
  
-@@ -239,6 +281,9 @@ vn_android_device_import_ahb(struct vn_device *dev,
+@@ -239,6 +304,9 @@ vn_android_device_import_ahb(struct vn_device *dev,
     result =
        vn_device_memory_import_dma_buf(dev, mem, &local_alloc_info, dup_fd);
     if (result != VK_SUCCESS) {

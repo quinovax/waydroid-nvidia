@@ -31,10 +31,12 @@ Which modifier depends on who composites:
   LINEAR**, which Intel/AMD bind as `GL_TEXTURE_2D` (`tests/crossimport.c`);
   they are placed in **system memory** first — a VRAM/BAR1 placement imports
   but reads over PCIe and shows black on RTD3 hybrids (issue #7).
-  Detected from DRM connectors / `boot_vga`; override with
-  `WAYDROID_NVIDIA_PRESENT=linear|block-linear|udmabuf` (`udmabuf` = kernel
-  fallback, skips NVIDIA allocation entirely). The host renderer logs the
-  chosen path and the real memory class on first alloc
+  Guest Venus also strips `INPUT_ATTACHMENT` from LINEAR AHB/ANB wraps
+  (NVIDIA rejects that usage on LINEAR, which crash-looped SystemUI even
+  after placement was correct). Detected from DRM connectors / `boot_vga`;
+  override with `WAYDROID_NVIDIA_PRESENT=linear|block-linear|udmabuf`
+  (`udmabuf` = kernel fallback, skips NVIDIA allocation entirely). The host
+  renderer logs the chosen path and the real memory class on first alloc
   (`vtest_gpu_alloc: present=... place=sysmem|bar1|vram`).
 
 ## The pipeline
@@ -120,7 +122,7 @@ native. Opt-out with `VN_NO_ASTC_EMU=1`. ETC2 is not yet emulated.
 
 | Component | Repo (upstream) | Change |
 |---|---|---|
-| Guest Vulkan driver | Mesa `src/virtio/vulkan/` | vtest sync_fd + dma_buf transport; timeline-fence path; semaphore sync_fd import; ASTC LDR emulation; AHB memory steering; UMA memory flags |
+| Guest Vulkan driver | Mesa `src/virtio/vulkan/` | vtest sync_fd + dma_buf transport; timeline-fence path; semaphore sync_fd import; ASTC LDR emulation; AHB/ANB memory steering (LINEAR INPUT_ATTACHMENT strip); UMA memory flags |
 | Host renderer | virglrenderer `vtest/`, `src/venus/` | sync_file export, dmabuf-import blob, gpu-alloc command, global-priority strip/retry |
 | gralloc | minigbm `gbm_mesa_driver/` | net-new `vtest_wrapper.c` allocating via `VCMD_RESOURCE_ALLOC_GPU` |
 | Display | android_hardware_waydroid (hwcomposer) | refresh override; direct (subsurface) composition with compositor-compatibility gate; opaque-layer alpha handling; fence lifecycle fixes; single-window layer selection |
