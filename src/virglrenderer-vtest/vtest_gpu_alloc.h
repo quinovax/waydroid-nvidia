@@ -8,11 +8,15 @@
  *   NVIDIA EGL binds LINEAR only as GL_TEXTURE_EXTERNAL_OES; KWin needs
  *   GL_TEXTURE_2D, which block-linear provides.
  *
- *   Hybrid (iGPU compositor + NVIDIA render): NVIDIA LINEAR. Intel/AMD
- *   import LINEAR dma_bufs as GL_TEXTURE_2D (tests/crossimport.c);
- *   NVIDIA block-linear is not advertised by the iGPU compositor.
+ *   Hybrid (iGPU compositor + NVIDIA render): NVIDIA LINEAR, sysmem-first.
+ *   Intel/AMD import LINEAR dma_bufs as GL_TEXTURE_2D (tests/crossimport.c)
+ *   but cannot sample dGPU VRAM (issue #7: black screen on RTD3 hybrids),
+ *   so the allocator prefers a HOST_VISIBLE|HOST_COHERENT placement; VRAM
+ *   is only a fallback. NVIDIA block-linear is not advertised by the iGPU
+ *   compositor.
  *   Auto-detected from DRM connectors / boot_vga; override with
- *   WAYDROID_NVIDIA_PRESENT=linear|block-linear.
+ *   WAYDROID_NVIDIA_PRESENT=linear|block-linear|udmabuf (udmabuf = kernel
+ *   fallback, no NVIDIA allocation, both paths).
  *
  * CPU path: NVIDIA LINEAR (host-visible) first, udmabuf fallback, for
  * BO_USE_SW_* gralloc buffers the guest must mmap.

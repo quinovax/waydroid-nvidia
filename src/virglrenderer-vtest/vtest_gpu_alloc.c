@@ -29,16 +29,25 @@
  * Discrete NVIDIA compositor: block-linear. NVIDIA EGL binds LINEAR only
  * as GL_TEXTURE_EXTERNAL_OES; KWin samples RGB as GL_TEXTURE_2D.
  *
- * iGPU compositor: NVIDIA LINEAR. Intel/AMD import LINEAR dma_bufs as
- * GL_TEXTURE_2D (tests/crossimport.c). NVIDIA block-linear is not in the
- * iGPU compositor's zwp_linux_dmabuf list, so attaching it is a fatal
- * Wayland protocol error.
+ * iGPU compositor: NVIDIA LINEAR, allocated in SYSTEM memory first (issue
+ * #7). Intel/AMD import LINEAR dma_bufs as GL_TEXTURE_2D
+ * (tests/crossimport.c) but cannot sample dGPU VRAM directly — a VRAM
+ * placement (the old behaviour) is read through BAR1 and shows up black on
+ * RTD3 hybrid laptops. sysmem keeps NVIDIA as the exporter (guest renders
+ * stay clean) while the iGPU imports memory it can actually read. VRAM is
+ * only a fallback for hosts that refuse sysmem placements.
  *
- * Override: WAYDROID_NVIDIA_PRESENT=linear|block-linear
+ * udmabuf: explicit compatibility fallback. Kernel-allocated LINEAR memory
+ * that every driver imports; NVIDIA renders into it through its dma-buf
+ * import path, which some stacks get wrong (Xid-69-era corruption) — that
+ * is what the NVIDIA-LINEAR paths above are for.
+ *
+ * Override: WAYDROID_NVIDIA_PRESENT=linear|block-linear|udmabuf
  */
 enum present_mode {
    PRESENT_BLOCK_LINEAR = 0,
    PRESENT_NVIDIA_LINEAR = 1,
+   PRESENT_UDMABUF = 2,
 };
 
 static enum present_mode g_present_mode = PRESENT_BLOCK_LINEAR;
@@ -212,8 +221,11 @@ present_init(void)
    const char *reason;
    enum present_mode mode = PRESENT_BLOCK_LINEAR;
 
-   if (env && (!strcmp(env, "linear") || !strcmp(env, "1") ||
-               !strcmp(env, "nvidia-linear"))) {
+   if (env && (!strcmp(env, "udmabuf") || !strcmp(env, "cpu-udmabuf"))) {
+      mode = PRESENT_UDMABUF;
+      reason = "WAYDROID_NVIDIA_PRESENT override (kernel udmabuf fallback)";
+   } else if (env && (!strcmp(env, "linear") || !strcmp(env, "1") ||
+                      !strcmp(env, "nvidia-linear"))) {
       mode = PRESENT_NVIDIA_LINEAR;
       reason = "WAYDROID_NVIDIA_PRESENT override";
    } else if (env && (!strcmp(env, "block-linear") || !strcmp(env, "0") ||
@@ -240,10 +252,12 @@ present_init(void)
 
    g_present_mode = mode;
    fprintf(stderr, "vtest_gpu_alloc:   present=%s  reason=%s\n",
-           mode == PRESENT_NVIDIA_LINEAR ? "nvidia-linear" : "block-linear",
+           mode == PRESENT_NVIDIA_LINEAR ? "nvidia-linear"
+           : mode == PRESENT_UDMABUF     ? "udmabuf"
+                                         : "block-linear",
            reason);
    fprintf(stderr,
-           "vtest_gpu_alloc:   override: WAYDROID_NVIDIA_PRESENT=linear|block-linear\n");
+           "vtest_gpu_alloc:   override: WAYDROID_NVIDIA_PRESENT=linear|block-linear|udmabuf\n");
    fprintf(stderr, "vtest_gpu_alloc: ===\n");
 }
 
@@ -291,6 +305,10 @@ static struct alloc_vk alloc_vk;
 static pthread_mutex_t alloc_vk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool alloc_vk_failed;
 static struct timespec alloc_vk_last_fail;
+
+static int
+vtest_udmabuf_alloc(uint32_t width, uint32_t height, uint32_t drm_format,
+                    uint32_t *out_stride, uint64_t *out_size, int *out_fd);
 
 static VkFormat
 drm_format_to_vk(uint32_t drm_format)
@@ -544,7 +562,6 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
    const VkFormat format = drm_format_to_vk(drm_format);
    if (format == VK_FORMAT_UNDEFINED)
       return -EINVAL;
-
    pthread_mutex_lock(&alloc_vk_mutex);
 
    struct alloc_vk *vk = &alloc_vk;
@@ -673,6 +690,27 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
    if (reqs.memoryTypeBits == 0)
       goto out;
 
+   /* Issue #7: a LINEAR dmabuf that lands in DEVICE_LOCAL (VRAM) cannot be
+    * sampled by a cross-vendor iGPU compositor (AMD/Intel read it over BAR1
+    * and get black on RTD3 hybrids). When the caller asked for DEVICE_LOCAL
+    * but a HOST_VISIBLE|HOST_COHERENT type also satisfies the requirements,
+    * prefer sysmem: NVIDIA still exports and still renders cleanly, and the
+    * iGPU imports memory it can actually read. True VRAM placement stays the
+    * block-linear discrete-compositor path. */
+   if (!host_visible) {
+      for (uint32_t i = 0; i < vk->mem_props.memoryTypeCount; i++) {
+         if ((reqs.memoryTypeBits & (1u << i)) &&
+             (vk->mem_props.memoryTypes[i].propertyFlags &
+              (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            mem_type = i;
+            break;
+         }
+      }
+   }
+
    const VkExportMemoryAllocateInfo export_info = {
       .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
       .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
@@ -748,14 +786,21 @@ vtest_gpu_alloc_gpu(uint32_t width, uint32_t height, uint32_t drm_format,
 {
    pthread_once(&g_present_once, present_init);
 
+   if (g_present_mode == PRESENT_UDMABUF) {
+      /* Explicit compatibility path: kernel udmabuf, no NVIDIA allocation. */
+      return vtest_udmabuf_alloc(width, height, drm_format, out_stride,
+                                 out_size, out_fd);
+   }
+
    const bool linear = (g_present_mode == PRESENT_NVIDIA_LINEAR);
    const char *path = linear ? "nvidia-linear" : "block-linear";
    bool host_visible = false;
    int ret = vtest_gpu_alloc_image(width, height, drm_format, linear, false,
                                    out_stride, out_modifier, out_size, out_fd);
    if (ret && linear) {
-      /* LINEAR + DEVICE_LOCAL refused; NVIDIA often places LINEAR in
-       * host-visible memory anyway. Same tiling, different heap. */
+      /* LINEAR refused outright; retry the same tiling in the other heap.
+       * The sysmem-preference inside alloc_image already keeps the hybrid
+       * path out of VRAM when a host-visible type exists. */
       ret = vtest_gpu_alloc_image(width, height, drm_format, true, true,
                                   out_stride, out_modifier, out_size, out_fd);
       if (ret == 0)
@@ -767,39 +812,13 @@ vtest_gpu_alloc_gpu(uint32_t width, uint32_t height, uint32_t drm_format,
    return ret;
 }
 
-int
-vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
+/* Kernel udmabuf over a shrink-sealed memfd — the vendor-neutral fallback
+ * both present paths land on when NVIDIA allocation is unavailable or
+ * explicitly overridden (WAYDROID_NVIDIA_PRESENT=udmabuf). */
+static int
+vtest_udmabuf_alloc(uint32_t width, uint32_t height, uint32_t drm_format,
                     uint32_t *out_stride, uint64_t *out_size, int *out_fd)
 {
-   /* NVIDIA renders corruptly into kernel-allocated (udmabuf) LINEAR memory
-    * but cleanly into its own exported LINEAR memory (host probes: residual
-    * -9/dips=141 vs -0.03/dips=0). Allocate CPU-mappable buffers as NVIDIA's
-    * own LINEAR memory so guest renders into them are clean. Fall back to a
-    * plain udmabuf when the format isn't renderable (non-whitelisted).
-    * Upstream Shiro836#12. */
-   pthread_once(&g_present_once, present_init);
-
-   /* WAYDROID_NVIDIA_CPU_LINEAR=0 forces the udmabuf fallback so the
-    * NVIDIA-LINEAR as render-target hypothesis (Xid 69 regression) can be
-    * A/B tested without a rebuild. */
-   const char *cpu_linear_env = getenv("WAYDROID_NVIDIA_CPU_LINEAR");
-   bool use_nvidia_linear = !cpu_linear_env || cpu_linear_env[0] != '0';
-
-   if (use_nvidia_linear) {
-      uint64_t modifier = 0;
-      if (vtest_gpu_alloc_image(width, height, drm_format, true, true, out_stride,
-                                &modifier, out_size, out_fd) == 0) {
-         log_alloc("cpu", width, height, drm_format, "nvidia-linear-hostvis", true,
-                   modifier, *out_stride, *out_size, 0);
-         return 0;
-      }
-   }
-
-   fprintf(stderr,
-           "vtest_gpu_alloc: cpu NVIDIA LINEAR failed for %ux%u %s, falling back to udmabuf\n",
-           width, height, vtest_format_name(drm_format));
-
-   /* Fallback: /dev/udmabuf over a shrink-sealed memfd. */
    uint32_t stride = 0;
    uint64_t size = 0;
 
@@ -865,4 +884,44 @@ vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
    log_alloc("cpu", width, height, drm_format, "udmabuf-linear", true, 0,
              stride, size, 0);
    return 0;
+}
+
+int
+vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
+                    uint32_t *out_stride, uint64_t *out_size, int *out_fd)
+{
+   /* NVIDIA renders corruptly into kernel-allocated (udmabuf) LINEAR memory
+    * but cleanly into its own exported LINEAR memory (host probes: residual
+    * -9/dips=141 vs -0.03/dips=0). Allocate CPU-mappable buffers as NVIDIA's
+    * own LINEAR memory so guest renders into them are clean. Fall back to a
+    * plain udmabuf when the format isn't renderable (non-whitelisted).
+    * Upstream Shiro836#12. */
+   pthread_once(&g_present_once, present_init);
+
+   if (g_present_mode == PRESENT_UDMABUF)
+      return vtest_udmabuf_alloc(width, height, drm_format, out_stride,
+                                 out_size, out_fd);
+
+   /* WAYDROID_NVIDIA_CPU_LINEAR=0 forces the udmabuf fallback so the
+    * NVIDIA-LINEAR as render-target hypothesis (Xid 69 regression) can be
+    * A/B tested without a rebuild. */
+   const char *cpu_linear_env = getenv("WAYDROID_NVIDIA_CPU_LINEAR");
+   bool use_nvidia_linear = !cpu_linear_env || cpu_linear_env[0] != '0';
+
+   if (use_nvidia_linear) {
+      uint64_t modifier = 0;
+      if (vtest_gpu_alloc_image(width, height, drm_format, true, true, out_stride,
+                                &modifier, out_size, out_fd) == 0) {
+         log_alloc("cpu", width, height, drm_format, "nvidia-linear-hostvis", true,
+                   modifier, *out_stride, *out_size, 0);
+         return 0;
+      }
+   }
+
+   fprintf(stderr,
+           "vtest_gpu_alloc: cpu NVIDIA LINEAR failed for %ux%u %s, falling back to udmabuf\n",
+           width, height, vtest_format_name(drm_format));
+
+   return vtest_udmabuf_alloc(width, height, drm_format, out_stride,
+                              out_size, out_fd);
 }
