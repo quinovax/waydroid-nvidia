@@ -35,7 +35,7 @@ assert_host_alloc_gpu() {
     local bin="${1:-$PREFIX/virgl_test_server}"
     [ -x "$bin" ] || die "$bin missing"
     if command -v strings >/dev/null 2>&1 && \
-       ! strings "$bin" | grep -q RESOURCE_ALLOC_GPU; then
+       ! strings "$bin" | grep RESOURCE_ALLOC_GPU >/dev/null; then
         die "$bin has no VCMD_RESOURCE_ALLOC_GPU (issue #7).
 The v0.1.1 host tarball was built without virgl patch 0006, so guest
 gralloc cannot allocate scanout buffers (black screen). Rebuild with

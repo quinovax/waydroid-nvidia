@@ -60,11 +60,13 @@ Android app ── Vulkan ──▶ guest Mesa Venus (bionic, vulkan.virtio.so)
 
 All end up on NVIDIA via Venus:
 
-- HWUI: `debug.hwui.renderer=skiagl` (Skia GL on ANGLE). `skiavk` makes
-  every app a Venus Vulkan client and serialises UI with SurfaceFlinger
-  through the single-threaded vtest server; it is the usual source of
-  garbled app chrome, WebView crashes, and extra CPU during benches.
-  Games still talk Vulkan via `ro.hardware.vulkan=virtio`.
+- HWUI: `debug.hwui.renderer=skiavk` (Skia Vulkan on Venus). This is the
+  setup default: on hybrid Intel-iGPU + nvidia-open ≥610 hosts, `skiagl`
+  plus `supportsYUVSamplerConversion` triggers NVRM Xid 69 (`Offset
+  0x274`) and kills the session (issue #10). `skiagl` (Skia GL on ANGLE)
+  remains an opt-in for hosts that never see that Xid; on those machines
+  it can reduce Venus client contention for UI. Games still talk Vulkan
+  via `ro.hardware.vulkan=virtio`.
 - SurfaceFlinger RenderEngine: `skiaglthreaded` on **ANGLE**
   (`ro.hardware.egl=angle`) — GL-on-Vulkan-on-Venus, composition on a
   dedicated RenderEngine thread (the old prebuilt-ANGLE crash that forced
@@ -136,7 +138,9 @@ native. Opt-out with `VN_NO_ASTC_EMU=1`. ETC2 is not yet emulated.
   talks to the host daemon over a socket.
 - `tools/helpers/lxc.py` `generate_nodes_lxc_config` emits the config_nodes
   bind-mounts (venus socket + guest `.so`s) so they survive `waydroid upgrade`;
-  props live in `waydroid.cfg [properties]`.
+  props live in `waydroid.cfg [properties]` and only reach the guest when
+  `waydroid upgrade -o` rewrites `waydroid_base.prop` (editing cfg and
+  restarting the container is a no-op — issue #10).
 - `tools/services/hardware_manager.py` honors `suspend_action = none` so the
   container isn't `lxc-freeze`d when the Android screen blanks.
 - `tools/actions/session_manager.py` starts `wd-venus.service` with the

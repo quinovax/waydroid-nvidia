@@ -28,6 +28,15 @@ OVERLAY_SYSTEM="/var/lib/waydroid/overlay/system"
 CFG="/var/lib/waydroid/waydroid.cfg"
 need_root() { [[ "$(id -u)" -eq 0 ]] || die "must run as root (sudo)"; }
 
+# waydroid.cfg [properties] only reach the guest via waydroid_base.prop,
+# which `waydroid upgrade -o` regenerates. Editing cfg and restarting the
+# container does nothing (issue #10 trap).
+sync_cfg() {
+  need_root
+  waydroid upgrade -o
+  green "  synced waydroid.cfg -> guest (waydroid upgrade -o)"
+}
+
 # ── Magisk + Zygisk + Shamiko ──
 install_magisk() {
   blue "== Magisk + Zygisk + Shamiko"
@@ -62,18 +71,11 @@ webview_gl() {
   ADB push "$flags" /data/local/tmp/webview-command-line
   ADB push "$flags" /data/local/tmp/chrome-command-line
   ADB shell chmod 644 /data/local/tmp/webview-command-line /data/local/tmp/chrome-command-line
-  ADB shell setprop debug.hwui.renderer skiagl 2>/dev/null || true
   ADB shell am force-stop com.google.android.webview 2>/dev/null || true
-  python3 - "$CFG" <<'PY'
-import configparser, sys
-from pathlib import Path
-cfg=Path(sys.argv[1]); cp=configparser.ConfigParser(); cp.optionxform=str; cp.read(cfg)
-p=cp.setdefault('properties',{})
-p['debug.hwui.renderer']='skiagl'
-p['debug.renderengine.backend']='skiaglthreaded'
-with cfg.open('w') as f: cp.write(f)
-PY
-  green "  HWUI=skiagl, WebView Vulkan draw functor disabled"
+  # Do not flip debug.hwui.renderer to skiagl: that is the issue #10 Xid-69
+  # path on hybrid nvidia-open ≥610. WebView's own command-line flags are
+  # enough to keep Chromium off Vulkan.
+  green "  WebView Vulkan draw functor disabled (HWUI renderer unchanged)"
 }
 
 # ── Mouse/cursor fix ──
@@ -92,6 +94,7 @@ p['persist.waydroid.cursor_on_subsurface']='false'
 p['persist.waydroid.fake_touch']='1'
 with cfg.open('w') as f: cp.write(f)
 PY
+  sync_cfg
   green "  cursor_on_subsurface=false, fake_touch=1"
 }
 
@@ -149,6 +152,7 @@ for k,v in {
     p[k]=v
 with cfg.open('w') as f: cp.write(f)
 PY
+  sync_cfg
   green "  Identity spoofed as $BRAND $MODEL (SoC: $SOC)"
 }
 

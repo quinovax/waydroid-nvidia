@@ -130,8 +130,10 @@ echo "== nvidia-drm.modeset: Y"
 
 HOST_VTEST=/usr/lib/waydroid-nvidia/virgl_test_server
 [ -x "$HOST_VTEST" ] || die "$HOST_VTEST missing (broken package?)"
+# Do not use grep -q under pipefail: a match closes the pipe early, strings
+# can exit 141 (SIGPIPE), and the pipeline is then treated as "not found".
 if command -v strings >/dev/null 2>&1 && \
-   ! strings "$HOST_VTEST" | grep -q RESOURCE_ALLOC_GPU; then
+   ! strings "$HOST_VTEST" | grep RESOURCE_ALLOC_GPU >/dev/null; then
     die "$HOST_VTEST was built without VCMD_RESOURCE_ALLOC_GPU (issue #7).
 The v0.1.1 host tarball applied virgl patches 0001–0004 only, so guest
 gralloc cannot allocate scanout buffers and SurfaceFlinger abort-loops
@@ -183,23 +185,27 @@ for k in list(cp["properties"].keys()):
         print("   removing stale gralloc override: {} = {}".format(
             k, cp["properties"][k]))
         cp.remove_option("properties", k)
-# skiagl (ANGLE GLES) rather than skiavk: every HWUI process as a Venus
-# Vulkan client serialises through the single-threaded vtest server and
-# races SurfaceFlinger. skiagl shares ANGLE with RenderEngine, which is
-# the stable UI path (WebView, Play Store, SystemUI). Games still use
-# virtio Vulkan / ANGLE GLES directly. Override with skiavk if wanted.
+# skiavk is the safe default on NVIDIA Venus (v0.1.0-era). skiagl +
+# supportsYUVSamplerConversion drives ANGLE→Venus→NVIDIA ICD for every
+# HWUI frame and triggers NVRM Xid 69 (Offset 0x274) on hybrid Intel-iGPU
+# + nvidia-open ≥610 hosts (issue #10). RenderEngine stays on
+# skiaglthreaded/ANGLE; games still use virtio Vulkan / ANGLE GLES.
+# Opt into skiagl only after verifying no Xid 69 on your driver.
 #
-# supportsYUVSamplerConversion: ANGLE's hardware YCbCr sampler aborts
-# when a decoder buffer is not a real multi-planar VkImage (issue #16).
-# Shader conversion is correct for both the NV12 path and the blob fallback.
+# Drop the former ANGLE YCbCr override: real NV12 allocs cover issue #16,
+# and leaving the override in cfg keeps Xid-69 hosts broken after upgrade.
+for k in list(cp["properties"].keys()):
+    if k == "debug.angle.feature_overrides_disabled":
+        print("   removing stale ANGLE override: {} = {}".format(
+            k, cp["properties"][k]))
+        cp.remove_option("properties", k)
 props = {
     "ro.hardware.egl": "angle",
     "ro.hardware.vulkan": "virtio",
     "mesa.vn.debug": "vtest",
     "mesa.vtest.socket.name": "/dev/venus/venus.sock",
-    "debug.hwui.renderer": "skiagl",
+    "debug.hwui.renderer": "skiavk",
     "debug.renderengine.backend": "skiaglthreaded",
-    "debug.angle.feature_overrides_disabled": "supportsYUVSamplerConversion",
     "debug.sf.nobootanimation": "1",
     "persist.waydroid.use_subsurface": "true",
     "ro.surface_flinger.vsync_event_phase_offset_ns": "0",
@@ -275,7 +281,7 @@ fi
 
 echo "== clearing stale HWUI shader caches (issue #13)"
 # Stock Waydroid on NVIDIA writes a SwiftShader BlobCache. After switching
-# to Venus/skiagl that cache SIGFPEs SystemUI in BlobCache::clean() (% 0).
+# to Venus that cache SIGFPEs SystemUI in BlobCache::clean() (% 0).
 # App userdata is the session dir (~/.local/share/waydroid/data), NOT
 # /var/lib/waydroid/data. Wipe both, plus the skia/opengl cache files.
 wipe_hwui_caches() {

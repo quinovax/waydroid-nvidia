@@ -46,11 +46,18 @@ Tested on Pascal (GTX 1080) with the proprietary driver.
 `waydroid-nvidia-setup` deploys the guest stack, writes the config, verifies
 your environment (modeset, vendor image, render node) and removes stale
 config left by older installs. Safe to re-run any time — it's also the first
-thing to try when something misbehaves. Verify acceleration:
+thing to try when something misbehaves. It writes
+`debug.hwui.renderer=skiavk`; `skiagl` plus the old ANGLE YCbCr override
+is NVRM Xid 69 (`Offset 0x274`) on hybrid nvidia-open ≥610 hosts
+(issue #10). Hand-edits to `waydroid.cfg [properties]` are **not** live
+until `sudo waydroid upgrade -o` (then restart the container) — setup
+already does that. Verify acceleration:
 
 ```sh
 sudo waydroid shell dumpsys SurfaceFlinger | grep GLES
 # GLES: ... ANGLE (NVIDIA, Vulkan ... Venus (NVIDIA GeForce ...))
+sudo waydroid shell getprop debug.hwui.renderer
+# skiavk
 sudo waydroid shell getprop ro.product.cpu.abilist
 # x86_64,x86,... means Houdini can translate ARM32-only apps into the x86 path
 ```
