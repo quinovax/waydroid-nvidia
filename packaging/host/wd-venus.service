@@ -3,6 +3,15 @@ Description=Venus vtest render server for waydroid-nvidia
 # The patched waydroid session starts and stops this unit. Do not enable it
 # for default.target: leftover vtest clients after a session restart block
 # the next SurfaceFlinger connect (listen Recv-Q stuck on venus.sock).
+#
+# A GPU class error (Xid 69) poisons the device for this whole process tree:
+# every later vkCreateDevice fails, even in a freshly forked render worker, so
+# the only recovery is a new server process. The patched renderer therefore
+# exits non-zero when a client's renderer is lost, and the unit must be allowed
+# to come back every single time -- a rate-limited unit ends up permanently
+# 'failed' with a black, crash-looping guest (issue #11). StartLimitIntervalSec=0
+# disables the limiter; RestartSec still bounds the restart rate.
+StartLimitIntervalSec=0
 
 [Service]
 Environment=RENDER_SERVER_EXEC_PATH=/usr/lib/waydroid-nvidia/virgl_render_server
@@ -15,8 +24,13 @@ LimitNOFILE=65536
 # virgl_egl_init abort on NVIDIA proprietary (libepoxy eglCreateSyncKHR)
 # and SurfaceFlinger crash-loops against the dead socket.
 ExecStart=/usr/lib/waydroid-nvidia/virgl_test_server --no-virgl --venus --multi-clients --socket-path /run/waydroid-venus/venus.sock
-Restart=on-failure
+# always, not on-failure: a self-requested restart after a lost renderer is the
+# normal recovery path here, and a clean exit must not be treated as "done".
+Restart=always
 RestartSec=1
+# the restart has to leave no survivors: a forked client still holding the
+# poisoned device would make the new server fail exactly like the old one.
+KillMode=control-group
 
 [Install]
 # Optional always-on. Session start/stop owns the lifecycle by default.

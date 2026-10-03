@@ -261,11 +261,68 @@ present_init(void)
    fprintf(stderr, "vtest_gpu_alloc: ===\n");
 }
 
+/* Last VCMD_ALLOC_GPU flags the dispatcher saw. The vtest command handler
+ * sets this before calling into the allocator so the trace can record the
+ * guest's actual request (MAPPABLE / SCANOUT), which the allocation path
+ * itself never sees. */
+static uint32_t g_last_alloc_flags;
+static bool g_last_alloc_flags_valid;
+
+void
+vtest_gpu_alloc_set_flags(uint32_t flags)
+{
+   g_last_alloc_flags = flags;
+   g_last_alloc_flags_valid = true;
+}
+
+/* Structured, unsampled allocation trace.
+ *
+ * The stderr log below deliberately samples (first 16, then every 128th), so
+ * it cannot answer questions of the form "did ANY 1920x1080 allocation take
+ * the CPU-mappable path?". When WDRDIAG_ALLOC_TRACE names a file, append one
+ * JSON object per allocation instead - off by default, so production logging
+ * is unchanged. Consumed by: dev/wdrdiag alloc-trace.
+ */
+static void
+trace_alloc(const char *kind, uint32_t w, uint32_t h, uint32_t fmt,
+            const char *path, const char *place, uint64_t modifier,
+            uint32_t stride, uint64_t size, int ret)
+{
+   static FILE *fp;
+   static bool opened;
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+   if (!opened) {
+      const char *p = getenv("WDRDIAG_ALLOC_TRACE");
+      opened = true;
+      if (p && p[0])
+         fp = fopen(p, "a");
+   }
+   if (!fp)
+      return;
+
+   pthread_mutex_lock(&lock);
+   fprintf(fp,
+           "{\"w\":%u,\"h\":%u,\"fmt\":\"%s\",\"flags\":%u,"
+           "\"mappable\":%s,\"scanout\":%s,\"kind\":\"%s\","
+           "\"path\":\"%s\",\"place\":\"%s\",\"modifier\":%llu,"
+           "\"stride\":%u,\"size\":%llu,\"ret\":%d}\n",
+           w, h, vtest_format_name(fmt),
+           g_last_alloc_flags_valid ? g_last_alloc_flags : 0,
+           (g_last_alloc_flags & 1u) ? "true" : "false",
+           (g_last_alloc_flags & 2u) ? "true" : "false",
+           kind, path, place, (unsigned long long)modifier, stride,
+           (unsigned long long)size, ret);
+   fflush(fp);
+   pthread_mutex_unlock(&lock);
+}
+
 static void
 log_alloc(const char *kind, uint32_t w, uint32_t h, uint32_t fmt,
           const char *path, const char *place, uint64_t modifier,
           uint32_t stride, uint64_t size, int ret)
 {
+   trace_alloc(kind, w, h, fmt, path, place, modifier, stride, size, ret);
    unsigned i = __sync_fetch_and_add(&g_alloc_log_n, 1);
    if (i >= 16 && (i % 128) != 0)
       return;
@@ -567,6 +624,36 @@ mem_place(VkMemoryPropertyFlags flags)
    return "sysmem";
 }
 
+/* Ask the driver what DRM_FORMAT_MOD_LINEAR can actually do for a format.
+ * Returns 0 when the driver does not list LINEAR at all (then the caller must
+ * not assume any usage is legal). */
+static VkFormatFeatureFlags
+linear_modifier_features(const struct alloc_vk *vk, VkFormat format)
+{
+   VkDrmFormatModifierPropertiesEXT props[64];
+   VkDrmFormatModifierPropertiesListEXT list = {
+      .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+   };
+   VkFormatProperties2 fp = {
+      .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+      .pNext = &list,
+   };
+
+   vk->GetPhysicalDeviceFormatProperties2(vk->physical_device, format, &fp);
+   if (list.drmFormatModifierCount == 0)
+      return 0;
+   list.drmFormatModifierCount =
+      list.drmFormatModifierCount > 64 ? 64 : list.drmFormatModifierCount;
+   list.pDrmFormatModifierProperties = props;
+   vk->GetPhysicalDeviceFormatProperties2(vk->physical_device, format, &fp);
+
+   for (uint32_t i = 0; i < list.drmFormatModifierCount; i++) {
+      if (props[i].drmFormatModifier == 0) /* DRM_FORMAT_MOD_LINEAR */
+         return props[i].drmFormatModifierTilingFeatures;
+   }
+   return 0;
+}
+
 static int
 vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
                       bool linear, bool host_visible, uint32_t *out_stride,
@@ -597,6 +684,17 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
     * what the format supports and let the driver pick.
     */
    uint32_t mod_count = 0;
+   /* Feature bits the driver actually advertises for DRM_FORMAT_MOD_LINEAR on
+    * this format. On NVIDIA (measured: GTX 1080 / 580.178.04) LINEAR reports
+    * 0x1dc03 while block-linear reports 0x1dd83 - the difference is exactly
+    * VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT (0x80) and
+    * COLOR_ATTACHMENT_BLEND_BIT (0x100). Asking for COLOR_ATTACHMENT on a
+    * LINEAR image is therefore a request the driver does not support, which
+    * is what produced the "NVIDIA LINEAR as a render target DEVICE_LOSTs"
+    * regression. Never request what the driver says it cannot do: derive the
+    * usage from drmFormatModifierTilingFeatures below. */
+   VkFormatFeatureFlags linear_features = 0;
+
    if (linear) {
       mod_candidates = malloc(sizeof(*mod_candidates));
       if (!mod_candidates)
@@ -604,6 +702,7 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
       /* CPU-mappable: explicit LINEAR so the guest can mmap and compute
        * pixel offsets; NVIDIA dma_bufs mmap fine from any memory type */
       mod_candidates[mod_count++] = 0; /* DRM_FORMAT_MOD_LINEAR */
+      linear_features = linear_modifier_features(vk, format);
    } else {
       VkDrmFormatModifierPropertiesListEXT mod_list = {
          .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
@@ -654,6 +753,29 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
       .drmFormatModifierCount = mod_count,
       .pDrmFormatModifiers = mod_candidates,
    };
+   /* Derive the usage from what the driver advertises for the modifier we are
+    * about to request. Asking for COLOR_ATTACHMENT on a LINEAR image is the
+    * NV regression this repo kept re-discovering: measured on GTX 1080 /
+    * 580.178.04, LINEAR reports 0x1dc03 and block-linear 0x1dd83, differing
+    * exactly in COLOR_ATTACHMENT_BIT (0x80) + BLEND (0x100). A buffer that is
+    * only CPU-written and then sampled (video frames, SoftwareRenderer
+    * output) needs no color-attachment usage at all.
+    */
+   VkImageUsageFlags image_usage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   if (!vtest_drm_format_is_yuv(drm_format)) {
+      /* Block-linear candidates are already filtered to COLOR_ATTACHMENT
+       * capable above; for LINEAR consult the queried feature bits. When the
+       * driver lists no LINEAR at all we keep the old behaviour. */
+      const VkFormatFeatureFlags ca =
+         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+      const bool want_ca = linear ? ((linear_features & ca) == ca) : true;
+      if (want_ca)
+         image_usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   }
+
    const VkImageCreateInfo image_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .pNext = &mod_info,
@@ -664,12 +786,7 @@ vtest_gpu_alloc_image(uint32_t width, uint32_t height, uint32_t drm_format,
       .arrayLayers = 1,
       .samples = VK_SAMPLE_COUNT_1_BIT,
       .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-      .usage = vtest_drm_format_is_yuv(drm_format)
-                  ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                     VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-                  : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                     VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+      .usage = image_usage,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    };

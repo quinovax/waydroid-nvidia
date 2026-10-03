@@ -14,9 +14,27 @@ REPO="${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 echo "virgl/build.sh: install net-new vtest allocator source"
 mkdir -p "$SRCDIR/vtest/"
-install -m 0644 "$REPO/src/virglrenderer-vtest/vtest_gpu_alloc.c" "$SRCDIR/vtest/"
-install -m 0644 "$REPO/src/virglrenderer-vtest/vtest_gpu_alloc.h" "$SRCDIR/vtest/"
-install -m 0644 "$REPO/src/vtest_alloc_formats.h" "$SRCDIR/vtest/"
+
+# src/ is canonical: installing it is what makes the tree build the reviewed
+# copy.  But if the tree already holds a DIFFERENT copy, that copy is unsynced
+# work and this install destroys it silently -- measured: an entire feature
+# (the WDRDIAG_ALLOC_TRACE allocator hook) disappeared that way and the next
+# build died on an undefined symbol.  Warn loudly and name the way out.
+install_netnew() {
+    if [ -f "$2" ] && ! cmp -s "$1" "$2"; then
+        {
+            echo "virgl/build.sh: WARNING: $2"
+            echo "  differs from $1 — src/ is canonical and will overwrite it."
+            echo "  If the tree copy is the newer one, run dev/sync-patches FIRST"
+            echo "  (it regenerates patches/ and src/ from the tree)."
+        } >&2
+    fi
+    install -m 0644 "$1" "$2"
+}
+
+install_netnew "$REPO/src/virglrenderer-vtest/vtest_gpu_alloc.c"  "$SRCDIR/vtest/vtest_gpu_alloc.c"
+install_netnew "$REPO/src/virglrenderer-vtest/vtest_gpu_alloc.h"  "$SRCDIR/vtest/vtest_gpu_alloc.h"
+install_netnew "$REPO/src/vtest_alloc_formats.h"                  "$SRCDIR/vtest/vtest_alloc_formats.h"
 
 if [ ! -f "$BUILDDIR/build.ninja" ]; then
     echo "virgl/build.sh: fresh meson setup -> $BUILDDIR"

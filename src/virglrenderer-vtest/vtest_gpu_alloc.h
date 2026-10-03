@@ -35,4 +35,9 @@ int vtest_gpu_alloc_gpu(uint32_t width, uint32_t height, uint32_t drm_format,
 int vtest_gpu_alloc_cpu(uint32_t width, uint32_t height, uint32_t drm_format,
                         uint32_t *out_stride, uint64_t *out_size, int *out_fd);
 
+/* Record the VCMD_ALLOC_GPU flags for the allocation about to be made, so the
+ * optional WDRDIAG_ALLOC_TRACE stream can attribute each allocation to the
+ * guest's actual request. Call from the vtest command handler. */
+void vtest_gpu_alloc_set_flags(uint32_t flags);
+
 #endif /* VTEST_GPU_ALLOC_H */

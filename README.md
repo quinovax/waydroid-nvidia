@@ -147,6 +147,14 @@ The patched session starts and stops `wd-venus.service` with itself. Do
 **not** `systemctl --user enable` it: leftover vtest clients after a session
 restart block the next SurfaceFlinger connect (listen Recv-Q on `venus.sock`).
 
+A lost renderer is recoverable by design. An NVIDIA class error poisons the
+device for the whole process tree, so only a new server process gets a usable
+GPU: the host renderer therefore exits non-zero when a client's renderer is
+lost, and the unit is `Restart=always` with no start-rate limit, so a
+device-lost comes back as a fresh stack instead of a black, crash-looping guest
+(issue #11). `tests/vtest-supervisor.sh` checks that contract in a few seconds
+with no GPU and no guest.
+
 **Manual install / other distros:** see
 [`docs/install-manual.md`](docs/install-manual.md).
 

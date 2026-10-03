@@ -36,3 +36,6 @@ tests/vnprobe
 tests/nvimportprobe
 tests/nvimportprobe-portable
 packaging/selinux/*.mod
+
+# Maintainer scratch: handoff notes (STATE.md is the append-only log)
+NEXT-ROUND.md

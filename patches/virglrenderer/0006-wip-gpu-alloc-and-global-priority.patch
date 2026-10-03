@@ -1,8 +1,8 @@
 diff --git a/server/render_context.c b/server/render_context.c
-index 718b1b52..d58a6fbd 100644
+index 718b1b52..72a9047d 100644
 --- a/server/render_context.c
 +++ b/server/render_context.c
-@@ -62,8 +62,53 @@ render_context_dispatch_submit_fence(struct render_context *ctx,
+@@ -62,10 +62,75 @@ render_context_dispatch_submit_fence(struct render_context *ctx,
     /* always merge fences */
     assert(!(req->flags & ~VIRGL_RENDERER_FENCE_FLAG_MERGEABLE));
     assert(req->ring_index < (uint32_t)ctx->timeline_count);
@@ -11,8 +11,8 @@ index 718b1b52..d58a6fbd 100644
 +   return render_state_submit_fence2(ctx->ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
 +                                     req->ring_index, req->seqno,
 +                                     req->timeline_point);
-+}
-+
+ }
+ 
 +static bool
 +render_context_dispatch_get_timeline(struct render_context *ctx,
 +                                     UNUSED const union render_context_op_request *request,
@@ -55,32 +55,56 @@ index 718b1b52..d58a6fbd 100644
 +
 +   /* on success the driver owns the fd; on failure render_state closed it */
 +   return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
- }
- 
++}
++
++static bool
++render_context_dispatch_memory_rw(struct render_context *ctx,
++                                  const union render_context_op_request *request,
++                                  const int *fds,
++                                  int fd_count)
++{
++   const struct render_context_op_memory_rw_request *req = &request->memory_rw;
++
++   struct render_context_op_memory_rw_reply reply = {
++      .status = 1,
++   };
++   if (fd_count == 1 &&
++       !render_state_memory_rw(ctx->ctx_id, req->mem_id, req->offset, req->size,
++                               req->dir, fds[0]))
++      reply.status = 0;
++
++   return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
++}
++
++
  static bool
-@@ -221,6 +266,8 @@ static const struct render_context_dispatch_entry
+ render_context_dispatch_submit_cmd(struct render_context *ctx,
+                                    const union render_context_op_request *request,
+@@ -221,6 +286,9 @@ static const struct render_context_dispatch_entry
        RENDER_CONTEXT_DISPATCH(DESTROY_RESOURCE, destroy_resource, 0),
        RENDER_CONTEXT_DISPATCH(SUBMIT_CMD, submit_cmd, 0),
        RENDER_CONTEXT_DISPATCH(SUBMIT_FENCE, submit_fence, 0),
 +      RENDER_CONTEXT_DISPATCH(GET_TIMELINE, get_timeline, 0),
 +      RENDER_CONTEXT_DISPATCH(IMPORT_SEMAPHORE, import_semaphore, 1),
++      RENDER_CONTEXT_DISPATCH(MEMORY_RW, memory_rw, 1),
  #undef RENDER_CONTEXT_DISPATCH
     };
  
 diff --git a/server/render_protocol.h b/server/render_protocol.h
-index ed74a1ec..a172b752 100644
+index ed74a1ec..ac1dd485 100644
 --- a/server/render_protocol.h
 +++ b/server/render_protocol.h
-@@ -40,6 +40,8 @@ enum render_context_op {
+@@ -40,6 +40,9 @@ enum render_context_op {
     RENDER_CONTEXT_OP_SUBMIT_CMD,
     RENDER_CONTEXT_OP_SUBMIT_FENCE,
     RENDER_CONTEXT_OP_EXPORT_FENCE,
 +   RENDER_CONTEXT_OP_GET_TIMELINE,
 +   RENDER_CONTEXT_OP_IMPORT_SEMAPHORE,
++   RENDER_CONTEXT_OP_MEMORY_RW,
  
     RENDER_CONTEXT_OP_COUNT,
  };
-@@ -207,6 +209,11 @@ struct render_context_op_submit_fence_request {
+@@ -207,6 +210,11 @@ struct render_context_op_submit_fence_request {
     /* TODO fix virgl_renderer_context_create_fence to use ring_index */
     uint32_t ring_index;
     uint32_t seqno;
@@ -92,7 +116,7 @@ index ed74a1ec..a172b752 100644
  };
  
  /* Export a sync_file fd for a previously submitted, not-yet-retired fence.
-@@ -236,6 +243,33 @@ struct render_context_op_export_fence_reply {
+@@ -236,6 +244,48 @@ struct render_context_op_export_fence_reply {
     /* followed by 1 fd if status == RENDER_CONTEXT_EXPORT_FENCE_OK */
  };
  
@@ -123,23 +147,39 @@ index ed74a1ec..a172b752 100644
 +   uint32_t status; /* 0 = ok */
 +};
 +
++/* Copy HOST_VISIBLE VkDeviceMemory through a guest shm fd carried with the
++ * request. dir 0 = host→guest, 1 = guest→host.
++ */
++struct render_context_op_memory_rw_request {
++   struct render_context_op_header header;
++   uint64_t mem_id;
++   uint64_t offset;
++   uint64_t size;
++   uint32_t dir;
++};
++
++struct render_context_op_memory_rw_reply {
++   uint32_t status; /* 0 = ok */
++};
++
  union render_context_op_request {
     struct render_context_op_header header;
     struct render_context_op_nop_request nop;
-@@ -246,6 +280,8 @@ union render_context_op_request {
+@@ -246,6 +296,9 @@ union render_context_op_request {
     struct render_context_op_submit_cmd_request submit_cmd;
     struct render_context_op_submit_fence_request submit_fence;
     struct render_context_op_export_fence_request export_fence;
 +   struct render_context_op_get_timeline_request get_timeline;
 +   struct render_context_op_import_semaphore_request import_semaphore;
++   struct render_context_op_memory_rw_request memory_rw;
  };
  
  #ifdef __APPLE__
 diff --git a/server/render_state.c b/server/render_state.c
-index e90a289d..58b15458 100644
+index e90a289d..d4b7f2b4 100644
 --- a/server/render_state.c
 +++ b/server/render_state.c
-@@ -224,6 +224,35 @@ render_state_export_fence(uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id,
+@@ -224,6 +224,48 @@ render_state_export_fence(uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id,
     return vkr_renderer_export_fence(ctx_id, ring_idx, fence_id, out_fd);
  }
  
@@ -172,14 +212,27 @@ index e90a289d..58b15458 100644
 +                                                sync_file_fd);
 +}
 +
++int
++render_state_memory_rw(uint32_t ctx_id,
++                       uint64_t mem_id,
++                       uint64_t offset,
++                       uint64_t size,
++                       uint32_t dir,
++                       int shm_fd)
++{
++   SCOPE_LOCK_RENDERER();
++   return vkr_renderer_memory_rw(ctx_id, mem_id, offset, size, dir, shm_fd);
++}
++
++
  bool
  render_state_create_resource(uint32_t ctx_id,
                               uint32_t res_id,
 diff --git a/server/render_state.h b/server/render_state.h
-index e2719860..819f4e3b 100644
+index e2719860..e26aa404 100644
 --- a/server/render_state.h
 +++ b/server/render_state.h
-@@ -36,6 +36,26 @@ render_state_submit_fence(uint32_t ctx_id,
+@@ -36,6 +36,36 @@ render_state_submit_fence(uint32_t ctx_id,
  int
  render_state_export_fence(uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id, int *out_fd);
  
@@ -203,11 +256,21 @@ index e2719860..819f4e3b 100644
 +                                 uint64_t semaphore_id,
 +                                 int sync_file_fd);
 +
++/* consumes shm_fd */
++int
++render_state_memory_rw(uint32_t ctx_id,
++                       uint64_t mem_id,
++                       uint64_t offset,
++                       uint64_t size,
++                       uint32_t dir,
++                       int shm_fd);
++
++
  bool
  render_state_create_resource(uint32_t ctx_id,
                               uint32_t res_id,
 diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
-index b718ef25..1a5c533a 100644
+index b718ef25..77925c31 100644
 --- a/src/proxy/proxy_context.c
 +++ b/src/proxy/proxy_context.c
 @@ -291,10 +291,11 @@ proxy_context_export_fence(struct virgl_context *base,
@@ -234,7 +297,7 @@ index b718ef25..1a5c533a 100644
     };
     if (proxy_socket_send_request(&ctx->socket, &req, sizeof(req)))
        return 0;
-@@ -344,6 +346,81 @@ proxy_context_submit_fence(struct virgl_context *base,
+@@ -344,6 +346,116 @@ proxy_context_submit_fence(struct virgl_context *base,
     return -1;
  }
  
@@ -313,16 +376,53 @@ index b718ef25..1a5c533a 100644
 +   return reply.status ? -EINVAL : 0;
 +}
 +
++static int
++proxy_context_memory_rw(struct virgl_context *base,
++                        uint64_t mem_id,
++                        uint64_t offset,
++                        uint64_t size,
++                        uint32_t dir,
++                        int shm_fd)
++{
++   struct proxy_context *ctx = (struct proxy_context *)base;
++
++   const struct render_context_op_memory_rw_request req = {
++      .header.op = RENDER_CONTEXT_OP_MEMORY_RW,
++      .mem_id = mem_id,
++      .offset = offset,
++      .size = size,
++      .dir = dir,
++   };
++   if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req),
++                                           &shm_fd, 1)) {
++      proxy_log("failed to send memory_rw");
++      close(shm_fd);
++      return -ENOTCONN;
++   }
++   close(shm_fd);
++
++   struct render_context_op_memory_rw_reply reply;
++   if (!proxy_socket_receive_reply(&ctx->socket, &reply, sizeof(reply))) {
++      proxy_log("failed to get memory_rw reply");
++      return -ENOTCONN;
++   }
++
++   return reply.status ? -EINVAL : 0;
++}
++
++
  static void
  proxy_context_retire_fences(struct virgl_context *base)
  {
-@@ -660,6 +737,9 @@ proxy_context_init_base(struct proxy_context *ctx)
+@@ -660,6 +772,11 @@ proxy_context_init_base(struct proxy_context *ctx)
     ctx->base.retire_fences = proxy_context_retire_fences;
     ctx->base.submit_fence = proxy_context_submit_fence;
     ctx->base.export_fence = proxy_context_export_fence;
 +   ctx->base.submit_fence2 = proxy_context_submit_fence2;
 +   ctx->base.get_timeline_fd = proxy_context_get_timeline_fd;
 +   ctx->base.import_semaphore_fd = proxy_context_import_semaphore_fd;
++   ctx->base.memory_rw = proxy_context_memory_rw;
++
  }
  
  static bool
@@ -462,10 +562,10 @@ index dc42c5a1..8a43d9a9 100644
  
  static void
 diff --git a/src/venus/vkr_command_buffer.h b/src/venus/vkr_command_buffer.h
-index 90b6d384..de45b9e6 100644
+index 90b6d384..98d55b27 100644
 --- a/src/venus/vkr_command_buffer.h
 +++ b/src/venus/vkr_command_buffer.h
-@@ -17,13 +17,75 @@ struct vkr_command_pool {
+@@ -17,13 +17,84 @@ struct vkr_command_pool {
  };
  VKR_DEFINE_OBJECT_CAST(command_pool, VK_OBJECT_TYPE_COMMAND_POOL, VkCommandPool)
  
@@ -473,8 +573,9 @@ index 90b6d384..de45b9e6 100644
 + * command stream is recorded by the guest and replayed here; these counters
 + * let the queue-submit path (and the device-lost handler) report what the
 + * faulting submission actually contained, so a recurring NVIDIA class error
-+ * (Xid 69, Class 0xC197 Offset 0x19D0 Data 0x3C) can be attributed to a
-+ * concrete Vulkan command family. */
++ * can be attributed to a concrete Vulkan command family.  Known fingerprints
++ * so far: Class 0xC197 Offset 0x19D0 Data 0x3C (issue #10) and Class 0xC997
++ * Offset 0x274 ErrorCode 0x9C (issue #11). */
 +struct vkr_cmd_stats {
 +   uint32_t draw;
 +   uint32_t draw_indexed;
@@ -523,6 +624,14 @@ index 90b6d384..de45b9e6 100644
 +{
 +   const struct vkr_cmd_stats zero = { 0 };
 +   cmd->stats = zero;
++   /* The draw trace is per-recording, exactly like the stats.  Leaving
++    * trace_n to grow without bound made the Xid-69 draw-trace unusable:
++    * the ring kept stale entries from earlier recordings, so a dump either
++    * printed draws that were not in the faulting submission, or (once the
++    * buffer had been reused many times) nothing meaningful at all.
++    * Reset it together with the stats so a dump always describes the
++    * recording that was actually submitted. */
++   cmd->trace_n = 0;
 +}
 +
 +static inline void
@@ -542,10 +651,10 @@ index 90b6d384..de45b9e6 100644
  vkr_context_init_command_pool_dispatch(struct vkr_context *ctx);
  
 diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
-index c170bd32..3453acbd 100644
+index c170bd32..5844f2ad 100644
 --- a/src/venus/vkr_context.c
 +++ b/src/venus/vkr_context.c
-@@ -5,10 +5,21 @@
+@@ -5,9 +5,23 @@
  
  #include "vkr_context.h"
  
@@ -557,17 +666,19 @@ index c170bd32..3453acbd 100644
  #include <sys/mman.h>
  #include <sys/types.h>
  #include <unistd.h>
- 
++#include <errno.h>
++#include <inttypes.h>
++#include <string.h>
++
 +/* the bundled UAPI header (src/drm/drm-uapi) — NOT <drm/drm.h>: the one-ioctl
 + * timeline import needs the kernel >= 6.16 syncobj UAPI (FD_TO_HANDLE
 + * FLAGS_TIMELINE + drm_syncobj_handle.point), which older distro headers
 + * lack; older kernels take the runtime EINVAL fallback instead. */
 +#include "drm.h"
-+
+ 
  #include "util/anon_file.h"
  #include "venus-protocol/vn_protocol_renderer_dispatches.h"
- 
-@@ -136,10 +147,11 @@ vkr_context_init_proc_table(struct vkr_context *ctx)
+@@ -136,10 +150,11 @@ vkr_context_init_proc_table(struct vkr_context *ctx)
  }
  
  bool
@@ -583,7 +694,7 @@ index c170bd32..3453acbd 100644
  {
     /* retire fence on cpu timeline directly */
     if (ring_idx == 0) {
-@@ -155,11 +167,309 @@ vkr_context_submit_fence(struct vkr_context *ctx,
+@@ -155,11 +170,371 @@ vkr_context_submit_fence(struct vkr_context *ctx,
     /* always merge fences */
     assert(!(flags & ~VIRGL_RENDERER_FENCE_FLAG_MERGEABLE));
     flags = VIRGL_RENDERER_FENCE_FLAG_MERGEABLE;
@@ -866,8 +977,18 @@ index c170bd32..3453acbd 100644
 +   struct vkr_semaphore *sem = vkr_context_get_object(ctx, semaphore_id);
 +   if (!dev || dev->base.type != VK_OBJECT_TYPE_DEVICE || !sem ||
 +       sem->base.type != VK_OBJECT_TYPE_SEMAPHORE) {
-+      vkr_log("import_semaphore: bad object ids dev %" PRIu64 " sem %" PRIu64,
-+              device_id, semaphore_id);
++      /* Report *why* the lookup failed.  The original one-line message could
++       * not distinguish "no such id" from "id exists but is the wrong object
++       * type", which is the difference between a routing bug (the object was
++       * created on another context/fork) and a lifetime bug (the id was
++       * recycled).  Both were open questions in issue #11. */
++      vkr_log("import_semaphore: bad object ids dev %" PRIu64 " sem %" PRIu64
++              " (dev %s%s, sem %s%s)",
++              device_id, semaphore_id,
++              dev ? "found" : "NULL",
++              (dev && dev->base.type != VK_OBJECT_TYPE_DEVICE) ? " wrong-type" : "",
++              sem ? "found" : "NULL",
++              (sem && sem->base.type != VK_OBJECT_TYPE_SEMAPHORE) ? " wrong-type" : "");
 +      close(sync_file_fd);
 +      return -EINVAL;
 +   }
@@ -891,29 +1012,78 @@ index c170bd32..3453acbd 100644
 +   return 0;
 +}
 +
++int
++vkr_context_memory_rw(struct vkr_context *ctx,
++                      uint64_t mem_id,
++                      uint64_t offset,
++                      uint64_t size,
++                      uint32_t dir,
++                      int shm_fd)
++{
++   struct vkr_device_memory *mem = vkr_context_get_object(ctx, mem_id);
++   if (!mem || mem->base.type != VK_OBJECT_TYPE_DEVICE_MEMORY) {
++      vkr_log("memory_rw: bad mem id %" PRIu64, mem_id);
++      close(shm_fd);
++      return -EINVAL;
++   }
++   if (!size || dir > 1 || offset + size < offset ||
++       offset + size > mem->allocation_size) {
++      close(shm_fd);
++      return -EINVAL;
++   }
++   if (!mem->device) {
++      close(shm_fd);
++      return -EINVAL;
++   }
++
++   void *guest = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++   close(shm_fd);
++   if (guest == MAP_FAILED)
++      return -errno;
++
++   struct vkr_device *dev = mem->device;
++   void *host = NULL;
++   VkResult result = dev->proc_table.MapMemory(dev->base.handle.device,
++                                               mem->base.handle.device_memory,
++                                               offset, size, 0, &host);
++   if (result != VK_SUCCESS || !host) {
++      vkr_log("memory_rw: vkMapMemory failed %d", result);
++      munmap(guest, size);
++      return -EINVAL;
++   }
++
++   if (dir == 0)
++      memcpy(guest, host, size);
++   else
++      memcpy(host, guest, size);
++
++   dev->proc_table.UnmapMemory(dev->base.handle.device,
++                               mem->base.handle.device_memory);
++   munmap(guest, size);
++   return 0;
++}
++
++
  int
  vkr_context_export_fence(struct vkr_context *ctx,
                           uint32_t ring_idx,
-@@ -472,6 +782,50 @@ vkr_context_on_ring_fatal(struct vkr_context *ctx)
+@@ -472,6 +847,35 @@ vkr_context_on_ring_fatal(struct vkr_context *ctx)
     mtx_unlock(&ctx->wait_ring.mutex);
  }
  
 +/* A guest-visible GPU fault (e.g. NVIDIA Xid 69 class error under 3D load)
-+ * makes the physical device return VK_ERROR_DEVICE_LOST. NVIDIA poisons the
-+ * whole GPU for the rest of this process tree: every subsequent
-+ * vkCreateDevice -- even in a freshly forked render worker -- returns
-+ * VK_ERROR_INITIALIZATION_FAILED, so SurfaceFlinger crash-loops forever
-+ * against a still-running wd-venus (observed: same-error CreateDevice every
-+ * ~17 s for minutes).
++ * makes THIS process's VkDevice return VK_ERROR_DEVICE_LOST.
 + *
-+ * Process layout under wd-venus.service: virgl_test_server (systemd main
-+ * PID, session leader) -> virgl_render_server -> one virgl-N-gpu_render
-+ * worker per guest client. The device-lost is seen by a worker, whose
-+ * getppid() is only the render server. Signal the whole session instead:
-+ * the session leader *is* the systemd main PID, so it exits, and systemd
-+ * (Restart=always, KillMode=control-group) reclaims every worker and starts
-+ * a fresh render server with a clean physical device -- the only thing that
-+ * recovers an NVIDIA device after a class error.
++ * wd-venus is `--venus --multi-clients` with the default fork-per-client:
++ * virgl_test_server (systemd main PID) forks one child per guest client
++ * (SF, HWUI, Unreal, Unity, …). Killing the session leader / process group
++ * was taking down SurfaceFlinger and every other app whenever AnTuTu 3D
++ * Unreal faulted — the guest then abort()ed on the dead socket and the
++ * container looked "exited" while LXC was still RUNNING.
++ *
++ * Only this worker exits. Sibling forks keep their VkDevices. If NVIDIA
++ * really poisons the whole GPU, SF will DEVICE_LOST next and we still
++ * isolate the blast; the guest vtest path must not abort() on EOF.
 + */
 +void
 +vkr_context_device_lost(struct vkr_context *ctx)
@@ -922,30 +1092,18 @@ index c170bd32..3453acbd 100644
 +   if (__atomic_exchange_n(&triggered, 1, __ATOMIC_SEQ_CST))
 +      return;
 +
-+   vkr_log("VK_ERROR_DEVICE_LOST: signaling render server restart (ctx %d, %s)",
++   vkr_log("VK_ERROR_DEVICE_LOST: exiting this client worker only (ctx %d, %s)",
 +           ctx->ctx_id, ctx->debug_name ? ctx->debug_name : "unknown");
 +
-+   /* Dump what the faulting submission stream actually contained so the
-+    * recurring Xid-69 (Class 0xC197) can be attributed to a command family. */
 +   vkr_queue_telemetry_dump();
 +
-+   /* primary: the session leader == virgl_test_server == systemd main PID */
-+   const pid_t sid = getsid(0);
-+   if (sid > 1 && sid != getpid())
-+      kill(sid, SIGTERM);
-+   /* fallback: our own process group (render server + sibling workers) in
-+    * case the session leader is stale or already re-parented */
-+   kill(0, SIGTERM);
-+
-+   /* exit promptly instead of serving a dead physical device. systemd
-+    * replaces the whole stack on the parent's restart. */
 +   _exit(EXIT_FAILURE);
 +}
 +
  bool
  vkr_context_wait_ring_seqno(struct vkr_context *ctx,
                              struct vkr_ring *ring,
-@@ -644,6 +998,25 @@ vkr_context_destroy(struct vkr_context *ctx)
+@@ -644,6 +1048,25 @@ vkr_context_destroy(struct vkr_context *ctx)
  
     vkr_context_wait_ring_fini(ctx);
  
@@ -971,7 +1129,7 @@ index c170bd32..3453acbd 100644
     if (ctx->ring_monitor.started)
        vkr_context_ring_monitor_fini(ctx);
  
-@@ -727,6 +1100,11 @@ vkr_context_create(uint32_t ctx_id,
+@@ -727,6 +1150,11 @@ vkr_context_create(uint32_t ctx_id,
     if (!vkr_context_wait_ring_init(ctx))
        goto err_ctx_wait_ring_init;
  
@@ -984,7 +1142,7 @@ index c170bd32..3453acbd 100644
        goto err_ctx_object_mutex;
  
 diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
-index 7ba72eb8..97659e90 100644
+index 7ba72eb8..5ce851cb 100644
 --- a/src/venus/vkr_context.h
 +++ b/src/venus/vkr_context.h
 @@ -98,6 +98,50 @@ struct vkr_context {
@@ -1038,7 +1196,7 @@ index 7ba72eb8..97659e90 100644
     struct vkr_instance *instance;
     char *instance_name;
  
-@@ -130,6 +174,40 @@ vkr_context_submit_fence(struct vkr_context *ctx,
+@@ -130,6 +174,52 @@ vkr_context_submit_fence(struct vkr_context *ctx,
                           uint32_t ring_idx,
                           uint64_t fence_id);
  
@@ -1076,10 +1234,22 @@ index 7ba72eb8..97659e90 100644
 +                                     uint64_t semaphore_id,
 +                                     int sync_file_fd);
 +
++/* copy HOST_VISIBLE VkDeviceMemory through guest shm; consumes shm_fd.
++ * dir 0 = host→guest, 1 = guest→host
++ */
++int
++vkr_context_memory_rw(struct vkr_context *ctx,
++                      uint64_t mem_id,
++                      uint64_t offset,
++                      uint64_t size,
++                      uint32_t dir,
++                      int shm_fd);
++
++
  bool
  vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size);
  
-@@ -269,6 +347,11 @@ vkr_context_get_wait_ring_seqno(struct vkr_context *ctx,
+@@ -269,6 +359,11 @@ vkr_context_get_wait_ring_seqno(struct vkr_context *ctx,
  void
  vkr_context_on_ring_fatal(struct vkr_context *ctx);
  
@@ -1091,11 +1261,39 @@ index 7ba72eb8..97659e90 100644
  bool
  vkr_context_wait_ring_seqno(struct vkr_context *ctx,
                              struct vkr_ring *ring,
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index 9e8dd26d..e238c23c 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -5,6 +5,7 @@
+ 
+ #include "vkr_pipeline.h"
+ 
++#include "vkr_context.h"
+ #include "vkr_pipeline_gen.h"
+ 
+ static void
+@@ -120,8 +121,14 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct object_array arr;
+ 
+-   if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
++   if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS) {
++      vkr_log("vkCreateGraphicsPipelines host ret %d count=%u ctx=%d (%s)",
++              args->ret, args->createInfoCount, ctx->ctx_id,
++              ctx->debug_name ? ctx->debug_name : "unknown");
++      if (args->ret == VK_ERROR_DEVICE_LOST)
++         vkr_context_device_lost(ctx);
+       return;
++   }
+ 
+    vkr_pipeline_add_array(ctx, dev, &arr, args->pPipelines);
+ }
 diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
-index 08c7b07f..38932c13 100644
+index 08c7b07f..e6049683 100644
 --- a/src/venus/vkr_queue.c
 +++ b/src/venus/vkr_queue.c
-@@ -5,12 +5,164 @@
+@@ -5,12 +5,241 @@
  
  #include "vkr_queue.h"
  
@@ -1112,25 +1310,65 @@ index 08c7b07f..38932c13 100644
 +/* Xid-69 command-stream telemetry ring.  Every vkQueueSubmit records a
 + * summary of the draw/dispatch command families in the submitted command
 + * buffers; the device-lost handler dumps the ring so a recurring NVIDIA
-+ * class error (Xid 69, Class 0xC197 Offset 0x19D0 Data 0x3C) can be
-+ * attributed to the submission (and command family) that faulted on the GPU.
++ * class error can be attributed to the submission (and command family) that
++ * faulted on the GPU.  At least two fingerprints are known: the skiagl/ANGLE
++ * one this was written for (Xid 69, Class 0xC197 Offset 0x19D0 Data 0x3C,
++ * issue #10) and a second, independent one with correct props
++ * (Class 0xC997 Offset 0x274 ErrorCode 0x9C, issue #11).  Both land here --
++ * the ring is per-submission, so no fingerprint-specific code is needed.
 + */
 +struct vkr_telem_entry {
 +   uint64_t seq;
 +   uint32_t ctx_id;
 +   uint32_t cb_count;
 +   struct vkr_cmd_stats stats;
-+   struct vkr_command_buffer *last_cb;
++   /* The draw trace is COPIED here, not referenced.  Storing a
++    * struct vkr_command_buffer * and dereferencing it in the device-lost
++    * handler was unsafe and useless: the app resubmits every frame and
++    * command buffers/pools get reset and recycled, so by fault time the
++    * pointer either dangled (use-after-free) or pointed at a buffer whose
++    * trace had already been reset.  That is why the draw-trace never
++    * printed anything for reporters. */
++   struct vkr_draw_trace_entry trace[VKR_DRAW_TRACE_N];
++   uint32_t trace_n;
 +};
 +
 +#define VKR_TELEM_RING 64
 +static struct vkr_telem_entry vkr_telem_ring[VKR_TELEM_RING];
 +static uint32_t vkr_telem_idx;
 +
++/* A submission can carry several command buffers, and the interesting draws
++ * are frequently NOT in the last one (the last cb is often a small/empty
++ * present or barrier-only buffer).  Taking the trace from a single
++ * "last_cb" therefore reported "draw-trace (0 cmds)" for submissions whose
++ * stats said draw=3 di=4.  Collect the trace from EVERY command buffer in
++ * the submission, in order, keeping the most recent VKR_DRAW_TRACE_N. */
++struct vkr_telem_trace_acc {
++   struct vkr_draw_trace_entry entries[VKR_DRAW_TRACE_N];
++   uint32_t n;    /* total seen (may exceed VKR_DRAW_TRACE_N) */
++};
++
++static inline void
++vkr_telem_trace_acc_add(struct vkr_telem_trace_acc *acc,
++                        const struct vkr_command_buffer *cb)
++{
++   if (!cb || !cb->trace_n)
++      return;
++   uint32_t n = cb->trace_n;
++   if (n > VKR_DRAW_TRACE_N)
++      n = VKR_DRAW_TRACE_N;
++   const uint32_t begin = cb->trace_n - n;
++   for (uint32_t i = 0; i < n; i++) {
++      acc->entries[acc->n % VKR_DRAW_TRACE_N] =
++         cb->trace[(begin + i) % VKR_DRAW_TRACE_N];
++      acc->n++;
++   }
++}
++
 +static void
 +vkr_telem_store(struct vkr_queue *queue, uint32_t cb_count,
 +                const struct vkr_cmd_stats *sum,
-+                struct vkr_command_buffer *last_cb)
++                const struct vkr_telem_trace_acc *trace)
 +{
 +   struct vkr_telem_entry *e =
 +      &vkr_telem_ring[__atomic_fetch_add(&vkr_telem_idx, 1, __ATOMIC_RELAXED) %
@@ -1139,21 +1377,58 @@ index 08c7b07f..38932c13 100644
 +   e->ctx_id = queue->context->ctx_id;
 +   e->cb_count = cb_count;
 +   e->stats = *sum;
-+   e->last_cb = last_cb;
++
++   /* Snapshot the trace now, while the command buffers are guaranteed to be
++    * alive and still describe this submission.  Storing a pointer and
++    * dereferencing it later was both unsafe (the cb is recycled) and
++    * useless (trace_n was never reset), which is why reporters saw an empty
++    * draw-trace. */
++   e->trace_n = 0;
++   if (trace && trace->n) {
++      const uint32_t n = trace->n < VKR_DRAW_TRACE_N ? trace->n : VKR_DRAW_TRACE_N;
++      const uint32_t begin = trace->n - n;
++      for (uint32_t i = 0; i < n; i++)
++         e->trace[i] = trace->entries[(begin + i) % VKR_DRAW_TRACE_N];
++      e->trace_n = n;
++   }
 +}
 +
 +/* Accumulate the per-command-buffer stats of one guest-encoded handle (the
 + * host-pointer value is still intact pre-replace) into *sum. */
 +static inline void
 +vkr_telem_accum_cb(struct vkr_cmd_stats *sum, uint32_t *cb_count,
-+                   struct vkr_command_buffer **last_cb, VkCommandBuffer handle)
++                   struct vkr_telem_trace_acc *trace, VkCommandBuffer handle)
 +{
 +   struct vkr_command_buffer *cb = vkr_command_buffer_from_handle(handle);
 +   if (cb) {
 +      vkr_command_buffer_accum_stats(cb, sum);
++      vkr_telem_trace_acc_add(trace, cb);
 +      (*cb_count)++;
-+      *last_cb = cb;
 +   }
++}
++
++/* Reporters had no way to inspect the ring without provoking a real
++ * device-lost, which made the telemetry untestable and left the
++ * "draw-trace never prints anything" question open.  Allow an on-demand
++ * dump: create the file named by VKR_TELEM_DUMP (default
++ * /tmp/vkr-telem-dump) and the next submit prints the ring, then the file
++ * is removed so it fires once per request.  Read-only w.r.t. driver state.
++ */
++static void
++vkr_telem_check_dump_request(void)
++{
++   static const char *path;
++   static bool inited;
++   if (!inited) {
++      path = getenv("VKR_TELEM_DUMP");
++      if (!path)
++         path = "/tmp/vkr-telem-dump";
++      inited = true;
++   }
++   if (access(path, F_OK) != 0)
++      return;
++   unlink(path);
++   vkr_queue_telemetry_dump();
 +}
 +
 +void
@@ -1163,30 +1438,29 @@ index 08c7b07f..38932c13 100644
 +{
 +   struct vkr_cmd_stats sum = { 0 };
 +   uint32_t cb_count = 0;
-+   struct vkr_command_buffer *last_cb = NULL;
++   struct vkr_telem_trace_acc trace = { 0 };
 +
 +   /* pSubmits still holds the guest-encoded (host-pointer) command-buffer
 +    * handles here — read the per-cb stats before the replace helper swaps
 +    * them for real VkCommandBuffer handles. */
 +   for (uint32_t i = 0; i < submit_count; i++) {
 +      for (uint32_t j = 0; j < submits[i].commandBufferCount; j++)
-+         vkr_telem_accum_cb(&sum, &cb_count, &last_cb, submits[i].pCommandBuffers[j]);
++         vkr_telem_accum_cb(&sum, &cb_count, &trace, submits[i].pCommandBuffers[j]);
 +   }
 +
-+   vkr_telem_store(queue, cb_count, &sum, last_cb);
++   vkr_telem_store(queue, cb_count, &sum, &trace);
++
++   vkr_telem_check_dump_request();
 +}
 +
 +static void
-+vkr_telem_dump_trace(const struct vkr_command_buffer *cb)
++vkr_telem_dump_trace(const struct vkr_draw_trace_entry *trace, uint32_t trace_n)
 +{
-+   if (!cb)
++   if (!trace || !trace_n)
 +      return;
-+   const uint32_t total = cb->trace_n;
-+   const uint32_t cnt = total < VKR_DRAW_TRACE_N ? total : VKR_DRAW_TRACE_N;
-+   const uint32_t begin = total - cnt;
++   const uint32_t cnt = trace_n < VKR_DRAW_TRACE_N ? trace_n : VKR_DRAW_TRACE_N;
 +   for (uint32_t i = 0; i < cnt; i++) {
-+      const struct vkr_draw_trace_entry *t =
-+         &cb->trace[(begin + i) % VKR_DRAW_TRACE_N];
++      const struct vkr_draw_trace_entry *t = &trace[i];
 +      switch (t->type) {
 +      case 0:
 +         vkr_log("    draw vc=%u inst=%u firstV=%u firstI=%u",
@@ -1245,14 +1519,15 @@ index 08c7b07f..38932c13 100644
 +   }
 +
 +   /* Print the exact draw/dispatch parameter stream for the last few
-+    * submissions so the faulting GPU draw can be identified directly. */
++    * submissions so the faulting GPU draw can be identified directly.
++    * The trace was snapshotted at submit time (see vkr_telem_store). */
 +   const uint32_t detail = n < 6 ? n : 6;
 +   vkr_log("-- draw-trace for the last %u submissions (oldest first) --", detail);
 +   for (uint32_t i = n - detail; i < n; i++) {
 +      const struct vkr_telem_entry *e =
 +         &vkr_telem_ring[(start + i) % VKR_TELEM_RING];
-+      vkr_log("  submit #%" PRIu64 " draw-trace:", e->seq);
-+      vkr_telem_dump_trace(e->last_cb);
++      vkr_log("  submit #%" PRIu64 " draw-trace (%u cmds):", e->seq, e->trace_n);
++      vkr_telem_dump_trace(e->trace, e->trace_n);
 +   }
 +   vkr_log("== end Xid-69 telemetry ==");
 +}
@@ -1260,7 +1535,7 @@ index 08c7b07f..38932c13 100644
  static struct vkr_queue_sync *
  vkr_device_alloc_queue_sync(struct vkr_device *dev,
                              uint32_t fence_flags,
-@@ -55,6 +207,8 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+@@ -55,6 +284,8 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
     sync->flags = fence_flags;
     sync->ring_idx = ring_idx;
     sync->fence_id = fence_id;
@@ -1269,7 +1544,7 @@ index 08c7b07f..38932c13 100644
  
     return sync;
  }
-@@ -62,6 +216,12 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+@@ -62,6 +293,12 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
  static void
  vkr_device_free_queue_sync(struct vkr_device *dev, struct vkr_queue_sync *sync)
  {
@@ -1282,7 +1557,7 @@ index 08c7b07f..38932c13 100644
     mtx_lock(&dev->free_sync_mutex);
     list_addtail(&sync->head, &dev->free_syncs);
     mtx_unlock(&dev->free_sync_mutex);
-@@ -79,7 +239,8 @@ bool
+@@ -79,7 +316,8 @@ bool
  vkr_queue_sync_submit(struct vkr_queue *queue,
                        uint32_t flags,
                        uint32_t ring_idx,
@@ -1292,7 +1567,7 @@ index 08c7b07f..38932c13 100644
  {
     TRACE_FUNC();
     struct vkr_device *dev = queue->device;
-@@ -90,19 +251,84 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+@@ -90,19 +328,84 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
     if (!sync)
        return false;
  
@@ -1379,7 +1654,7 @@ index 08c7b07f..38932c13 100644
     mtx_lock(&queue->sync_thread.mutex);
     list_addtail(&sync->head, &queue->sync_thread.syncs);
     cnd_signal(&queue->sync_thread.cond);
-@@ -124,43 +350,46 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
+@@ -124,43 +427,46 @@ vkr_queue_export_fence_sync_file(struct vkr_queue *queue, uint64_t fence_id, int
  
     int ret = 1;
     mtx_lock(&queue->sync_thread.mutex);
@@ -1458,7 +1733,7 @@ index 08c7b07f..38932c13 100644
     }
     mtx_unlock(&queue->sync_thread.mutex);
  
-@@ -173,7 +402,7 @@ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
+@@ -173,7 +479,7 @@ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
     /* vkDeviceWaitIdle has been called */
     mtx_lock(&queue->sync_thread.mutex);
     queue->sync_thread.join = true;
@@ -1467,7 +1742,7 @@ index 08c7b07f..38932c13 100644
     mtx_unlock(&queue->sync_thread.mutex);
  
     thrd_join(queue->sync_thread.thread, NULL);
-@@ -227,11 +456,26 @@ vkr_queue_thread(void *arg)
+@@ -227,11 +533,26 @@ vkr_queue_thread(void *arg)
        struct vkr_queue_sync *sync =
           list_first_entry(&queue->sync_thread.syncs, struct vkr_queue_sync, head);
  
@@ -1495,7 +1770,7 @@ index 08c7b07f..38932c13 100644
        } else {
           result = vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
                                      ns_per_sec * 3);
-@@ -244,6 +488,19 @@ vkr_queue_thread(void *arg)
+@@ -244,6 +565,19 @@ vkr_queue_thread(void *arg)
  
        list_del(&sync->head);
  
@@ -1515,7 +1790,7 @@ index 08c7b07f..38932c13 100644
        vkr_queue_sync_retire(queue, sync);
     }
     mtx_unlock(&queue->sync_thread.mutex);
-@@ -429,12 +686,20 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
+@@ -429,12 +763,20 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
     struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
     struct vn_device_proc_table *vk = &queue->device->proc_table;
  
@@ -1536,20 +1811,20 @@ index 08c7b07f..38932c13 100644
  }
  
  static void
-@@ -470,12 +735,30 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
+@@ -470,12 +812,30 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
     struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
     struct vn_device_proc_table *vk = &queue->device->proc_table;
  
 +   {
 +      struct vkr_cmd_stats sum = { 0 };
 +      uint32_t cb_count = 0;
-+      struct vkr_command_buffer *last_cb = NULL;
++      struct vkr_telem_trace_acc trace = { 0 };
 +      for (uint32_t i = 0; i < args->submitCount; i++) {
 +         for (uint32_t j = 0; j < args->pSubmits[i].commandBufferInfoCount; j++)
-+            vkr_telem_accum_cb(&sum, &cb_count, &last_cb,
++            vkr_telem_accum_cb(&sum, &cb_count, &trace,
 +                              args->pSubmits[i].pCommandBufferInfos[j].commandBuffer);
 +      }
-+      vkr_telem_store(queue, cb_count, &sum, last_cb);
++      vkr_telem_store(queue, cb_count, &sum, &trace);
 +   }
     vn_replace_vkQueueSubmit2_args_handle(args);
  
@@ -1628,10 +1903,19 @@ index 5246a5a2..c8bdc11e 100644
  
  #endif /* VKR_QUEUE_H */
 diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
-index d7eaab36..704fe916 100644
+index d7eaab36..78aae299 100644
 --- a/src/venus/vkr_renderer.c
 +++ b/src/venus/vkr_renderer.c
-@@ -183,6 +183,53 @@ vkr_renderer_submit_fence(uint32_t ctx_id,
+@@ -3,6 +3,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <unistd.h>
++
+ #include "vkr_common.h"
+ 
+ #include "venus-protocol/vn_protocol_renderer_info.h"
+@@ -183,6 +185,73 @@ vkr_renderer_submit_fence(uint32_t ctx_id,
     return vkr_context_submit_fence(ctx, flags, ring_idx, fence_id);
  }
  
@@ -1682,14 +1966,34 @@ index d7eaab36..704fe916 100644
 +                                               sync_file_fd);
 +}
 +
++int
++vkr_renderer_memory_rw(uint32_t ctx_id,
++                       uint64_t mem_id,
++                       uint64_t offset,
++                       uint64_t size,
++                       uint32_t dir,
++                       int shm_fd)
++{
++   TRACE_FUNC();
++
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   if (!ctx) {
++      close(shm_fd);
++      return -EINVAL;
++   }
++
++   return vkr_context_memory_rw(ctx, mem_id, offset, size, dir, shm_fd);
++}
++
++
  bool
  vkr_renderer_create_resource(uint32_t ctx_id,
                               uint32_t res_id,
 diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
-index b606ce62..5ff81b2d 100644
+index b606ce62..f026180e 100644
 --- a/src/venus/vkr_renderer.h
 +++ b/src/venus/vkr_renderer.h
-@@ -57,6 +57,29 @@ vkr_renderer_submit_fence(uint32_t ctx_id,
+@@ -57,6 +57,39 @@ vkr_renderer_submit_fence(uint32_t ctx_id,
                            uint64_t ring_idx,
                            uint64_t fence_id);
  
@@ -1716,14 +2020,24 @@ index b606ce62..5ff81b2d 100644
 +                                      uint64_t semaphore_id,
 +                                      int sync_file_fd);
 +
++/* consumes shm_fd; dir 0 = host→guest, 1 = guest→host */
++int
++vkr_renderer_memory_rw(uint32_t ctx_id,
++                       uint64_t mem_id,
++                       uint64_t offset,
++                       uint64_t size,
++                       uint32_t dir,
++                       int shm_fd);
++
++
  bool
  vkr_renderer_create_resource(uint32_t ctx_id,
                               uint32_t res_id,
 diff --git a/src/virgl_context.h b/src/virgl_context.h
-index 5db5cc30..7397b975 100644
+index 5db5cc30..ec3fd997 100644
 --- a/src/virgl_context.h
 +++ b/src/virgl_context.h
-@@ -140,6 +140,34 @@ struct virgl_context {
+@@ -140,6 +140,45 @@ struct virgl_context {
                         uint64_t fence_id,
                         int *out_fd);
  
@@ -1755,14 +2069,25 @@ index 5db5cc30..7397b975 100644
 +                              uint64_t semaphore_id,
 +                              int sync_file_fd);
 +
++   /* Copy HOST_VISIBLE VkDeviceMemory through a guest shm fd.
++    * dir 0 = host→guest, 1 = guest→host. Consumes shm_fd. Optional.
++    */
++   int (*memory_rw)(struct virgl_context *ctx,
++                    uint64_t mem_id,
++                    uint64_t offset,
++                    uint64_t size,
++                    uint32_t dir,
++                    int shm_fd);
++
++
     /* For DRM native contexts, return the device fd: */
     int (*get_device_fd)(struct virgl_context *ctx);
  
 diff --git a/src/virglrenderer.c b/src/virglrenderer.c
-index c82b916d..cef4107d 100644
+index c82b916d..62b24ace 100644
 --- a/src/virglrenderer.c
 +++ b/src/virglrenderer.c
-@@ -449,6 +449,54 @@ int virgl_renderer_context_export_fence(uint32_t ctx_id,
+@@ -449,6 +449,75 @@ int virgl_renderer_context_export_fence(uint32_t ctx_id,
     return ctx->export_fence(ctx, ring_idx, fence_id, fd);
  }
  
@@ -1814,14 +2139,35 @@ index c82b916d..cef4107d 100644
 +   return ctx->import_semaphore_fd(ctx, device_id, semaphore_id, sync_file_fd);
 +}
 +
++int virgl_renderer_context_memory_rw(uint32_t ctx_id,
++                                     uint64_t mem_id,
++                                     uint64_t offset,
++                                     uint64_t size,
++                                     uint32_t dir,
++                                     int shm_fd)
++{
++   TRACE_FUNC();
++   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
++   if (!ctx) {
++      close(shm_fd);
++      return -EINVAL;
++   }
++   if (!ctx->memory_rw) {
++      close(shm_fd);
++      return -ENOTSUP;
++   }
++   return ctx->memory_rw(ctx, mem_id, offset, size, dir, shm_fd);
++}
++
++
  void virgl_renderer_context_poll(uint32_t ctx_id)
  {
     TRACE_FUNC();
 diff --git a/src/virglrenderer.h b/src/virglrenderer.h
-index f59dd9a3..6d36e313 100644
+index f59dd9a3..f463e262 100644
 --- a/src/virglrenderer.h
 +++ b/src/virglrenderer.h
-@@ -467,6 +467,40 @@ VIRGL_EXPORT int virgl_renderer_context_export_fence(uint32_t ctx_id,
+@@ -467,6 +467,53 @@ VIRGL_EXPORT int virgl_renderer_context_export_fence(uint32_t ctx_id,
                                                       uint64_t fence_id,
                                                       int *fd);
  
@@ -1859,6 +2205,19 @@ index f59dd9a3..6d36e313 100644
 +                                                            uint64_t semaphore_id,
 +                                                            int sync_file_fd);
 +
++/*
++ * Copy HOST_VISIBLE VkDeviceMemory identified by mem_id through a guest shm
++ * fd (venus contexts only). dir 0 = host→guest, 1 = guest→host. Consumes
++ * shm_fd. Returns 0 on success.
++ */
++VIRGL_EXPORT int virgl_renderer_context_memory_rw(uint32_t ctx_id,
++                                                  uint64_t mem_id,
++                                                  uint64_t offset,
++                                                  uint64_t size,
++                                                  uint32_t dir,
++                                                  int shm_fd);
++
++
  VIRGL_EXPORT void virgl_renderer_context_poll(uint32_t ctx_id); /* force fences */
  VIRGL_EXPORT int virgl_renderer_context_get_poll_fd(uint32_t ctx_id);
  
@@ -1876,10 +2235,26 @@ index c2bd2782..387084fe 100644
     'vtest.h'
  ]
 diff --git a/vtest/vtest.h b/vtest/vtest.h
-index fa74075a..59698511 100644
+index fa74075a..3e5ceb80 100644
 --- a/vtest/vtest.h
 +++ b/vtest/vtest.h
-@@ -56,6 +56,14 @@ void vtest_poll_context(struct vtest_context *ctx);
+@@ -49,6 +49,15 @@ void vtest_cleanup_renderer(void);
+ 
+ int vtest_create_context(struct vtest_input *input, int out_fd,
+                          uint32_t length_dw, struct vtest_context **out_ctx);
++
++/* Returned by vtest_lazy_init_context() when the renderer REFUSED to create the
++ * context, as opposed to the guest asking for something this build cannot serve
++ * (e.g. protocol version < 3).  Only the refusal means the renderer -- or the
++ * GPU under it -- is unusable, which is what a device poisoned by a class error
++ * looks like: every later vkCreateDevice fails until the server is replaced.
++ * Negative, so callers that only test `< 0` keep working unchanged. */
++#define VTEST_CONTEXT_INIT_RENDERER_FAILED (-1000)
++
+ int vtest_lazy_init_context(struct vtest_context *ctx);
+ void vtest_destroy_context(struct vtest_context *ctx);
+ 
+@@ -56,6 +65,16 @@ void vtest_poll_context(struct vtest_context *ctx);
  int vtest_get_context_poll_fd(struct vtest_context *ctx);
  
  void vtest_set_current_context(struct vtest_context *ctx);
@@ -1891,10 +2266,12 @@ index fa74075a..59698511 100644
 +int vtest_submit_cmd2_timeline(uint32_t length_dw);
 +int vtest_timeline_get(uint32_t length_dw);
 +int vtest_semaphore_import_sync_fd(uint32_t length_dw);
++int vtest_memory_rw(uint32_t length_dw);
++
  
  int vtest_send_caps(uint32_t length_dw);
  int vtest_send_caps2(uint32_t length_dw);
-@@ -96,6 +104,7 @@ int vtest_sync_write(uint32_t length_dw);
+@@ -96,6 +115,7 @@ int vtest_sync_write(uint32_t length_dw);
  int vtest_sync_wait(uint32_t length_dw);
  int vtest_sync_export_sync_file(uint32_t length_dw);
  int vtest_resource_import_blob(uint32_t length_dw);
@@ -1903,10 +2280,10 @@ index fa74075a..59698511 100644
  int vtest_submit_cmd2(uint32_t length_dw);
  
 diff --git a/vtest/vtest_protocol.h b/vtest/vtest_protocol.h
-index 3a7381f7..95b0b0d1 100644
+index 3a7381f7..9b92668f 100644
 --- a/vtest/vtest_protocol.h
 +++ b/vtest/vtest_protocol.h
-@@ -98,6 +98,22 @@
+@@ -98,6 +98,29 @@
  #define VCMD_SYNC_EXPORT_SYNC_FILE 39
  /* import a dmabuf fd as a blob resource attached to the context */
  #define VCMD_RESOURCE_IMPORT_BLOB 40
@@ -1926,10 +2303,17 @@ index 3a7381f7..95b0b0d1 100644
 + * ring submission that waits on the semaphore
 + */
 +#define VCMD_SEMAPHORE_IMPORT_SYNC_FD 44
++/* copy HOST_VISIBLE VkDeviceMemory through guest shm. NVIDIA dma_buf mmap
++ * is write-combined even for HOST_CACHED types. payload uint32[7] =
++ * { mem_id_lo, mem_id_hi, offset_lo, offset_hi, size_lo, size_hi, dir }
++ * dir 0 = host→guest, 1 = guest→host; one SCM_RIGHTS fd = guest shm
++ */
++#define VCMD_MEMORY_RW 45
++
  
  #define VCMD_RES_CREATE_SIZE 10
  #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
-@@ -170,6 +186,10 @@ enum vcmd_param  {
+@@ -170,6 +193,10 @@ enum vcmd_param  {
     VCMD_PARAM_HAS_TIMELINE_SYNCOBJ = 2,
     /* server supports VCMD_SYNC_EXPORT_SYNC_FILE for venus sync points */
     VCMD_PARAM_HAS_VENUS_SYNC_FD = 3,
@@ -1940,7 +2324,7 @@ index 3a7381f7..95b0b0d1 100644
  };
  #define VCMD_GET_PARAM_SIZE 1
  #define VCMD_GET_PARAM_PARAM 0
-@@ -262,6 +282,30 @@ enum vcmd_sync_export_sync_file_status {
+@@ -262,6 +289,30 @@ enum vcmd_sync_export_sync_file_status {
  #define VCMD_RESOURCE_IMPORT_BLOB_SIZE_HI 1
  /* followed by 1 fd; resp res_id (0 = failure) */
  
@@ -1971,8 +2355,24 @@ index 3a7381f7..95b0b0d1 100644
  enum vcmd_submit_cmd2_flag {
     VCMD_SUBMIT_CMD2_FLAG_RING_IDX = 1 << 0,
     VCMD_SUBMIT_CMD2_FLAG_IN_FENCE_FD = 1 << 1,
+@@ -385,5 +436,15 @@ struct vcmd_submit_cmd2_batch {
+ #define VCMD_RESOURCE_EXPORT_FD_SIZE 1
+ #define VCMD_RESOURCE_EXPORT_FD_RES_HANDLE 0
+ /* rsp fd */
++#define VCMD_MEMORY_RW_SIZE 7
++#define VCMD_MEMORY_RW_MEM_ID_LO 0
++#define VCMD_MEMORY_RW_MEM_ID_HI 1
++#define VCMD_MEMORY_RW_OFFSET_LO 2
++#define VCMD_MEMORY_RW_OFFSET_HI 3
++#define VCMD_MEMORY_RW_SIZE_LO 4
++#define VCMD_MEMORY_RW_SIZE_HI 5
++#define VCMD_MEMORY_RW_DIR 6
++/* followed by 1 fd; resp status dword (0 = ok) */
++
+ 
+ #endif /* VTEST_PROTOCOL */
 diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
-index f3212ad7..3a9cbbb3 100644
+index f3212ad7..e30abe7e 100644
 --- a/vtest/vtest_renderer.c
 +++ b/vtest/vtest_renderer.c
 @@ -53,6 +53,7 @@
@@ -1983,7 +2383,20 @@ index f3212ad7..3a9cbbb3 100644
  #include "vtest_protocol.h"
  #include "threadpool.h"
  
-@@ -865,6 +866,13 @@ static struct vtest_context *vtest_get_current_context(void)
+@@ -804,6 +805,12 @@ int vtest_lazy_init_context(struct vtest_context *ctx)
+    }
+    ctx->context_initialized = (ret == 0);
+ 
++   /* Tell the caller apart "the guest is wrong" from "the renderer is gone":
++    * a refused device/context on a device poisoned by a GPU class error is the
++    * second case and needs the whole server replaced (issue #11). */
++   if (ret)
++      return VTEST_CONTEXT_INIT_RENDERER_FAILED;
++
+    return ret;
+ }
+ 
+@@ -865,6 +872,13 @@ static struct vtest_context *vtest_get_current_context(void)
     return renderer.current_context;
  }
  
@@ -1997,7 +2410,7 @@ index f3212ad7..3a9cbbb3 100644
  int vtest_ping_protocol_version(UNUSED uint32_t length_dw)
  {
     struct vtest_context *ctx = vtest_get_current_context();
-@@ -970,6 +978,20 @@ int vtest_get_param(UNUSED uint32_t length_dw)
+@@ -970,6 +984,20 @@ int vtest_get_param(UNUSED uint32_t length_dw)
        resp[0] = true;
        resp[1] = !!(renderer.ctx_flags & VIRGL_RENDERER_VENUS);
        break;
@@ -2018,7 +2431,7 @@ index f3212ad7..3a9cbbb3 100644
     case VCMD_PARAM_HAS_TIMELINE_SYNCOBJ: {
  #ifdef ENABLE_DRM
        int fd = virgl_renderer_get_dev_fd(ctx->ctx_id);
-@@ -2238,7 +2260,8 @@ struct drm_virtgpu_execbuffer_syncobj {
+@@ -2238,7 +2266,8 @@ struct drm_virtgpu_execbuffer_syncobj {
  static int vtest_submit_cmd2_batch(struct vtest_context *ctx,
                                     const struct vcmd_submit_cmd2_batch *batch,
                                     const uint32_t *cmds,
@@ -2028,7 +2441,7 @@ index f3212ad7..3a9cbbb3 100644
  {
     struct vtest_timeline_submit *submit = NULL;
     struct drm_virtgpu_execbuffer_syncobj *in_syncobj = NULL, *out_syncobj = NULL;
-@@ -2361,10 +2384,18 @@ static int vtest_submit_cmd2_batch(struct vtest_context *ctx,
+@@ -2361,10 +2390,18 @@ static int vtest_submit_cmd2_batch(struct vtest_context *ctx,
        uint64_t fence_id = (uintptr_t)submit;
  
        submit->timeline = timeline;
@@ -2051,7 +2464,7 @@ index f3212ad7..3a9cbbb3 100644
        if (ret) {
           vtest_free_timeline_submit(submit);
           goto out;
-@@ -2439,6 +2470,7 @@ int vtest_resource_import_blob(uint32_t length_dw)
+@@ -2439,6 +2476,7 @@ int vtest_resource_import_blob(uint32_t length_dw)
     /* venus imports with size 0 when only querying memory properties (see
      * vn_get_memory_dma_buf_properties); derive the size from the dmabuf
      */
@@ -2059,7 +2472,7 @@ index f3212ad7..3a9cbbb3 100644
     if (!size) {
        const off_t seek_size = lseek(fd, 0, SEEK_END);
        if (seek_size < 0) {
-@@ -2491,6 +2523,64 @@ int vtest_resource_import_blob(uint32_t length_dw)
+@@ -2491,6 +2529,85 @@ int vtest_resource_import_blob(uint32_t length_dw)
     return vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf)) >= 0 ? 0 : -1;
  }
  
@@ -2088,9 +2501,30 @@ index f3212ad7..3a9cbbb3 100644
 +   uint64_t modifier = 0;
 +   uint64_t size = 0;
 +
++   /* Let the allocator's optional WDRDIAG_ALLOC_TRACE stream attribute this
++    * allocation to the guest's actual request (dev/wdrdiag alloc-trace). */
++   vtest_gpu_alloc_set_flags(flags);
++
 +   if (!width || !height || width > 32768 || height > 32768) {
 +      ret = -EINVAL;
 +   } else if (flags & VCMD_ALLOC_GPU_FLAG_MAPPABLE) {
++      /* MAPPABLE means "the guest will mmap this" (vtest_protocol.h). Honour
++       * it: a block-linear VRAM buffer is not CPU-mappable, so routing a
++       * MAPPABLE request there makes the guest's later
++       * IMapper::lock() fail with BAD_VALUE and takes the caller down
++       * (measured: mediaserver/SoftwareRenderer abort -> black AnTuTu 3D).
++       *
++       * A size test used to decide this instead, on the theory that large
++       * MAPPABLE surfaces are Unreal/AnTuTu swapchains. alloc-trace disproved
++       * that on this host: the swapchain requests are
++       * 1920x1080 scanout=true mappable=FALSE, while the only large MAPPABLE
++       * allocation is a 2560x1440 RGB565 scanout=false video surface. The
++       * gate therefore protected nothing and only broke CPU mapping.
++       *
++       * The old Pascal DEVICE_LOST came from creating the LINEAR image with
++       * COLOR_ATTACHMENT usage the driver does not advertise for LINEAR; that
++       * is now derived from drmFormatModifierTilingFeatures in
++       * vtest_gpu_alloc_image(), so honoring MAPPABLE is safe. */
 +      ret = vtest_gpu_alloc_cpu(width, height, drm_format, &stride, &size, &fd);
 +   } else {
 +      ret = vtest_gpu_alloc_gpu(width, height, drm_format, &stride, &modifier,
@@ -2124,7 +2558,7 @@ index f3212ad7..3a9cbbb3 100644
  int vtest_sync_export_sync_file(uint32_t length_dw)
  {
     struct vtest_context *ctx = vtest_get_current_context();
-@@ -2560,7 +2650,7 @@ int vtest_sync_export_sync_file(uint32_t length_dw)
+@@ -2560,7 +2677,7 @@ int vtest_sync_export_sync_file(uint32_t length_dw)
     return ret >= 0 ? 0 : ret;
  }
  
@@ -2133,7 +2567,7 @@ index f3212ad7..3a9cbbb3 100644
  {
     struct vtest_context *ctx = vtest_get_current_context();
     uint32_t *submit_cmd2_buf;
-@@ -2611,7 +2701,9 @@ int vtest_submit_cmd2(uint32_t length_dw)
+@@ -2611,7 +2728,9 @@ int vtest_submit_cmd2(uint32_t length_dw)
           return -EINVAL;
        }
  
@@ -2144,7 +2578,7 @@ index f3212ad7..3a9cbbb3 100644
        if (ret) {
           free(submit_cmd2_buf);
           return ret;
-@@ -2623,6 +2715,92 @@ int vtest_submit_cmd2(uint32_t length_dw)
+@@ -2623,6 +2742,134 @@ int vtest_submit_cmd2(uint32_t length_dw)
     return 0;
  }
  
@@ -2206,6 +2640,48 @@ index f3212ad7..3a9cbbb3 100644
 +   return ret >= 0 ? 0 : ret;
 +}
 +
++int vtest_memory_rw(uint32_t length_dw)
++{
++   struct vtest_context *ctx = vtest_get_current_context();
++   uint32_t cmd_buf[VCMD_MEMORY_RW_SIZE];
++   uint32_t resp_buf[VTEST_HDR_SIZE + 1];
++   int ret;
++
++   if (length_dw != ARRAY_SIZE(cmd_buf))
++      return -EINVAL;
++
++   ret = ctx->input->read(ctx->input, cmd_buf, sizeof(cmd_buf));
++   if (ret != sizeof(cmd_buf))
++      return -1;
++
++   const uint64_t mem_id =
++      cmd_buf[VCMD_MEMORY_RW_MEM_ID_LO] |
++      (uint64_t)cmd_buf[VCMD_MEMORY_RW_MEM_ID_HI] << 32;
++   const uint64_t offset =
++      cmd_buf[VCMD_MEMORY_RW_OFFSET_LO] |
++      (uint64_t)cmd_buf[VCMD_MEMORY_RW_OFFSET_HI] << 32;
++   const uint64_t size =
++      cmd_buf[VCMD_MEMORY_RW_SIZE_LO] |
++      (uint64_t)cmd_buf[VCMD_MEMORY_RW_SIZE_HI] << 32;
++   const uint32_t dir = cmd_buf[VCMD_MEMORY_RW_DIR];
++
++   int fd = vtest_receive_fd(ctx->input->data.fd);
++   if (fd < 0)
++      return report_failed_call("vtest_receive_fd", fd);
++
++   /* consumes fd */
++   ret = virgl_renderer_context_memory_rw(ctx->ctx_id, mem_id, offset, size,
++                                          dir, fd);
++
++   resp_buf[VTEST_CMD_LEN] = 1;
++   resp_buf[VTEST_CMD_ID] = VCMD_MEMORY_RW;
++   resp_buf[VTEST_CMD_DATA_START] = ret ? 1 : 0;
++   ret = vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf));
++
++   return ret >= 0 ? 0 : ret;
++}
++
++
 +int vtest_timeline_get(UNUSED uint32_t length_dw)
 +{
 +   struct vtest_context *ctx = vtest_get_current_context();
@@ -2238,12 +2714,16 @@ index f3212ad7..3a9cbbb3 100644
  
  int vtest_drm_sync_create(UNUSED uint32_t length_dw)
 diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
-index dcf1b192..6e1ea1d8 100644
+index dcf1b192..7018bf2e 100644
 --- a/vtest/vtest_server.c
 +++ b/vtest/vtest_server.c
-@@ -33,12 +33,16 @@
+@@ -31,14 +31,20 @@
+ #include <stdbool.h>
+ #include <unistd.h>
  #include <stdlib.h>
++#include <errno.h>
  #include <sys/types.h>
++#include <sys/wait.h>
  #include <sys/socket.h>
 +#include <sys/stat.h>
  #include <netinet/in.h>
@@ -2258,7 +2738,7 @@ index dcf1b192..6e1ea1d8 100644
  #include "util.h"
  #include "util/list.h"
  #include "util/u_math.h"
-@@ -52,6 +56,40 @@
+@@ -52,6 +58,59 @@
  #include <sys/select.h>
  #endif
  
@@ -2274,6 +2754,25 @@ index dcf1b192..6e1ea1d8 100644
 +   uint64_t ns[VTEST_STATS_MAX_CMDS];
 +   uint64_t polls;
 +} vtest_stats = { .period = -1 };
++
++/* Exit status a forked client process uses when the renderer it was serving is
++ * gone (a render worker died, or a new GPU context could not be created).
++ *
++ * Why this has to reach systemd: an NVIDIA class error (Xid 69) does not just
++ * fail one submission -- the whole device is poisoned for this process tree,
++ * and every later vkCreateDevice, even in a freshly forked worker, returns
++ * VK_ERROR_INITIALIZATION_FAILED.  A new child of the *same* server is
++ * therefore useless; only a new server recovers the GPU.  The main server
++ * (the systemd main PID) is the only process that can end the whole tree, so
++ * the code is propagated: worker -> client process -> main server -> exit.
++ * 69 is not an accident: it matches the Xid it exists to recover from.
++ */
++#define VTEST_EXIT_RENDERER_LOST 69
++
++/* Reaped by the main server's SIGCHLD handler.  Only flags are touched in the
++ * handler itself (async-signal-safe); all logging happens in the run loop. */
++static volatile sig_atomic_t vtest_child_renderer_lost;
++static volatile sig_atomic_t vtest_child_abnormal;
 +
 +static int64_t vtest_stats_now(void)
 +{
@@ -2299,7 +2798,34 @@ index dcf1b192..6e1ea1d8 100644
  enum vtest_client_result {
     VTEST_CLIENT_DISCONNECTED = 1,
     VTEST_CLIENT_ERROR_INPUT_READ,
-@@ -272,6 +310,13 @@ static void vtest_server_parse_args(int argc, char **argv)
+@@ -98,6 +157,11 @@ struct vtest_server
+    bool use_compat_profile;
+    bool drm;
+ 
++   /* Set by a client process when its renderer died; read by the main server,
++    * which turns it into its own exit status (see VTEST_EXIT_RENDERER_LOST). */
++   bool renderer_lost;
++   int exit_code;
++
+    int ctx_flags;
+ 
+    struct list_head new_clients;
+@@ -155,12 +219,12 @@ while (__AFL_LOOP(1000)) {
+ 
+ #ifdef __AFL_LOOP
+    if (!server.main_server) {
+-      exit(0);
++      exit(server.exit_code);
+    }
+ }
+ #endif
+ 
+-   return 0;
++   return server.exit_code;
+ }
+ 
+ #define OPT_NO_FORK 'f'
+@@ -272,6 +336,13 @@ static void vtest_server_parse_args(int argc, char **argv)
        server.multi_clients = false;
     }
  
@@ -2313,7 +2839,59 @@ index dcf1b192..6e1ea1d8 100644
     if (!server.no_virgl) {
        server.ctx_flags = VIRGL_RENDERER_USE_EGL;
        if (server.use_glx) {
-@@ -426,6 +471,11 @@ static void vtest_server_open_socket(void)
+@@ -324,6 +395,40 @@ static void handler(int sig, siginfo_t *si, void *unused)
+    exit(EXIT_FAILURE);
+ }
+ 
++/* The main server supervises one forked client process per connection, and its
++ * own lifetime is the signal to systemd that the renderer is gone.  It must
++ * therefore reap its children instead of ignoring SIGCHLD: with SIG_IGN the
++ * main process never learns that a client's renderer died, `active_clients` is
++ * always empty in --multi-clients mode (the forks own the clients), and the
++ * run loop's exit condition can never fire -- so the unit stays "running"
++ * forever with nothing behind it, Restart= never triggers, and a device-lost
++ * leaves the guest in a permanent SurfaceFlinger crash-loop with a black
++ * screen (issue #11).
++ *
++ * Only a child that exits with VTEST_EXIT_RENDERER_LOST escalates: a client
++ * disconnecting normally, or dying from a protocol error, must stay contained
++ * to that one guest client.
++ */
++static void vtest_server_child_handler(int sig)
++{
++   int saved_errno = errno;
++   int status;
++   pid_t pid;
++
++   (void)sig;
++
++   while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
++      if (WIFEXITED(status) && WEXITSTATUS(status) == VTEST_EXIT_RENDERER_LOST) {
++         vtest_child_renderer_lost = 1;
++      } else if (WIFSIGNALED(status) ||
++                 (WIFEXITED(status) && WEXITSTATUS(status) != 0)) {
++         vtest_child_abnormal = 1;
++      }
++   }
++
++   errno = saved_errno;
++}
++
+ static void vtest_server_set_signal_child(void)
+ {
+    struct sigaction sa;
+@@ -331,8 +436,8 @@ static void vtest_server_set_signal_child(void)
+ 
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+-   sa.sa_handler = SIG_IGN;
+-   sa.sa_flags = 0;
++   sa.sa_handler = vtest_server_child_handler;
++   sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+ 
+    ret = sigaction(SIGCHLD, &sa, NULL);
+    if (ret == -1) {
+@@ -426,6 +531,11 @@ static void vtest_server_open_socket(void)
        goto err;
     }
  
@@ -2325,7 +2903,19 @@ index dcf1b192..6e1ea1d8 100644
     return;
  
  err:
-@@ -525,6 +575,7 @@ static void vtest_server_dispatch_clients(void)
+@@ -469,6 +579,11 @@ static void vtest_server_wait_clients(void)
+ 
+    ret = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+    if (ret < 0) {
++      /* SIGCHLD always interrupts select(): a child exited, and the run loop
++       * decides what that means (see vtest_server_child_handler). */
++      if (errno == EINTR)
++         return;
++
+       perror("Failed to select on socket!");
+       exit(1);
+    }
+@@ -525,6 +640,7 @@ static void vtest_server_dispatch_clients(void)
        int ret;
  
        if (client->context_need_poll) {
@@ -2333,7 +2923,68 @@ index dcf1b192..6e1ea1d8 100644
           vtest_poll_context(client->context);
           client->context_need_poll = false;
        }
-@@ -732,8 +783,37 @@ static const struct vtest_command {
+@@ -537,6 +653,15 @@ static void vtest_server_dispatch_clients(void)
+       if (ret) {
+          fprintf(ret == VTEST_CLIENT_DISCONNECTED ? stdout : stderr, "client: %s\n",
+                  vtest_client_result_string(ret));
++
++         /* The renderer, not the protocol, failed: either the render server
++          * this client was talking to is gone, or the GPU refused to give it a
++          * device/context (which is what a poisoned device looks like).  That
++          * client will never render again, so escalate (issue #11). */
++         if (ret == VTEST_CLIENT_ERROR_COMMAND_DISPATCH ||
++             ret == VTEST_CLIENT_ERROR_CONTEXT_FAILED)
++            server.renderer_lost = true;
++
+          list_del(&client->head);
+          list_addtail(&client->head, &server.inactive_clients);
+       }
+@@ -658,6 +783,10 @@ static void vtest_server_run(void)
+                                        server.ctx_flags,
+                                        server.render_device);
+          if (ret) {
++            /* No renderer could be created for this client at all -- on a
++             * poisoned device this is the steady state until the server is
++             * replaced, so escalate rather than exit quietly. */
++            server.renderer_lost = true;
+             vtest_server_inactivate_clients();
+             run = false;
+          }
+@@ -672,6 +801,33 @@ static void vtest_server_run(void)
+             run = false;
+          }
+       }
++
++      /* This process has no working renderer left (see renderer_lost above).
++       * A client process reports it and exits with the contract status so the
++       * main server can end the whole unit. */
++      if (server.renderer_lost) {
++         server.exit_code = VTEST_EXIT_RENDERER_LOST;
++         run = false;
++      }
++
++      /* The main server is the systemd main PID: exiting non-zero is the only
++       * way to get a fresh process tree with an unpoisoned GPU.  Called out
++       * loudly because it takes the guest's SurfaceFlinger down with it. */
++      if (server.main_server && vtest_child_renderer_lost) {
++         fprintf(stderr, "vtest: a client renderer was lost -- exiting with "
++                         "status %d so the service restarts with a clean GPU\n",
++                 VTEST_EXIT_RENDERER_LOST);
++         server.exit_code = VTEST_EXIT_RENDERER_LOST;
++         run = false;
++      }
++
++      /* Anything else (a client that segfaulted, a client killed by a signal)
++       * stays contained to that client -- log it, do not take the stack down. */
++      if (server.main_server && vtest_child_abnormal) {
++         vtest_child_abnormal = 0;
++         fprintf(stderr, "vtest: a client process died unexpectedly "
++                         "(contained, server keeps running)\n");
++      }
+    }
+ 
+    vtest_server_close_socket();
+@@ -732,8 +888,38 @@ static const struct vtest_command {
     HANDLER(RESOURCE_EXPORT_FD,          resource_export_fd,        true   ),
     HANDLER(SYNC_EXPORT_SYNC_FILE,       sync_export_sync_file,     true   ),
     HANDLER(RESOURCE_IMPORT_BLOB,        resource_import_blob,      true   ),
@@ -2341,6 +2992,7 @@ index dcf1b192..6e1ea1d8 100644
 +   HANDLER(TIMELINE_GET,                timeline_get,              true   ),
 +   HANDLER(SUBMIT_CMD2_TIMELINE,        submit_cmd2_timeline,      true   ),
 +   HANDLER(SEMAPHORE_IMPORT_SYNC_FD,    semaphore_import_sync_fd,  true   ),
++   HANDLER(MEMORY_RW,                   memory_rw,                 true   ),
  };
  
 +static void vtest_stats_dump(void)
@@ -2371,7 +3023,7 @@ index dcf1b192..6e1ea1d8 100644
  static int vtest_client_dispatch_commands(struct vtest_client *client)
  {
     TRACE_FUNC();
-@@ -766,6 +846,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
+@@ -766,6 +952,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
  
     vtest_poll_resource_busy_wait();
     if (header[1] <= 0 || header[1] >= ARRAY_SIZE(vtest_commands)) {
@@ -2380,7 +3032,21 @@ index dcf1b192..6e1ea1d8 100644
        return VTEST_CLIENT_ERROR_COMMAND_ID;
     }
  
-@@ -785,8 +867,30 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
+@@ -778,6 +966,13 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
+    if (cmd->init_context) {
+       ret = vtest_lazy_init_context(client->context);
+       if (ret) {
++         /* A guest that asks for something this build cannot serve (protocol
++          * version too low) is that guest's problem and must not take the
++          * stack down.  A renderer that refuses to create the context is not:
++          * on a device poisoned by a class error this is the steady state and
++          * the server has to be replaced (issue #11). */
++         if (ret == VTEST_CONTEXT_INIT_RENDERER_FAILED)
++            server.renderer_lost = true;
+          return VTEST_CLIENT_ERROR_CONTEXT_FAILED;
+       }
+       client->context_poll_fd = vtest_get_context_poll_fd(client->context);
+@@ -785,8 +980,30 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
  
     vtest_set_current_context(client->context);
  
