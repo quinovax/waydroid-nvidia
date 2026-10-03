@@ -13,7 +13,7 @@
 #   pkexec ./packaging/install-from-release.sh --local "$PWD" --skip-build   # deploy this checkout
 set -euo pipefail
 
-REPO_URL="https://github.com/CinQwQeggs01/waydroid-nvidia"
+REPO_URL="https://github.com/quinovax/waydroid-nvidia"
 WAYDROID_UPSTREAM="https://github.com/waydroid/waydroid.git"
 PREFIX="/usr/lib/waydroid-nvidia"
 TAG=""
@@ -23,7 +23,7 @@ SKIP_BUILD=0
 # ANGLE / hwcomposer / surfaceflinger are built on a self-hosted runner this
 # fork does not have. When a tag ships without guest-prebuilts, reuse this
 # repository's last release that includes them.
-PREBUILTS_FALLBACK_URL="https://github.com/CinQwQeggs01/waydroid-nvidia/releases/download/v0.1.1"
+PREBUILTS_FALLBACK_URL="https://github.com/quinovax/waydroid-nvidia/releases/download/v0.1.1"
 PREBUILTS_FALLBACK_FILE="waydroid-nvidia-guest-prebuilts-v0.1.1.tar.gz"
 PREBUILTS_FALLBACK_SHA256="31a76fe8f811295ef9ccbd5ffb7005249978a128ce0cf95e32148c3de11515d7"
 
@@ -393,7 +393,7 @@ if [ "$SKIP_BUILD" -eq 0 ] && [ -z "$TAG" ]; then
               | grep -v '\^{}' | head -1 | sed 's/.*refs\/tags\///')
     else
         # release mode with no tag: use latest release
-        TAG=$(curl -fsSL "https://api.github.com/repos/CinQwQeggs01/waydroid-nvidia/releases/latest" | \
+        TAG=$(curl -fsSL "https://api.github.com/repos/quinovax/waydroid-nvidia/releases/latest" | \
               grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//' | sed 's/".*//')
     fi
     [ -n "$TAG" ] || die "could not determine tag (no releases? use --tag or --source)"

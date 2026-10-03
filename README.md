@@ -4,8 +4,8 @@
 Works with the proprietary NVIDIA kernel module; the open kernel module
 (`nvidia-open`) is optional and has no advantage for DMA-BUF on this stack.**
 
-[![build](https://github.com/CinQwQeggs01/waydroid-nvidia/actions/workflows/build.yml/badge.svg)](https://github.com/CinQwQeggs01/waydroid-nvidia/actions/workflows/build.yml)
-[![release](https://img.shields.io/github/v/release/CinQwQeggs01/waydroid-nvidia)](https://github.com/CinQwQeggs01/waydroid-nvidia/releases)
+[![build](https://github.com/quinovax/waydroid-nvidia/actions/workflows/build.yml/badge.svg)](https://github.com/quinovax/waydroid-nvidia/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/quinovax/waydroid-nvidia)](https://github.com/quinovax/waydroid-nvidia/releases)
 
 ## Highlights
 
@@ -93,7 +93,7 @@ it still crashes and can take the host session with it (gamescope#1590).
 ### Install from the latest release (recommended)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/quinovax/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash
 # or, from a checkout, without sudo:
 #   ./pkexec-install.sh
 ```
@@ -106,7 +106,7 @@ SELinux policy (rpm family).
 To install a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/CinQwQeggs01/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash -s -- --tag v0.1.1
+curl -fsSL https://raw.githubusercontent.com/quinovax/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash -s -- --tag v0.1.1
 ```
 
 ### Install from a tag (build from source)
@@ -115,7 +115,7 @@ When a tag exists but no release has been published yet (pre-built tarballs
 are uploaded manually and may lag behind tags), you can build from source:
 
 ```sh
-git clone https://github.com/CinQwQeggs01/waydroid-nvidia.git
+git clone https://github.com/quinovax/waydroid-nvidia.git
 cd waydroid-nvidia
 sudo ./packaging/install-from-release.sh --source --tag v0.1.0
 ```

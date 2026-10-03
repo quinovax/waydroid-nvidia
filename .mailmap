@@ -1,0 +1,19 @@
+# .mailmap — canonical author/committer identity for this repository.
+#
+# The maintainer renamed their GitHub account from CinQwQeggs01 to QuinOvaX.
+# GitHub attributes commits to an account by *email*, and the contributors
+# graph shows the account's current login — so the rename already fixes how
+# the project page reads. This file only normalises the names shown by
+# `git log`, `git shortlog`, `git blame` and `git describe` locally.
+#
+# It does NOT rewrite history and does NOT touch existing (signed) commits.
+# See: https://git-scm.com/docs/gitmailmap
+#
+# Syntax: Proper Name <proper@email> Commit Name <commit@email>
+
+# Canonical identity.
+QuinOvaX <cinqwqeggs01@outlook.com> <cinqwqeggs01@outlook.com>
+
+# Pre-rename account display names (same verified account email).
+QuinOvaX <cinqwqeggs01@outlook.com> CinQwQeggs01 <cinqwqeggs01@outlook.com>
+QuinOvaX <cinqwqeggs01@outlook.com> CinQwQeggs <3544861138@qq.com>
