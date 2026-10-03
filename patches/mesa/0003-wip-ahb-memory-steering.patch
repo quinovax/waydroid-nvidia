@@ -1,8 +1,8 @@
 diff --git a/src/virtio/vtest/vtest_protocol.h b/src/virtio/vtest/vtest_protocol.h
-index c8a1bbfaacf..c622c5b629d 100644
+index c8a1bbfaacf..920e924d2b3 100644
 --- a/src/virtio/vtest/vtest_protocol.h
 +++ b/src/virtio/vtest/vtest_protocol.h
-@@ -98,6 +98,22 @@
+@@ -98,6 +98,29 @@
  #define VCMD_SYNC_EXPORT_SYNC_FILE 39
  /* import a dmabuf fd as a blob resource attached to the context */
  #define VCMD_RESOURCE_IMPORT_BLOB 40
@@ -22,10 +22,17 @@ index c8a1bbfaacf..c622c5b629d 100644
 + * ring submission that waits on the semaphore
 + */
 +#define VCMD_SEMAPHORE_IMPORT_SYNC_FD 44
++/* copy HOST_VISIBLE VkDeviceMemory through guest shm. NVIDIA dma_buf mmap
++ * is write-combined even for HOST_CACHED types. payload uint32[7] =
++ * { mem_id_lo, mem_id_hi, offset_lo, offset_hi, size_lo, size_hi, dir }
++ * dir 0 = host→guest, 1 = guest→host; one SCM_RIGHTS fd = guest shm
++ */
++#define VCMD_MEMORY_RW 45
++
  
  #define VCMD_RES_CREATE_SIZE 10
  #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
-@@ -170,6 +186,10 @@ enum vcmd_param  {
+@@ -170,6 +193,10 @@ enum vcmd_param  {
     VCMD_PARAM_HAS_TIMELINE_SYNCOBJ = 2,
     /* server supports VCMD_SYNC_EXPORT_SYNC_FILE for venus sync points */
     VCMD_PARAM_HAS_VENUS_SYNC_FD = 3,
@@ -36,6 +43,22 @@ index c8a1bbfaacf..c622c5b629d 100644
  };
  #define VCMD_GET_PARAM_SIZE 1
  #define VCMD_GET_PARAM_PARAM 0
+@@ -371,5 +398,15 @@ struct vcmd_submit_cmd2_batch {
+ #define VCMD_RESOURCE_EXPORT_FD_SIZE 1
+ #define VCMD_RESOURCE_EXPORT_FD_RES_HANDLE 0
+ /* rsp fd */
++#define VCMD_MEMORY_RW_SIZE 7
++#define VCMD_MEMORY_RW_MEM_ID_LO 0
++#define VCMD_MEMORY_RW_MEM_ID_HI 1
++#define VCMD_MEMORY_RW_OFFSET_LO 2
++#define VCMD_MEMORY_RW_OFFSET_HI 3
++#define VCMD_MEMORY_RW_SIZE_LO 4
++#define VCMD_MEMORY_RW_SIZE_HI 5
++#define VCMD_MEMORY_RW_DIR 6
++/* followed by 1 fd; resp status dword (0 = ok) */
++
+ 
+ #endif /* VTEST_PROTOCOL */
 diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
 index 02a3d371e75..2468e348767 100644
 --- a/src/virtio/vulkan/meson.build
@@ -401,6 +424,76 @@ index a5099e9236d..3b2ffd7725c 100644
  };
  
  struct vn_query_feedback_cmd;
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index 603cf3f8b34..d5524676a17 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -270,8 +270,10 @@ vn_relax(struct vn_relax_state *state)
+       struct vn_ring *ring = instance->ring.ring;
+       const uint32_t status = vn_ring_load_status(ring);
+       if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
+-         vn_log(instance, "aborting on ring fatal error at iter %d", *iter);
+-         abort();
++         vn_log(instance, "ring fatal at iter %d; failing the wait, not abort()",
++                *iter);
++         state->give_up = true;
++         return;
+       }
+ 
+       struct vn_watchdog *watchdog = &instance->ring.watchdog;
+@@ -279,15 +281,18 @@ vn_relax(struct vn_relax_state *state)
+       if (vn_watchdog_acquire(watchdog, alive))
+          vn_ring_unset_status_bits(ring, VK_RING_STATUS_ALIVE_BIT_MESA);
+ 
+-      if (vn_watchdog_timeout(watchdog) && !VN_DEBUG(NO_ABORT)) {
+-         vn_log(instance, "aborting on expired ring alive status at iter %d",
++      if (vn_watchdog_timeout(watchdog)) {
++         vn_log(instance, "ring alive expired at iter %d; failing the wait, not abort()",
+                 *iter);
+-         abort();
++         state->give_up = true;
++         return;
+       }
+ 
+-      if (*iter >= (1 << abort_order) && !VN_DEBUG(NO_ABORT)) {
+-         vn_log(instance, "aborting");
+-         abort();
++      if (*iter >= (1 << abort_order)) {
++         vn_log(instance, "ring wait exhausted at iter %d; failing the wait, not abort()",
++                *iter);
++         state->give_up = true;
++         return;
+       }
+    }
+ 
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index 12789dc939a..1bd0b4b5128 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -275,6 +275,10 @@ struct vn_relax_state {
+    const struct vn_relax_profile profile;
+    const char *reason_str;
+    bool warn;
++   /* ring FATAL / watchdog / exhausted wait: callers must stop spinning
++    * and fail the Vulkan call. abort() here used to SIGABRT Unreal (AnTuTu
++    * 3D) and Unity when the host worker already DEVICE_LOSTed. */
++   bool give_up;
+ };
+ 
+ /* TLS ring
+@@ -429,6 +433,12 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason);
+ void
+ vn_relax(struct vn_relax_state *state);
+ 
++static inline bool
++vn_relax_gave_up(const struct vn_relax_state *state)
++{
++   return state->give_up;
++}
++
+ void
+ vn_relax_fini(struct vn_relax_state *state);
+ 
 diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
 index f7a1f1cc6a0..5f2c0ff5048 100644
 --- a/src/virtio/vulkan/vn_device.c
@@ -529,7 +622,7 @@ index e8715649232..f4c7cc583bd 100644
     bool has_sync2;
  
 diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
-index 8b6eb4cce18..38e1511149e 100644
+index 8b6eb4cce18..409fa5a54a9 100644
 --- a/src/virtio/vulkan/vn_device_memory.c
 +++ b/src/virtio/vulkan/vn_device_memory.c
 @@ -8,6 +8,9 @@
@@ -542,7 +635,7 @@ index 8b6eb4cce18..38e1511149e 100644
  #include "vn_device_memory.h"
  
  #include "venus-protocol/vn_protocol_driver_device_memory.h"
-@@ -374,6 +377,41 @@ vn_AllocateMemory(VkDevice device,
+@@ -374,12 +377,101 @@ vn_AllocateMemory(VkDevice device,
  {
     struct vn_device *dev = vn_device_from_handle(device);
  
@@ -551,31 +644,79 @@ index 8b6eb4cce18..38e1511149e 100644
 +    * on NVIDIA that mapping is ~1 GB/s write / 0.2 GB/s read for the
 +    * uncached-coherent type but ~31 / 7.5 GB/s for the cached one
 +    * (tests/nvmembench.c). Both are HOST_COHERENT, so no flush-semantics
-+    * change; skip imports and dedicated allocations whose memoryTypeBits we
-+    * cannot see here.
++    * change.
++    *
++    * Dedicated *images* with OPTIMAL / modifier tiling are skipped (scanout
++    * layout is type-sensitive). Dedicated *LINEAR images* and *buffers* are
++    * steered: Geekbench Horizon/Face maps dedicated HOST_VISIBLE LINEAR
++    * readback, and uncached dma_buf mmap is the 5–27× hole vs vkMapMemory.
 +    */
 +   VkMemoryAllocateInfo steered_info;
++   const VkMemoryDedicatedAllocateInfo *dedicated = vk_find_struct_const(
++      pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
++   bool skip_dedicated_image = dedicated && dedicated->image;
++   VkImageTiling skip_tiling = VK_IMAGE_TILING_OPTIMAL;
++   if (skip_dedicated_image) {
++      struct vn_image *dimg = vn_image_from_handle(dedicated->image);
++      if (dimg) {
++         skip_tiling = dimg->base.vk.tiling;
++         if (skip_tiling == VK_IMAGE_TILING_LINEAR)
++            skip_dedicated_image = false;
++      }
++   }
++   if (skip_dedicated_image) {
++      static bool skip_logged;
++      if (!skip_logged) {
++         mesa_loge("NVWD: skip dedicated image tiling %u",
++                   (unsigned)skip_tiling);
++         skip_logged = true;
++      }
++   }
 +   if (!vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR) &&
 +       !vk_find_struct_const(pAllocateInfo->pNext,
 +                             IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID) &&
-+       !vk_find_struct_const(pAllocateInfo->pNext,
-+                             MEMORY_DEDICATED_ALLOCATE_INFO)) {
++       !skip_dedicated_image) {
 +      const VkPhysicalDeviceMemoryProperties *props =
 +         &dev->physical_device->memory_properties;
 +      const uint32_t idx = pAllocateInfo->memoryTypeIndex;
 +      const VkMemoryType *cur = &props->memoryTypes[idx];
 +      if ((cur->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
 +          !(cur->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
++         /* Prefer a same-heap cached sibling. If none (NVIDIA BAR1 is
++          * DEVICE_LOCAL|HOST_VISIBLE|COHERENT with no cached type on that
++          * heap), take any HOST_VISIBLE|HOST_COHERENT|HOST_CACHED type.
++          * GB6 Horizon/Face map dedicated HOST_VISIBLE readback; BAR1
++          * dma_buf mmap is ~0.2 GB/s vs ~7.5 GB/s cached sysmem.
++          */
++         int32_t best = -1;
 +         for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
 +            const VkMemoryType *cand = &props->memoryTypes[i];
-+            if (cand->heapIndex == cur->heapIndex &&
-+                (cand->propertyFlags &
-+                 (cur->propertyFlags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
-+                   (cur->propertyFlags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
-+               steered_info = *pAllocateInfo;
-+               steered_info.memoryTypeIndex = i;
-+               pAllocateInfo = &steered_info;
++            const VkMemoryPropertyFlags need =
++               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++               VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++            if ((cand->propertyFlags & need) != need)
++               continue;
++            if (cand->heapIndex == cur->heapIndex) {
++               best = (int32_t)i;
 +               break;
++            }
++            if (best < 0)
++               best = (int32_t)i;
++         }
++         if (best >= 0 && (uint32_t)best != idx) {
++            steered_info = *pAllocateInfo;
++            steered_info.memoryTypeIndex = (uint32_t)best;
++            pAllocateInfo = &steered_info;
++            {
++               static bool logged;
++               if (!logged) {
++                  mesa_loge("NVWD: steered HOST_VISIBLE type %u heap %u -> "
++                            "HOST_CACHED type %u heap %u",
++                            idx, cur->heapIndex, (uint32_t)best,
++                            props->memoryTypes[best].heapIndex);
++                  logged = true;
++               }
 +            }
 +         }
 +      }
@@ -584,7 +725,119 @@ index 8b6eb4cce18..38e1511149e 100644
     struct vn_device_memory *mem = vk_device_memory_create(
        &dev->base.vk, pAllocateInfo, pAllocator, sizeof(*mem));
     if (!mem)
-@@ -584,6 +622,54 @@ vn_GetMemoryFdKHR(VkDevice device,
+       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
++   /* Bounce is a memcpy snapshot. Live dma_buf mmap stays for buffers and
++    * OPTIMAL/modifier images so SF/HWUI textures stay valid. */
++   mem->bounce_ok =
++      dedicated && dedicated->image && !skip_dedicated_image &&
++      !mem->base.vk.ahardware_buffer && !mem->base.vk.export_handle_types;
++
+ 
+    const VkImportMemoryFdInfoKHR *import_fd_info =
+       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+@@ -408,6 +500,32 @@ vn_AllocateMemory(VkDevice device,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++vn_device_memory_bounce_rw(struct vn_device *dev,
++                           struct vn_device_memory *mem,
++                           uint32_t dir)
++{
++   if (!mem->map_shmem || mem->map_shmem->mmap_fd < 0 ||
++       !dev->renderer->ops.memory_rw)
++      return VK_ERROR_MEMORY_MAP_FAILED;
++   return dev->renderer->ops.memory_rw(dev->renderer, mem->base.id,
++                                       mem->map_offset, mem->map_size, dir,
++                                       mem->map_shmem->mmap_fd);
++}
++
++static void
++vn_device_memory_bounce_release(struct vn_device *dev,
++                                struct vn_device_memory *mem,
++                                bool upload)
++{
++   if (!mem->map_shmem)
++      return;
++   if (upload)
++      vn_device_memory_bounce_rw(dev, mem, 1);
++   vn_renderer_shmem_unref(dev->renderer, mem->map_shmem);
++   mem->map_shmem = NULL;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ vn_FreeMemory(VkDevice device,
+               VkDeviceMemory memory,
+@@ -418,6 +536,8 @@ vn_FreeMemory(VkDevice device,
+    if (!mem)
+       return;
+ 
++   vn_device_memory_bounce_release(dev, mem, true);
++
+    vn_device_memory_emit_report(dev, mem, /* is_alloc */ false, VK_SUCCESS);
+ 
+    /* ensure renderer side import still sees the resource */
+@@ -451,6 +571,8 @@ vn_MapMemory2(VkDevice device,
+    const VkDeviceSize offset = pMemoryMapInfo->offset;
+    const VkDeviceSize size = pMemoryMapInfo->size;
+    const struct vk_device_memory *mem_vk = &mem->base.vk;
++   const VkMemoryType *mem_type = &dev->physical_device->memory_properties
++                                     .memoryTypes[mem_vk->memory_type_index];
+    const bool need_bo = !mem->base_bo;
+    void *placed_addr = NULL;
+    void *ptr = NULL;
+@@ -481,6 +603,37 @@ vn_MapMemory2(VkDevice device,
+       placed_addr = placed_info->pPlacedAddress;
+    }
+ 
++   const bool host_visible =
++      (mem_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
++   const bool exported = mem_vk->export_handle_types ||
++                         mem_vk->ahardware_buffer;
++   const VkDeviceSize map_size =
++      size == VK_WHOLE_SIZE ? mem_vk->size - offset : size;
++   if (!placed_addr && host_visible && !exported && mem->bounce_ok &&
++       dev->renderer->ops.memory_rw && map_size) {
++      struct vn_renderer_shmem *shmem =
++         vn_renderer_shmem_create(dev->renderer, map_size);
++      if (shmem && shmem->mmap_fd >= 0 && shmem->mmap_ptr) {
++         mem->map_shmem = shmem;
++         mem->map_offset = offset;
++         mem->map_size = map_size;
++         result = vn_device_memory_bounce_rw(dev, mem, 0);
++         if (result == VK_SUCCESS) {
++            static bool logged;
++            if (!logged) {
++               mesa_loge("NVWD: MapMemory bounce shmem (dma_buf mmap is WC)");
++               logged = true;
++            }
++            mem->map_end = offset + map_size;
++            *ppData = shmem->mmap_ptr;
++            return VK_SUCCESS;
++         }
++         vn_device_memory_bounce_release(dev, mem, false);
++      } else if (shmem) {
++         vn_renderer_shmem_unref(dev->renderer, shmem);
++      }
++   }
++
+    ptr = vn_renderer_bo_map(dev->renderer, mem->base_bo, placed_addr);
+    if (!ptr) {
+       /* vn_renderer_bo_map implies a roundtrip on success, but not here. */
+@@ -506,6 +659,10 @@ vn_MapMemory2(VkDevice device,
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vn_UnmapMemory2(VkDevice device, const VkMemoryUnmapInfo *pMemoryUnmapInfo)
+ {
++   struct vn_device *dev = vn_device_from_handle(device);
++   struct vn_device_memory *mem =
++      vn_device_memory_from_handle(pMemoryUnmapInfo->memory);
++   vn_device_memory_bounce_release(dev, mem, true);
+    return VK_SUCCESS;
+ }
+ 
+@@ -584,6 +741,54 @@ vn_GetMemoryFdKHR(VkDevice device,
     return VK_SUCCESS;
  }
  
@@ -639,7 +892,7 @@ index 8b6eb4cce18..38e1511149e 100644
  VkResult
  vn_get_memory_dma_buf_properties(struct vn_device *dev,
                                   int fd,
-@@ -591,6 +677,13 @@ vn_get_memory_dma_buf_properties(struct vn_device *dev,
+@@ -591,6 +796,13 @@ vn_get_memory_dma_buf_properties(struct vn_device *dev,
  {
     VkDevice device = vn_device_to_handle(dev);
  
@@ -653,7 +906,7 @@ index 8b6eb4cce18..38e1511149e 100644
     struct vn_renderer_bo *bo;
     VkResult result = vn_renderer_bo_create_from_dma_buf(
        dev->renderer, 0 /* size */, fd, 0 /* flags */, &bo);
-@@ -614,6 +707,9 @@ vn_get_memory_dma_buf_properties(struct vn_device *dev,
+@@ -614,6 +826,9 @@ vn_get_memory_dma_buf_properties(struct vn_device *dev,
  
     *out_mem_type_bits = props.memoryTypeBits;
  
@@ -663,8 +916,28 @@ index 8b6eb4cce18..38e1511149e 100644
     return VK_SUCCESS;
  }
  
+diff --git a/src/virtio/vulkan/vn_device_memory.h b/src/virtio/vulkan/vn_device_memory.h
+index d2b74b297fe..c835f374893 100644
+--- a/src/virtio/vulkan/vn_device_memory.h
++++ b/src/virtio/vulkan/vn_device_memory.h
+@@ -49,6 +49,15 @@ struct vn_device_memory {
+ 
+    VkDeviceSize map_end;
+ 
++   /* vtest HOST_VISIBLE bounce: shmem + VCMD_MEMORY_RW, not dma_buf mmap.
++    * Snapshot, not a live mapping — only dedicated LINEAR readbacks (GB6).
++    */
++   bool bounce_ok;
++   struct vn_renderer_shmem *map_shmem;
++   VkDeviceSize map_offset;
++   VkDeviceSize map_size;
++
++
+    /* only valid when wsi platform is used */
+    struct vn_image *dedicated_img;
+ };
 diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
-index 5d4f9168e47..c669c7ca411 100644
+index 5d4f9168e47..6838fdaf5cd 100644
 --- a/src/virtio/vulkan/vn_image.c
 +++ b/src/virtio/vulkan/vn_image.c
 @@ -8,8 +8,11 @@
@@ -679,12 +952,13 @@ index 5d4f9168e47..c669c7ca411 100644
  #include "venus-protocol/vn_protocol_driver_image.h"
  #include "venus-protocol/vn_protocol_driver_image_view.h"
  #include "venus-protocol/vn_protocol_driver_sampler.h"
-@@ -606,7 +609,35 @@ vn_CreateImage(VkDevice device,
+@@ -606,7 +609,36 @@ vn_CreateImage(VkDevice device,
              pCreateInfo, renderer_handle_type, &local_info);
        }
  
-+      /* ASTC emulation: back the image with an RGBA host image; uploads are
-+       * decoded by compute (vn_astc_emu.c). Only plain 2D non-external
++      /* ASTC emulation: back the image with RGBA UNORM (never SRGB+STORAGE;
++       * NVIDIA returns FORMAT_NOT_SUPPORTED for that). Uploads are decoded
++       * by compute (vn_astc_emu.c). Only plain 2D non-external OPTIMAL
 +       * images are emulated.
 +       */
 +      VkImageCreateInfo astc_local_info;
@@ -715,29 +989,36 @@ index 5d4f9168e47..c669c7ca411 100644
     }
  
     if (result != VK_SUCCESS)
-@@ -820,6 +851,27 @@ vn_CreateImageView(VkDevice device,
+@@ -820,6 +852,34 @@ vn_CreateImageView(VkDevice device,
        assert(pCreateInfo->format != VK_FORMAT_UNDEFINED);
     }
  
-+   /* ASTC emulation: the host image is RGBA */
++   /* ASTC emulation: the host image is RGBA UNORM. App ASTC / SRGB views
++    * are rewritten; UINT storage views (decode) keep STORAGE usage.
++    */
 +   VkImageViewUsageCreateInfo astc_usage_info;
-+   if (img->astc_emulated &&
-+       vn_astc_emu_format(pCreateInfo->format)) {
-+      local_info = *pCreateInfo;
-+      local_info.format = vn_astc_emu_get_rgba_format(pCreateInfo->format);
-+      /* the image gained STORAGE for the decode pass; app views (esp. SRGB)
-+       * must not inherit it
-+       */
-+      if (!vk_find_struct_const(pCreateInfo->pNext,
-+                                IMAGE_VIEW_USAGE_CREATE_INFO)) {
-+         astc_usage_info = (VkImageViewUsageCreateInfo){
-+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-+            .pNext = local_info.pNext,
-+            .usage = img->astc_app_usage,
-+         };
-+         local_info.pNext = &astc_usage_info;
++   if (img->astc_emulated) {
++      VkFormat view_fmt = pCreateInfo->format;
++      if (vn_astc_emu_format(view_fmt))
++         view_fmt = vn_astc_emu_get_rgba_format(view_fmt);
++      const bool need_usage =
++         !vk_find_struct_const(pCreateInfo->pNext,
++                               IMAGE_VIEW_USAGE_CREATE_INFO);
++      if (view_fmt != pCreateInfo->format || need_usage) {
++         local_info = *pCreateInfo;
++         local_info.format = view_fmt;
++         if (need_usage) {
++            astc_usage_info = (VkImageViewUsageCreateInfo){
++               .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
++               .pNext = local_info.pNext,
++               .usage = (view_fmt == VK_FORMAT_R8G8B8A8_UINT)
++                           ? VK_IMAGE_USAGE_STORAGE_BIT
++                           : img->astc_app_usage,
++            };
++            local_info.pNext = &astc_usage_info;
++         }
++         pCreateInfo = &local_info;
 +      }
-+      pCreateInfo = &local_info;
 +   }
 +
     struct vn_image_view *view =
@@ -760,8 +1041,31 @@ index 74bdeeda3b9..43af19701db 100644
  };
  VK_DEFINE_NONDISP_HANDLE_CASTS(vn_image,
                                 base.vk.base,
+diff --git a/src/virtio/vulkan/vn_instance.c b/src/virtio/vulkan/vn_instance.c
+index 773a491e33d..6b9064428ce 100644
+--- a/src/virtio/vulkan/vn_instance.c
++++ b/src/virtio/vulkan/vn_instance.c
+@@ -129,10 +129,14 @@ vn_instance_init_ring(struct vn_instance *instance)
+    /* 32-bit seqno for renderer roundtrips */
+    static const size_t extra_size = sizeof(uint32_t);
+ 
+-   /* default instance ring size */
+-   static const size_t buf_size = 128 * 1024;
+-
+-   /* order of 4 for performant async cmd enqueue */
++   /* Unreal/AnTuTu 3D posts large vkUpdateDescriptorSets bursts. 128 KiB
++    * filled while the renderer was Xid-stalled, then wait_space timed out
++    * and write_buffer aborted the RHIThread. 1 MiB + indirect upload for
++    * cmds > direct_size (64 KiB) keeps the ring moving.
++    */
++   static const size_t buf_size = 1024 * 1024;
++
++   /* order of 4 for performant async cmd enqueue (direct_size = 64 KiB) */
+    static const uint8_t direct_order = 4;
+ 
+    struct vn_ring_layout layout;
 diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
-index 7ee58ac8805..9d254e18a43 100644
+index 7ee58ac8805..0596d776488 100644
 --- a/src/virtio/vulkan/vn_physical_device.c
 +++ b/src/virtio/vulkan/vn_physical_device.c
 @@ -8,8 +8,13 @@
@@ -778,7 +1082,7 @@ index 7ee58ac8805..9d254e18a43 100644
  #include <stdio.h>
  
  #include "git_sha1.h"
-@@ -431,6 +436,16 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
+@@ -431,6 +436,25 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
      */
     feats->deviceMemoryReport = true;
  
@@ -786,7 +1090,16 @@ index 7ee58ac8805..9d254e18a43 100644
 +    * decoded to RGBA by compute (vn_astc_emu.c). Android requires the
 +    * feature, so Vulkan-native games blindly rely on it.
 +    */
++   /* Off by default. Enabling it makes the driver advertise
++    * textureCompressionASTC_LDR, which switches clients (Unreal/AnTuTu 3D,
++    * Unity) onto a compressed-texture path whose emulated images fault the
++    * NVIDIA TEX unit (Xid 13 "TEX LAYOUT", class 0xC197) and kill the
++    * context. With the feature absent those clients fall back cleanly to
++    * uncompressed textures and run. Opt in with VN_ASTC_EMU=1 once the
++    * emulated image/view layout is fixed.
++    */
 +   if (!feats->textureCompressionASTC_LDR &&
++       debug_get_bool_option("VN_ASTC_EMU", false) &&
 +       !debug_get_bool_option("VN_NO_ASTC_EMU", false)) {
 +      physical_dev->emu_astc_ldr = true;
 +      feats->textureCompressionASTC_LDR = true;
@@ -795,7 +1108,57 @@ index 7ee58ac8805..9d254e18a43 100644
     /* VK_EXT_map_memory_placed */
     if (supported_exts->EXT_map_memory_placed) {
        feats->memoryMapPlaced = true;
-@@ -1018,6 +1033,26 @@ vn_physical_device_init_memory_properties(
+@@ -549,33 +573,29 @@ vn_physical_device_sanitize_properties(struct vn_physical_device *physical_dev)
+       props->apiVersion = ver;
+    }
+ 
+-   /* ANGLE relies on ARM proprietary driver version for workarounds */
+-   const char *engine_name = instance->base.vk.app_info.engine_name;
+-   const bool forward_driver_version =
+-      props->driverID == VK_DRIVER_ID_ARM_PROPRIETARY && engine_name &&
+-      strcmp(engine_name, "ANGLE") == 0;
+-   if (!forward_driver_version)
+-      props->driverVersion = vk_get_driver_version();
++   /* Keep the host driverVersion. Replacing it with Mesa's packed version
++    * made ANGLE's GL_RENDERER "venus-<mesaver>"; AnTuTu 11 hangs on that.
++    * ARM+ANGLE workarounds already want the host version.
++    */
+ 
+    physical_dev->wa_min_fb_align = strstr(props->deviceName, "JSL") ? 128 : 1;
+ 
+-   char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+-   int device_name_len = snprintf(device_name, sizeof(device_name),
+-                                  "Virtio-GPU Venus (%s)", props->deviceName);
+-   if (device_name_len >= VK_MAX_PHYSICAL_DEVICE_NAME_SIZE) {
+-      memcpy(device_name + VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 5, "...)", 4);
+-      device_name_len = VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1;
++   /* Keep the host GPU name *and* the host driverName/driverInfo/version.
++    * Prefixing "Virtio-GPU Venus (...)" or advertising driverName "venus"
++    * makes ANGLE's GL_RENDERER look like a virtual GPU
++    * ("venus-<mesaver>"); AnTuTu 11 then hangs on ABenchMarkStart.
++    * force_vk_devicename still wins when set.
++    *
++    * driverID stays MESA_VENUS so Venus-aware clients can still identify
++    * the ICD; ANGLE builds GL_RENDERER from driverName + driverVersion.
++    */
++   if (strlen(instance->drirc.debug.force_vk_devicename) > 0) {
++      snprintf(props->deviceName, sizeof(props->deviceName), "%s",
++               instance->drirc.debug.force_vk_devicename);
+    }
+-   snprintf(props->deviceName, sizeof(props->deviceName),
+-            "%s", (strlen(instance->drirc.debug.force_vk_devicename) > 0) ?
+-            instance->drirc.debug.force_vk_devicename : device_name);
+ 
+    props->driverID = VK_DRIVER_ID_MESA_VENUS;
+ 
+-   snprintf(props->driverName, sizeof(props->driverName), "venus");
+-   snprintf(props->driverInfo, sizeof(props->driverInfo),
+-            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
+-
+    props->conformanceVersion.major = 1;
+    props->conformanceVersion.minor = 4;
+    props->conformanceVersion.subminor = 0;
+@@ -1018,6 +1038,26 @@ vn_physical_device_init_memory_properties(
        props->memoryTypes[first_coherent].propertyFlags |=
           VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     }
@@ -822,7 +1185,28 @@ index 7ee58ac8805..9d254e18a43 100644
  }
  
  static void
-@@ -2283,6 +2318,26 @@ vn_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+@@ -1482,6 +1522,20 @@ vn_physical_device_init_supported_extensions(
+    struct vk_device_extension_table native;
+    struct vk_device_extension_table passthrough;
+ 
++   /* Ray tracing defaults ON. Venus only advertises what the host driver
++    * actually reports, so a GPU without RT support simply gets nothing, while
++    * RT-capable parts (Turing/Ampere/Ada - most users of this stack) get
++    * VK_KHR_ray_tracing_pipeline and ray_query.
++    *
++    * Pascal (GTX 10xx) is the known exception: NVIDIA 580 advertises
++    * KHR_ray_tracing_pipeline there as *software* RT, and letting Unreal take
++    * that path has been observed to DEVICE_LOST. Such hosts opt out with
++    * mesa.vn.debug=vtest,no_ray_tracing (waydroid.cfg [properties], then
++    * waydroid upgrade -o + container restart).
++    *
++    * VN_DEBUG_NO_RAY_TRACING previously had no effect anywhere - the value was
++    * hardcoded false, so the documented opt-out did nothing and no one could
++    * turn RT on either. Honour the flag so both directions work. */
+    physical_dev->ray_tracing = !VN_DEBUG(NO_RAY_TRACING);
+ 
+    vn_physical_device_get_native_extensions(physical_dev, &native);
+@@ -2283,6 +2337,26 @@ vn_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
        }
     }
  
@@ -849,7 +1233,7 @@ index 7ee58ac8805..9d254e18a43 100644
     vn_call_vkGetPhysicalDeviceFormatProperties2(ring, physicalDevice, format,
                                                  pFormatProperties);
     vn_sanitize_format_properties(format, props, props3);
-@@ -2713,9 +2768,18 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
+@@ -2713,9 +2787,18 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
     /* Only advertise support for optimal tiling since venus is unable to
      * detiling if the AHB allocated outside is tiled. Internally venus always
      * overrides the tiling to VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT.
@@ -869,7 +1253,7 @@ index 7ee58ac8805..9d254e18a43 100644
  
     /* No need to support AHB + VK_EXT_separate_stencil_usage. */
     if (vk_find_struct_const(info->pNext, IMAGE_STENCIL_USAGE_CREATE_INFO))
-@@ -2734,8 +2798,12 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
+@@ -2734,8 +2817,12 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
      */
     VkResult result = vk_android_get_ahb_image_properties(
        vn_physical_device_to_handle(physical_dev), info, props);
@@ -883,12 +1267,12 @@ index 7ee58ac8805..9d254e18a43 100644
  
     /* Now properly fill all the default props. */
  
-@@ -2853,6 +2921,30 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+@@ -2853,6 +2940,30 @@ vn_GetPhysicalDeviceImageFormatProperties2(
        pImageFormatInfo = &local_info.format;
     }
  
-+   /* ASTC LDR emulation: answer with the backing RGBA image's limits by
-+    * rewriting the query the same way vn_CreateImage rewrites creation
++   /* ASTC LDR emulation: answer with the backing RGBA UNORM image's limits
++    * (same rewrite as vn_CreateImage). SRGB is never the CreateImage format.
 +    */
 +   struct vn_physical_device_image_format_info astc_local_info;
 +   if (physical_dev->emu_astc_ldr &&
@@ -914,7 +1298,7 @@ index 7ee58ac8805..9d254e18a43 100644
     /* Check if image format props is in the cache. */
     uint8_t key[BLAKE3_KEY_LEN] = { 0 };
     const bool cacheable = vn_image_get_image_format_key(
-@@ -2880,6 +2972,14 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+@@ -2880,6 +2991,14 @@ vn_GetPhysicalDeviceImageFormatProperties2(
        }
     }
  
@@ -943,8 +1327,21 @@ index c33f3cf71c1..2c0c1569641 100644
     struct {
        VkExternalMemoryHandleTypeFlagBits renderer_handle_type;
        VkExternalMemoryHandleTypeFlags supported_handle_types;
+diff --git a/src/virtio/vulkan/vn_query_pool.c b/src/virtio/vulkan/vn_query_pool.c
+index 383eea694b9..91300ee6af0 100644
+--- a/src/virtio/vulkan/vn_query_pool.c
++++ b/src/virtio/vulkan/vn_query_pool.c
+@@ -306,7 +306,7 @@ vn_query_feedback_wait_ready(struct vn_device *dev,
+          vn_relax(&relax_state);
+ 
+          /* Wait until warn order is reached. */
+-         if (vn_relax_warn(&relax_state)) {
++         if (vn_relax_warn(&relax_state) || vn_relax_gave_up(&relax_state)) {
+             vn_relax_fini(&relax_state);
+             return false;
+          }
 diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
-index 4c337a308bf..3957600e901 100644
+index 4c337a308bf..9265c5ef501 100644
 --- a/src/virtio/vulkan/vn_queue.c
 +++ b/src/virtio/vulkan/vn_queue.c
 @@ -383,6 +383,9 @@ vn_fix_device_group_cmd_count(struct vn_queue_submission *submit,
@@ -991,7 +1388,20 @@ index 4c337a308bf..3957600e901 100644
        if (!vn_semaphore_wait_external(dev, sem))
           return VK_ERROR_DEVICE_LOST;
  
-@@ -1853,6 +1883,7 @@ vn_create_sync_file(struct vn_device *dev,
+@@ -1784,8 +1814,11 @@ vn_update_sync_result(struct vn_device *dev,
+       if (abs_timeout != OS_TIMEOUT_INFINITE &&
+           os_time_get_nano() >= abs_timeout)
+          result = VK_TIMEOUT;
+-      else
++      else {
+          vn_relax(relax_state);
++         if (vn_relax_gave_up(relax_state))
++            result = VK_ERROR_DEVICE_LOST;
++      }
+       break;
+    default:
+       assert(result == VK_SUCCESS || result < 0);
+@@ -1853,6 +1886,7 @@ vn_create_sync_file(struct vn_device *dev,
        .sync_values = &(const uint64_t){ 1 },
        .sync_count = 1,
        .ring_idx = external_payload->ring_idx,
@@ -1000,10 +1410,19 @@ index 4c337a308bf..3957600e901 100644
  
     uint32_t local_data[8];
 diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
-index fc5ff2c0564..d5c1150c52f 100644
+index fc5ff2c0564..45ab8787951 100644
 --- a/src/virtio/vulkan/vn_renderer.h
 +++ b/src/virtio/vulkan/vn_renderer.h
-@@ -66,6 +66,11 @@ struct vn_renderer_info {
+@@ -14,6 +14,8 @@ struct vn_renderer_shmem {
+    uint32_t res_id;
+    size_t mmap_size; /* for internal use only (i.e., munmap) */
+    void *mmap_ptr;
++   /* vtest keeps the blob fd so MapMemory bounce can SCM_RIGHTS it; -1 else */
++   int mmap_fd;
+ 
+    struct list_head cache_head;
+    int64_t cache_timestamp;
+@@ -66,6 +68,11 @@ struct vn_renderer_info {
  
     bool has_dma_buf_import;
     bool has_external_sync;
@@ -1015,7 +1434,7 @@ index fc5ff2c0564..d5c1150c52f 100644
     bool has_timeline_sync;
     bool has_implicit_fencing;
     bool has_guest_vram;
-@@ -103,6 +108,15 @@ struct vn_renderer_submit_batch {
+@@ -103,6 +110,15 @@ struct vn_renderer_submit_batch {
     /* TODO allow NULL when syncs are all binary? */
     const uint64_t *sync_values;
     uint32_t sync_count;
@@ -1031,7 +1450,7 @@ index fc5ff2c0564..d5c1150c52f 100644
  };
  
  struct vn_renderer_wait {
-@@ -128,6 +142,16 @@ struct vn_renderer_ops {
+@@ -128,6 +144,26 @@ struct vn_renderer_ops {
      */
     VkResult (*wait)(struct vn_renderer *renderer,
                      const struct vn_renderer_wait *wait);
@@ -1045,15 +1464,40 @@ index fc5ff2c0564..d5c1150c52f 100644
 +                                        uint64_t device_id,
 +                                        uint64_t semaphore_id,
 +                                        int sync_file_fd);
++
++   /* copy HOST_VISIBLE VkDeviceMemory through guest shm (vtest). dir 0 =
++    * host→guest, 1 = guest→host. shm_fd is NOT consumed. Optional.
++    */
++   VkResult (*memory_rw)(struct vn_renderer *renderer,
++                         uint64_t mem_id,
++                         uint64_t offset,
++                         uint64_t size,
++                         uint32_t dir,
++                         int shm_fd);
  };
  
  struct vn_renderer_shmem_ops {
+diff --git a/src/virtio/vulkan/vn_renderer_virtgpu.c b/src/virtio/vulkan/vn_renderer_virtgpu.c
+index 17d724069c5..8c8d4c093d5 100644
+--- a/src/virtio/vulkan/vn_renderer_virtgpu.c
++++ b/src/virtio/vulkan/vn_renderer_virtgpu.c
+@@ -758,6 +758,7 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+          .res_id = res_id,
+          .mmap_size = size,
+          .mmap_ptr = ptr,
++         .mmap_fd = -1,
+       },
+       .gem_handle = gem_handle,
+    };
 diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
-index 7aaebd2de34..7d47597391d 100644
+index 7aaebd2de34..6554b3e49cb 100644
 --- a/src/virtio/vulkan/vn_renderer_vtest.c
 +++ b/src/virtio/vulkan/vn_renderer_vtest.c
-@@ -10,12 +10,16 @@
+@@ -8,14 +8,19 @@
+ 
+ #include "virtio/virtio-gpu/venus_hw.h"
  #include <errno.h>
++#include <string.h>
  #include <netinet/in.h>
  #include <poll.h>
 +#include <sys/ioctl.h>
@@ -1069,7 +1513,7 @@ index 7aaebd2de34..7d47597391d 100644
  #include "drm-uapi/virtgpu_drm.h"
  #include "util/os_file.h"
  #include "util/os_misc.h"
-@@ -44,6 +48,11 @@ struct vtest_bo {
+@@ -44,6 +49,11 @@ struct vtest_bo {
  
  struct vtest_sync {
     struct vn_renderer_sync base;
@@ -1081,7 +1525,12 @@ index 7aaebd2de34..7d47597391d 100644
  };
  
  struct vtest {
-@@ -57,6 +66,19 @@ struct vtest {
+@@ -53,10 +63,24 @@ struct vtest {
+ 
+    mtx_t sock_mutex;
+    int sock_fd;
++   bool sock_dead; /* Venus restarted; do not abort() the Android process */
+ 
     uint32_t protocol_version;
     uint32_t max_timeline_count;
     bool has_venus_sync_fd;
@@ -1101,7 +1550,7 @@ index 7aaebd2de34..7d47597391d 100644
  
     struct {
        uint32_t id;
-@@ -80,7 +102,10 @@ vtest_connect_socket(struct vn_instance *instance, const char *path)
+@@ -80,7 +104,10 @@ vtest_connect_socket(struct vn_instance *instance, const char *path)
  
     sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0) {
@@ -1113,7 +1562,7 @@ index 7aaebd2de34..7d47597391d 100644
        return -1;
     }
  
-@@ -89,7 +114,9 @@ vtest_connect_socket(struct vn_instance *instance, const char *path)
+@@ -89,7 +116,9 @@ vtest_connect_socket(struct vn_instance *instance, const char *path)
     memcpy(un.sun_path, path, strlen(path));
  
     if (connect(sock, (struct sockaddr *)&un, sizeof(un)) == -1) {
@@ -1124,7 +1573,246 @@ index 7aaebd2de34..7d47597391d 100644
        close(sock);
        return -1;
     }
-@@ -532,6 +559,39 @@ vtest_vcmd_resource_import_blob(struct vtest *vtest, uint64_t size, int fd)
+@@ -98,20 +127,46 @@ vtest_connect_socket(struct vn_instance *instance, const char *path)
+ }
+ 
+ static void
+-vtest_read(struct vtest *vtest, void *buf, size_t size)
++vtest_mark_dead(struct vtest *vtest, const char *why)
++{
++   if (vtest->sock_dead)
++      return;
++   vtest->sock_dead = true;
++   vn_log(vtest->instance, "vtest socket dead (%s); returning errors, not abort()",
++          why);
++}
++
++/* Never abort(): Venus DEVICE_LOST restarts a worker and the socket drops.
++ * abort() here used to SIGABRT SurfaceFlinger / Unreal / Unity and leave
++ * the LXC container RUNNING with no IP. */
++static bool
++vtest_read_ok(struct vtest *vtest, void *buf, size_t size)
+ {
++   if (vtest->sock_dead) {
++      memset(buf, 0, size);
++      return false;
++   }
+    do {
+       const ssize_t ret = read(vtest->sock_fd, buf, size);
+-      if (unlikely(ret < 0)) {
++      if (unlikely(ret <= 0)) {
+          vn_log(vtest->instance,
+                 "lost connection to rendering server on %zu read %zi %d",
+                 size, ret, errno);
+-         abort();
++         vtest_mark_dead(vtest, "read");
++         memset(buf, 0, size);
++         return false;
+       }
+ 
+       buf += ret;
+       size -= ret;
+    } while (size);
++   return true;
++}
++
++static void
++vtest_read(struct vtest *vtest, void *buf, size_t size)
++{
++   vtest_read_ok(vtest, buf, size);
+ }
+ 
+ static int
+@@ -130,16 +185,21 @@ vtest_receive_fd(struct vtest *vtest)
+       .msg_controllen = sizeof(cmsg_buf),
+    };
+ 
++   if (vtest->sock_dead)
++      return -1;
++
+    if (recvmsg(vtest->sock_fd, &msg, 0) < 0) {
+       vn_log(vtest->instance, "recvmsg failed: %s", strerror(errno));
+-      abort();
++      vtest_mark_dead(vtest, "recvmsg");
++      return -1;
+    }
+ 
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+        cmsg->cmsg_type != SCM_RIGHTS) {
+       vn_log(vtest->instance, "invalid cmsghdr");
+-      abort();
++      vtest_mark_dead(vtest, "cmsghdr");
++      return -1;
+    }
+ 
+    return *((int *)CMSG_DATA(cmsg));
+@@ -170,21 +230,45 @@ vtest_send_fd(struct vtest *vtest, int fd)
+    return ret > 0 ? 0 : -ECONNRESET;
+ }
+ 
+-static void
+-vtest_write(struct vtest *vtest, const void *buf, size_t size)
++static bool
++vtest_write_ok(struct vtest *vtest, const void *buf, size_t size)
+ {
++   if (vtest->sock_dead)
++      return false;
+    do {
+       const ssize_t ret = write(vtest->sock_fd, buf, size);
+-      if (unlikely(ret < 0)) {
++      if (unlikely(ret <= 0)) {
+          vn_log(vtest->instance,
+                 "lost connection to rendering server on %zu write %zi %d",
+                 size, ret, errno);
+-         abort();
++         vtest_mark_dead(vtest, "write");
++         return false;
+       }
+ 
+       buf += ret;
+       size -= ret;
+    } while (size);
++   return true;
++}
++
++static void
++vtest_write(struct vtest *vtest, const void *buf, size_t size)
++{
++   vtest_write_ok(vtest, buf, size);
++}
++
++static bool
++vtest_expect_cmd(struct vtest *vtest, const uint32_t *hdr, uint32_t cmd)
++{
++   if (vtest->sock_dead)
++      return false;
++   if (hdr[VTEST_CMD_ID] != cmd) {
++      vn_log(vtest->instance, "vtest cmd mismatch got %u want %u",
++             hdr[VTEST_CMD_ID], cmd);
++      vtest_mark_dead(vtest, "cmd id");
++      return false;
++   }
++   return true;
+ }
+ 
+ static void
+@@ -226,12 +310,14 @@ vtest_vcmd_ping_protocol_version(struct vtest *vtest)
+    if (vtest_hdr[VTEST_CMD_ID] == VCMD_PING_PROTOCOL_VERSION) {
+       /* consume the dummy busy wait result */
+       vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
+-      assert(vtest_hdr[VTEST_CMD_ID] == VCMD_RESOURCE_BUSY_WAIT);
++      if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_RESOURCE_BUSY_WAIT))
++         return false;
+       vtest_read(vtest, &dummy, sizeof(dummy));
+       return true;
+    } else {
+       /* no ping protocol version support */
+-      assert(vtest_hdr[VTEST_CMD_ID] == VCMD_RESOURCE_BUSY_WAIT);
++      if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_RESOURCE_BUSY_WAIT))
++         return false;
+       vtest_read(vtest, &dummy, sizeof(dummy));
+       return false;
+    }
+@@ -251,8 +337,11 @@ vtest_vcmd_protocol_version(struct vtest *vtest)
+    vtest_write(vtest, vcmd_protocol_version, sizeof(vcmd_protocol_version));
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   if (vtest->sock_dead)
++      return 0;
+    assert(vtest_hdr[VTEST_CMD_LEN] == VCMD_PROTOCOL_VERSION_SIZE);
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_PROTOCOL_VERSION);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_PROTOCOL_VERSION))
++      return 0;
+    vtest_read(vtest, vcmd_protocol_version, sizeof(vcmd_protocol_version));
+ 
+    return vcmd_protocol_version[VCMD_PROTOCOL_VERSION_VERSION];
+@@ -271,8 +360,11 @@ vtest_vcmd_get_param(struct vtest *vtest, enum vcmd_param param)
+    vtest_write(vtest, vcmd_get_param, sizeof(vcmd_get_param));
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   if (vtest->sock_dead)
++      return 0;
+    assert(vtest_hdr[VTEST_CMD_LEN] == 2);
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_GET_PARAM);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_GET_PARAM))
++      return 0;
+ 
+    uint32_t resp[2];
+    vtest_read(vtest, resp, sizeof(resp));
+@@ -298,7 +390,8 @@ vtest_vcmd_get_capset(struct vtest *vtest,
+    vtest_write(vtest, vcmd_get_capset, sizeof(vcmd_get_capset));
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_GET_CAPSET);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_GET_CAPSET))
++      return 0;
+ 
+    uint32_t valid;
+    vtest_read(vtest, &valid, sizeof(valid));
+@@ -364,8 +457,11 @@ vtest_vcmd_resource_create_blob(struct vtest *vtest,
+    vtest_write(vtest, vcmd_res_create_blob, sizeof(vcmd_res_create_blob));
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   if (vtest->sock_dead)
++      return 0;
+    assert(vtest_hdr[VTEST_CMD_LEN] == 1);
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_RESOURCE_CREATE_BLOB);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_RESOURCE_CREATE_BLOB))
++      return 0;
+ 
+    uint32_t res_id;
+    vtest_read(vtest, &res_id, sizeof(res_id));
+@@ -406,8 +502,11 @@ vtest_vcmd_sync_create(struct vtest *vtest, uint64_t initial_val)
+    vtest_write(vtest, vcmd_sync_create, sizeof(vcmd_sync_create));
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   if (vtest->sock_dead)
++      return 0;
+    assert(vtest_hdr[VTEST_CMD_LEN] == 1);
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_SYNC_CREATE);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_SYNC_CREATE))
++      return 0;
+ 
+    uint32_t sync_id;
+    vtest_read(vtest, &sync_id, sizeof(sync_id));
+@@ -444,8 +543,11 @@ vtest_vcmd_sync_read(struct vtest *vtest, uint32_t sync_id)
+    vtest_write(vtest, vcmd_sync_read, sizeof(vcmd_sync_read));
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   if (vtest->sock_dead)
++      return 0;
+    assert(vtest_hdr[VTEST_CMD_LEN] == 2);
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_SYNC_READ);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_SYNC_READ))
++      return 0;
+ 
+    uint64_t val;
+    vtest_read(vtest, &val, sizeof(val));
+@@ -500,8 +602,11 @@ vtest_vcmd_sync_wait(struct vtest *vtest,
+    }
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   if (vtest->sock_dead)
++      return -1;
+    assert(vtest_hdr[VTEST_CMD_LEN] == 0);
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_SYNC_WAIT);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_SYNC_WAIT))
++      return -1;
+ 
+    return vtest_receive_fd(vtest);
+ }
+@@ -524,7 +629,8 @@ vtest_vcmd_resource_import_blob(struct vtest *vtest, uint64_t size, int fd)
+       return 0;
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_RESOURCE_IMPORT_BLOB);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_RESOURCE_IMPORT_BLOB))
++      return 0;
+ 
+    uint32_t res_id;
+    vtest_read(vtest, &res_id, sizeof(res_id));
+@@ -532,6 +638,40 @@ vtest_vcmd_resource_import_blob(struct vtest *vtest, uint64_t size, int fd)
     return res_id;
  }
  
@@ -1139,7 +1827,8 @@ index 7aaebd2de34..7d47597391d 100644
 +   vtest_write(vtest, vtest_hdr, sizeof(vtest_hdr));
 +
 +   vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
-+   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_TIMELINE_GET);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_TIMELINE_GET))
++      return -ENODEV;
 +
 +   uint32_t status;
 +   vtest_read(vtest, &status, sizeof(status));
@@ -1164,7 +1853,17 @@ index 7aaebd2de34..7d47597391d 100644
  static int
  vtest_vcmd_sync_export_sync_file(struct vtest *vtest,
                                   uint32_t sync_id,
-@@ -581,11 +641,31 @@ vtest_vcmd_submit_cmd2(struct vtest *vtest,
+@@ -550,7 +690,8 @@ vtest_vcmd_sync_export_sync_file(struct vtest *vtest,
+    vtest_write(vtest, vcmd_export, sizeof(vcmd_export));
+ 
+    vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
+-   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_SYNC_EXPORT_SYNC_FILE);
++   if (!vtest_expect_cmd(vtest, vtest_hdr, VCMD_SYNC_EXPORT_SYNC_FILE))
++      return -1;
+ 
+    uint32_t status;
+    vtest_read(vtest, &status, sizeof(status));
+@@ -581,11 +722,31 @@ vtest_vcmd_submit_cmd2(struct vtest *vtest,
     if (!total_size)
        return;
  
@@ -1198,7 +1897,7 @@ index 7aaebd2de34..7d47597391d 100644
     /* write batch count and batch headers */
     const uint32_t batch_count = 1;
     size_t sync_offset = header_size + batch->cs_size;
-@@ -658,6 +738,59 @@ vtest_sync_reset(struct vn_renderer *renderer,
+@@ -658,6 +819,59 @@ vtest_sync_reset(struct vn_renderer *renderer,
     return vtest_sync_write(renderer, sync, initial_val);
  }
  
@@ -1258,7 +1957,7 @@ index 7aaebd2de34..7d47597391d 100644
  static int
  vtest_sync_export_syncobj(struct vn_renderer *renderer,
                            struct vn_renderer_sync *_sync,
-@@ -670,6 +803,14 @@ vtest_sync_export_syncobj(struct vn_renderer *renderer,
+@@ -670,6 +884,14 @@ vtest_sync_export_syncobj(struct vn_renderer *renderer,
     if (!sync_file || !vtest->has_venus_sync_fd)
        return -ENOTSUP;
  
@@ -1273,7 +1972,36 @@ index 7aaebd2de34..7d47597391d 100644
     /* Resolve the (binary) sync's signal point to the pending submit's
      * VkFence on the server and export a sync_file from it.  -1 means the
      * point already retired (already-signaled sync_file convention).
-@@ -1032,6 +1173,44 @@ vtest_submit(struct vn_renderer *renderer,
+@@ -894,8 +1116,9 @@ vtest_shmem_destroy_now(struct vn_renderer *renderer,
+ {
+    struct vtest *vtest = (struct vtest *)renderer;
+    struct vtest_shmem *shmem = (struct vtest_shmem *)_shmem;
+-
+    munmap(shmem->base.mmap_ptr, shmem->base.mmap_size);
++   if (shmem->base.mmap_fd >= 0)
++      close(shmem->base.mmap_fd);
+ 
+    mtx_lock(&vtest->sock_mutex);
+    vtest_vcmd_resource_unref(vtest, shmem->base.res_id);
+@@ -936,8 +1159,8 @@ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
+ 
+    void *ptr =
+       mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, res_fd, 0);
+-   close(res_fd);
+    if (ptr == MAP_FAILED) {
++      close(res_fd);
+       mtx_lock(&vtest->sock_mutex);
+       vtest_vcmd_resource_unref(vtest, res_id);
+       mtx_unlock(&vtest->sock_mutex);
+@@ -952,6 +1175,7 @@ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
+          .res_id = res_id,
+          .mmap_size = size,
+          .mmap_ptr = ptr,
++         .mmap_fd = res_fd,
+       },
+    };
+ 
+@@ -1032,6 +1256,95 @@ vtest_submit(struct vn_renderer *renderer,
     return VK_SUCCESS;
  }
  
@@ -1299,26 +2027,77 @@ index 7aaebd2de34..7d47597391d 100644
 +   mtx_lock(&vtest->sock_mutex);
 +   vtest_hdr[VTEST_CMD_LEN] = ARRAY_SIZE(cmd);
 +   vtest_hdr[VTEST_CMD_ID] = VCMD_SEMAPHORE_IMPORT_SYNC_FD;
-+   vtest_write(vtest, vtest_hdr, sizeof(vtest_hdr));
-+   vtest_write(vtest, cmd, sizeof(cmd));
-+   if (vtest_send_fd(vtest, sync_file_fd)) {
++   /* Must not abort(): a dying renderer (NVIDIA DEVICE_LOST restarts
++    * wd-venus) used to SIGABRT Unreal's RHIThread and SurfaceFlinger. */
++   if (!vtest_write_ok(vtest, vtest_hdr, sizeof(vtest_hdr)) ||
++       !vtest_write_ok(vtest, cmd, sizeof(cmd)) ||
++       vtest_send_fd(vtest, sync_file_fd) ||
++       !vtest_read_ok(vtest, vtest_hdr, sizeof(vtest_hdr))) {
 +      mtx_unlock(&vtest->sock_mutex);
 +      return VK_ERROR_DEVICE_LOST;
 +   }
-+
-+   vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
-+   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_SEMAPHORE_IMPORT_SYNC_FD);
++   if (vtest_hdr[VTEST_CMD_ID] != VCMD_SEMAPHORE_IMPORT_SYNC_FD) {
++      mtx_unlock(&vtest->sock_mutex);
++      return VK_ERROR_DEVICE_LOST;
++   }
 +   uint32_t status;
-+   vtest_read(vtest, &status, sizeof(status));
++   if (!vtest_read_ok(vtest, &status, sizeof(status))) {
++      mtx_unlock(&vtest->sock_mutex);
++      return VK_ERROR_DEVICE_LOST;
++   }
 +   mtx_unlock(&vtest->sock_mutex);
 +
 +   return status ? VK_ERROR_INVALID_EXTERNAL_HANDLE : VK_SUCCESS;
 +}
 +
++static VkResult
++vtest_memory_rw(struct vn_renderer *renderer,
++                uint64_t mem_id,
++                uint64_t offset,
++                uint64_t size,
++                uint32_t dir,
++                int shm_fd)
++{
++   struct vtest *vtest = (struct vtest *)renderer;
++   uint32_t vtest_hdr[VTEST_HDR_SIZE];
++   const uint32_t cmd[VCMD_MEMORY_RW_SIZE] = {
++      (uint32_t)mem_id,
++      (uint32_t)(mem_id >> 32),
++      (uint32_t)offset,
++      (uint32_t)(offset >> 32),
++      (uint32_t)size,
++      (uint32_t)(size >> 32),
++      dir,
++   };
++
++   mtx_lock(&vtest->sock_mutex);
++   vtest_hdr[VTEST_CMD_LEN] = ARRAY_SIZE(cmd);
++   vtest_hdr[VTEST_CMD_ID] = VCMD_MEMORY_RW;
++   if (!vtest_write_ok(vtest, vtest_hdr, sizeof(vtest_hdr)) ||
++       !vtest_write_ok(vtest, cmd, sizeof(cmd)) ||
++       vtest_send_fd(vtest, shm_fd) ||
++       !vtest_read_ok(vtest, vtest_hdr, sizeof(vtest_hdr))) {
++      mtx_unlock(&vtest->sock_mutex);
++      return VK_ERROR_DEVICE_LOST;
++   }
++   if (vtest_hdr[VTEST_CMD_ID] != VCMD_MEMORY_RW) {
++      mtx_unlock(&vtest->sock_mutex);
++      return VK_ERROR_DEVICE_LOST;
++   }
++   uint32_t status;
++   if (!vtest_read_ok(vtest, &status, sizeof(status))) {
++      mtx_unlock(&vtest->sock_mutex);
++      return VK_ERROR_DEVICE_LOST;
++   }
++   mtx_unlock(&vtest->sock_mutex);
++   return status ? VK_ERROR_MEMORY_MAP_FAILED : VK_SUCCESS;
++}
++
++
  static void
  vtest_init_renderer_info(struct vtest *vtest)
  {
-@@ -1042,6 +1221,7 @@ vtest_init_renderer_info(struct vtest *vtest)
+@@ -1042,6 +1355,7 @@ vtest_init_renderer_info(struct vtest *vtest)
  
     info->has_dma_buf_import = vtest->has_venus_sync_fd;
     info->has_external_sync = vtest->has_venus_sync_fd;
@@ -1326,7 +2105,7 @@ index 7aaebd2de34..7d47597391d 100644
     info->has_implicit_fencing = false;
  
     const struct virgl_renderer_capset_venus *capset = &vtest->capset.data;
-@@ -1078,6 +1258,12 @@ vtest_destroy(struct vn_renderer *renderer,
+@@ -1078,6 +1392,12 @@ vtest_destroy(struct vn_renderer *renderer,
        close(vtest->sock_fd);
     }
  
@@ -1339,7 +2118,7 @@ index 7aaebd2de34..7d47597391d 100644
     mtx_destroy(&vtest->sock_mutex);
     util_sparse_array_finish(&vtest->shmem_array);
     util_sparse_array_finish(&vtest->bo_array);
-@@ -1172,11 +1358,39 @@ vtest_init(struct vtest *vtest)
+@@ -1172,11 +1492,41 @@ vtest_init(struct vtest *vtest)
  
     vtest_vcmd_context_init(vtest, vtest->capset.id);
  
@@ -1376,9 +2155,202 @@ index 7aaebd2de34..7d47597391d 100644
     vtest->base.ops.submit = vtest_submit;
     vtest->base.ops.wait = vtest_wait;
 +   vtest->base.ops.semaphore_import_sync_fd = vtest_semaphore_import_sync_fd;
++   vtest->base.ops.memory_rw = vtest_memory_rw;
++
  
     vtest->base.shmem_ops.create = vtest_shmem_create;
     vtest->base.shmem_ops.destroy = vtest_shmem_destroy;
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index ff72774d243..fa663e8bd9f 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -124,10 +124,16 @@ vn_ring_unset_status_bits(struct vn_ring *ring, uint32_t mask)
+                              memory_order_seq_cst);
+ }
+ 
+-static void
++static bool
+ vn_ring_write_buffer(struct vn_ring *ring, const void *data, uint32_t size)
+ {
+-   assert(ring->cur + size - vn_ring_load_head(ring) <= ring->buffer_size);
++   /* Never abort(): a stuck renderer (NVIDIA DEVICE_LOST / Xid 69) used to
++    * trip this assert from Unreal's RHIThread vkUpdateDescriptorSets and
++    * kill AnTuTu 3D. Caller must have waited for space; if the renderer
++    * is gone, fail the submit instead.
++    */
++   if (unlikely(ring->cur + size - vn_ring_load_head(ring) > ring->buffer_size))
++      return false;
+ 
+    const uint32_t offset = ring->cur & ring->buffer_mask;
+    if (offset + size <= ring->buffer_size) {
+@@ -139,6 +145,7 @@ vn_ring_write_buffer(struct vn_ring *ring, const void *data, uint32_t size)
+    }
+ 
+    ring->cur += size;
++   return true;
+ }
+ 
+ static bool
+@@ -178,7 +185,7 @@ vn_ring_get_seqno_status(struct vn_ring *ring, uint32_t seqno)
+    return vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno);
+ }
+ 
+-void
++bool
+ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
+ {
+    /* A renderer wait incurs several hops and the renderer might poll
+@@ -191,9 +198,13 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
+    do {
+       if (vn_ring_get_seqno_status(ring, seqno)) {
+          vn_relax_fini(&relax_state);
+-         return;
++         return true;
+       }
+       vn_relax(&relax_state);
++      if (vn_relax_gave_up(&relax_state)) {
++         vn_relax_fini(&relax_state);
++         return false;
++      }
+    } while (true);
+ }
+ 
+@@ -220,26 +231,36 @@ vn_ring_has_space(const struct vn_ring *ring,
+    return false;
+ }
+ 
+-static uint32_t
+-vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
++static bool
++vn_ring_wait_space(struct vn_ring *ring, uint32_t size, uint32_t *out_head)
+ {
+-   assert(size <= ring->buffer_size);
++   if (unlikely(size > ring->buffer_size))
++      return false;
+ 
+    uint32_t head;
+-   if (likely(vn_ring_has_space(ring, size, &head)))
+-      return head;
++   if (likely(vn_ring_has_space(ring, size, &head))) {
++      *out_head = head;
++      return true;
++   }
+ 
+    {
+       VN_TRACE_FUNC();
+ 
+-      /* see the reasoning in vn_ring_wait_seqno */
+       struct vn_relax_state relax_state =
+          vn_relax_init(ring->instance, VN_RELAX_REASON_RING_SPACE);
+       do {
+          vn_relax(&relax_state);
+          if (vn_ring_has_space(ring, size, &head)) {
+             vn_relax_fini(&relax_state);
+-            return head;
++            *out_head = head;
++            return true;
++         }
++         if (vn_relax_gave_up(&relax_state)) {
++            vn_relax_fini(&relax_state);
++            vn_log(ring->instance,
++                   "ring space timeout (need %u of %u); DEVICE_LOST, not abort()",
++                   size, ring->buffer_size);
++            return false;
+          }
+       } while (true);
+    }
+@@ -436,25 +457,28 @@ static bool
+ vn_ring_submit_internal(struct vn_ring *ring,
+                         struct vn_ring_submit *submit,
+                         const struct vn_cs_encoder *cs,
+-                        uint32_t *seqno)
++                        uint32_t *seqno,
++                        bool *out_notify)
+ {
+    /* write cs to the ring */
+    assert(!vn_cs_encoder_is_empty(cs));
++   *out_notify = false;
+ 
+    /* avoid -Wmaybe-unitialized */
+    uint32_t cur_seqno = 0;
+ 
+    for (uint32_t i = 0; i < cs->buffer_count; i++) {
+       const struct vn_cs_encoder_buffer *buf = &cs->buffers[i];
+-      cur_seqno = vn_ring_wait_space(ring, buf->committed_size);
+-      vn_ring_write_buffer(ring, buf->base, buf->committed_size);
++      if (!vn_ring_wait_space(ring, buf->committed_size, &cur_seqno) ||
++          !vn_ring_write_buffer(ring, buf->base, buf->committed_size))
++         return false;
+    }
+ 
+    vn_ring_store_tail(ring);
+    const VkRingStatusFlagsMESA status = vn_ring_load_status(ring);
+    if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
+-      vn_log(NULL, "vn_ring_submit abort on fatal");
+-      abort();
++      vn_log(ring->instance, "vn_ring_submit: ring FATAL; DEVICE_LOST, not abort()");
++      return false;
+    }
+ 
+    vn_ring_retire_submits(ring, cur_seqno);
+@@ -473,10 +497,10 @@ vn_ring_submit_internal(struct vn_ring *ring,
+       if (os_time_timeout(ring->last_notify, ring->next_notify, now)) {
+          ring->last_notify = now;
+          ring->next_notify = now + VN_RING_IDLE_TIMEOUT_NS;
+-         return true;
++         *out_notify = true;
+       }
+    }
+-   return false;
++   return true;
+ }
+ 
+ static const struct vn_cs_encoder *
+@@ -633,9 +657,13 @@ vn_ring_submit_locked(struct vn_ring *ring,
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   uint32_t seqno;
+-   const bool notify =
+-      vn_ring_submit_internal(ring, submit.submit, submit.cs, &seqno);
++   uint32_t seqno = 0;
++   bool notify = false;
++   if (!vn_ring_submit_internal(ring, submit.submit, submit.cs, &seqno,
++                                &notify)) {
++      vn_ring_submission_cleanup(&submit);
++      return VK_ERROR_DEVICE_LOST;
++   }
+    if (notify) {
+       uint32_t notify_ring_data[8];
+       struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
+@@ -720,7 +748,12 @@ vn_ring_submit_command(struct vn_ring *ring,
+          void *reply_ptr = submit->reply_shmem->mmap_ptr + reply_offset;
+          submit->reply =
+             VN_CS_DECODER_INITIALIZER(reply_ptr, submit->reply_size);
+-         vn_ring_wait_seqno(ring, submit->ring_seqno);
++         if (!vn_ring_wait_seqno(ring, submit->ring_seqno)) {
++            submit->ring_seqno_valid = false;
++            vn_renderer_shmem_unref(ring->instance->renderer,
++                                    submit->reply_shmem);
++            submit->reply_shmem = NULL;
++         }
+       } else {
+          vn_renderer_shmem_unref(ring->instance->renderer,
+                                  submit->reply_shmem);
+diff --git a/src/virtio/vulkan/vn_ring.h b/src/virtio/vulkan/vn_ring.h
+index 5128fa4115f..5b343796aa3 100644
+--- a/src/virtio/vulkan/vn_ring.h
++++ b/src/virtio/vulkan/vn_ring.h
+@@ -65,7 +65,8 @@ vn_ring_unset_status_bits(struct vn_ring *ring, uint32_t mask);
+ bool
+ vn_ring_get_seqno_status(struct vn_ring *ring, uint32_t seqno);
+ 
+-void
++/* false: ring FATAL / renderer gone — caller must fail the Vulkan call */
++bool
+ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno);
+ 
+ void
 diff --git a/src/vulkan/runtime/meson.build b/src/vulkan/runtime/meson.build
 index 7da99c886ea..05cee35f2b0 100644
 --- a/src/vulkan/runtime/meson.build
