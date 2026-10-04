@@ -165,7 +165,7 @@ index 92190ab..c1d96fe 100644
      for node in sorted(glob.glob("/dev/dri/renderD*")):
          renderDev = os.path.basename(node)
 diff --git a/tools/helpers/lxc.py b/tools/helpers/lxc.py
-index b50ddc1..54d151b 100644
+index d3f6c24..54d151b 100644
 --- a/tools/helpers/lxc.py
 +++ b/tools/helpers/lxc.py
 @@ -124,9 +124,76 @@ def generate_nodes_lxc_config(args):
@@ -259,18 +259,6 @@ index b50ddc1..54d151b 100644
          command = ["sed", "-i", "-E", "/lxc.aa_profile|lxc.apparmor.profile/ s/unconfined/{}/g".format(LXC_APPARMOR_PROFILE), lxc_path + "/config"]
          tools.helpers.run.user(args, command)
  
-@@ -324,11 +396,6 @@ def make_base_props(args):
-         opengles = "196610"
-     props.append("ro.opengles.version=" + opengles)
- 
--    # Some Mali devices require ro.vendor.arm.egl.* props from the
--    # host for libEGL/GLES to work
--    for k, v in tools.helpers.props.host_list(args, "ro.vendor.arm.egl.").items():
--        props.append(k + "=" + v)
--
-     if args.images_path not in tools.config.defaults["preinstalled_images_paths"]:
-         props.append("waydroid.system_ota=" + args.system_ota)
-         props.append("waydroid.vendor_ota=" + args.vendor_ota)
 diff --git a/tools/services/hardware_manager.py b/tools/services/hardware_manager.py
 index 072df41..7f74391 100644
 --- a/tools/services/hardware_manager.py

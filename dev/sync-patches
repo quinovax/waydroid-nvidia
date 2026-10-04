@@ -37,6 +37,21 @@ say "waydroid: 0001-nvidia-integration (uncommitted gpu.py + lxc.py + hardware_m
 # the same upstream.  Diff pristine-vs-runtime with --no-index (readable as
 # root-owned) and rewrite the a/ b/ prefixes onto the upstream paths so the
 # result still applies with `git apply` after a fresh clone.
+#
+# The pristine tree MUST be the pinned SHA from packaging/ci/pins.env -- that is
+# the commit CI applies the patch to.  Diffing against upstream main instead
+# sweeps the distribution's own local modifications (Fedora's Mali
+# ro.vendor.arm.egl.* block in lxc.py, for one) into the patch as deletions of
+# lines the pinned base never had, and `git apply` then fails there with
+# "patch does not apply" -- which is exactly how the lxc.py:324 hunk broke.
+: "${WAYDROID_PATCH_SHA:=$(sed -n 's/^WAYDROID_SHA=//p' "$REPO/packaging/ci/pins.env")}"
+[ -n "$WAYDROID_PATCH_SHA" ] || {
+    echo "sync-patches: no WAYDROID_SHA in packaging/ci/pins.env" >&2; exit 1; }
+if [ "$(git -C "$WAYDROID_PATCH_TREE" rev-parse HEAD 2>/dev/null || echo none)" != "$WAYDROID_PATCH_SHA" ]; then
+    echo "sync-patches: checking out pinned waydroid base $WAYDROID_PATCH_SHA in $WAYDROID_PATCH_TREE"
+    git -C "$WAYDROID_PATCH_TREE" fetch -q --depth 1 origin "$WAYDROID_PATCH_SHA"
+    git -C "$WAYDROID_PATCH_TREE" checkout -q "$WAYDROID_PATCH_SHA"
+fi
 WAYDROID_PATHS=(
     tools/helpers/gpu.py
     tools/helpers/lxc.py
@@ -56,6 +71,13 @@ git diff --no-index --src-prefix=a/ --dst-prefix=b/ \
          "and $WAYDROID_SRC look identical; refusing to ship a no-op patch." >&2
     exit 1
 }
+# Refuse to ship a patch that cannot be applied at the pinned base CI uses.
+if ! git -C "$WAYDROID_PATCH_TREE" apply --check \
+        "$REPO/patches/waydroid/0001-nvidia-integration.patch" 2>/dev/null; then
+    echo "sync-patches: the generated waydroid patch does NOT apply at pinned base" \
+         "$WAYDROID_PATCH_SHA; it would break CI. Not shipping it." >&2
+    exit 1
+fi
 
 echo
 say "review (nothing committed):"
