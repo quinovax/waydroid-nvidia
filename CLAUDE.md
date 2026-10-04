@@ -17,6 +17,25 @@ Instead of hacks and crutches, solve problems fundamentally.
 Use every available resource — sources, etc. If some command is used very
 often via sudo mcp, get NOPASSWD rights for it.
 
+## Branch model — do not push daily work to main
+
+- **`dev` is the working branch.** Every ordinary commit lands here, and `dev` is
+  expected to be ahead of `main`.
+- **`main` is the release branch.** It only moves when a release is cut: `dev` is
+  merged/ff-integrated into `main` and a tag is pushed. Between releases `main`
+  sits on the last release commit.
+- So the normal push is `git push fork dev`. **Never `git push fork dev:dev
+  dev:main`** — that publishes unreleased work and breaks the release branch.
+- Before touching a remote branch, check what it actually points at:
+  `git ls-remote --heads fork`, `git log --oneline <tag>..<branch>`.
+  `v0.1.2` is an annotated tag, so compare with `git rev-parse v0.1.2^{commit}`
+  rather than `git rev-parse v0.1.2` (the latter yields the tag object).
+- If `main` was pushed by mistake, restore it to the last release commit with a
+  lease-protected force push:
+  `git push --force-with-lease=main:<current-remote-sha> fork <tag>^{commit}:refs/heads/main`
+  (plain `--force` risks clobbering someone else's push; the bare
+  `--force-with-lease=<name>:<sha>` form is rejected as non-fast-forward here).
+
 ## For agents working from a public clone
 
 - Orientation: README.md, then docs/building.md (repo layout, per-component
