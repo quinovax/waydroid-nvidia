@@ -15,8 +15,16 @@ set -euo pipefail
 : "${REPO:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # --- external trees ---
-: "${WNV:=$HOME/repos/waydroid-nv}"
-: "${WAYDROID_SRC:=$HOME/repos/waydroid}"
+# NOTE: this account was renamed and the trees moved; these defaults used to
+# point at $HOME/repos/{waydroid-nv,waydroid}, which no longer exist.  WNV is
+# ~/waydroid-nv.  There is no per-user waydroid.py checkout under $HOME: the
+# runtime is the Fedora package's /usr/lib/waydroid (root-owned, so
+# `git -C ... diff` cannot run there and sync-patches' waydroid patch has to
+# come from the writable git checkout in /tmp/wdsrc).
+: "${WNV:=$HOME/waydroid-nv}"
+: "${WAYDROID_SRC:=/usr/lib/waydroid}"
+# Writable git checkout of the same waydroid tree, used only as the patch anchor.
+: "${WAYDROID_PATCH_TREE:=/tmp/wdsrc}"
 
 : "${MESA_TREE:=$WNV/mesa}"
 : "${MESA_BUILD_X86_64:=${MESA_BUILD:-$MESA_TREE/build-android-x86_64}}"
@@ -25,7 +33,13 @@ set -euo pipefail
 : "${MESA_BUILD:=$MESA_BUILD_X86_64}"
 : "${VIRGL_TREE:=$WNV/virglrenderer}"
 : "${VIRGL_BUILD:=$VIRGL_TREE/build}"
-: "${HWC_TREE:=$WNV/hwcomposer-src}"
+# HWC_TREE must be the tree carrying patches/hwcomposer/0001.  hwcomposer-src is
+# a pristine upstream clone, so pointing sync-patches at it captures nothing
+# (and previously produced an empty 0001, silently dropping every HAL fix).
+# It is the git ROOT (the patch paths are hwcomposer/... relative to it);
+# HWC_SRCDIR is the subdir build/hwcomposer/build.sh compiles.
+: "${HWC_TREE:=$WNV/android_hardware_waydroid}"
+: "${HWC_SRCDIR:=$HWC_TREE/hwcomposer}"
 : "${HWC_BUILD:=$WNV/hwc-build}"
 : "${ANGLE_TREE:=$WNV/angle-src}"
 : "${ANGLE_OUT_X86_64:=$ANGLE_TREE/out/AndroidX64}"
