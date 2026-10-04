@@ -1490,7 +1490,7 @@ index 17d724069c5..8c8d4c093d5 100644
        .gem_handle = gem_handle,
     };
 diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
-index 7aaebd2de34..6554b3e49cb 100644
+index 7aaebd2de34..8370b25e3c6 100644
 --- a/src/virtio/vulkan/vn_renderer_vtest.c
 +++ b/src/virtio/vulkan/vn_renderer_vtest.c
 @@ -8,14 +8,19 @@
@@ -1579,7 +1579,7 @@ index 7aaebd2de34..6554b3e49cb 100644
  static void
 -vtest_read(struct vtest *vtest, void *buf, size_t size)
 +vtest_mark_dead(struct vtest *vtest, const char *why)
-+{
+ {
 +   if (vtest->sock_dead)
 +      return;
 +   vtest->sock_dead = true;
@@ -1592,7 +1592,7 @@ index 7aaebd2de34..6554b3e49cb 100644
 + * the LXC container RUNNING with no IP. */
 +static bool
 +vtest_read_ok(struct vtest *vtest, void *buf, size_t size)
- {
++{
 +   if (vtest->sock_dead) {
 +      memset(buf, 0, size);
 +      return false;
@@ -1972,7 +1972,23 @@ index 7aaebd2de34..6554b3e49cb 100644
     /* Resolve the (binary) sync's signal point to the pending submit's
      * VkFence on the server and export a sync_file from it.  -1 means the
      * point already retired (already-signaled sync_file convention).
-@@ -894,8 +1116,9 @@ vtest_shmem_destroy_now(struct vn_renderer *renderer,
+@@ -869,7 +1091,14 @@ vtest_bo_create_from_device_memory(
+    int res_fd;
+    uint32_t res_id = vtest_vcmd_resource_create_blob(
+       vtest, VCMD_BLOB_TYPE_HOST3D, blob_flags, size, mem_id, &res_fd);
+-   assert(res_id > 0 && res_fd >= 0);
++   if (res_id == 0 || res_fd < 0) {
++      vn_log(vtest->instance,
++             "NVWD: bo_create_from_device_memory failed (res_id=%u res_fd=%d "
++             "sock_dead=%d); returning DEVICE_LOST",
++             res_id, res_fd, vtest->sock_dead);
++      mtx_unlock(&vtest->sock_mutex);
++      return VK_ERROR_DEVICE_LOST;
++   }
+    mtx_unlock(&vtest->sock_mutex);
+ 
+    struct vtest_bo *bo = util_sparse_array_get(&vtest->bo_array, res_id);
+@@ -894,8 +1123,9 @@ vtest_shmem_destroy_now(struct vn_renderer *renderer,
  {
     struct vtest *vtest = (struct vtest *)renderer;
     struct vtest_shmem *shmem = (struct vtest_shmem *)_shmem;
@@ -1983,7 +1999,20 @@ index 7aaebd2de34..6554b3e49cb 100644
  
     mtx_lock(&vtest->sock_mutex);
     vtest_vcmd_resource_unref(vtest, shmem->base.res_id);
-@@ -936,8 +1159,8 @@ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -931,13 +1161,20 @@ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
+    uint32_t res_id = vtest_vcmd_resource_create_blob(
+       vtest, vtest->shmem_blob_mem, VCMD_BLOB_FLAG_MAPPABLE, size, 0,
+       &res_fd);
+-   assert(res_id > 0 && res_fd >= 0);
++   if (res_id == 0 || res_fd < 0) {
++      vn_log(vtest->instance,
++             "NVWD: shmem_create failed (res_id=%u res_fd=%d sock_dead=%d); "
++             "returning NULL",
++             res_id, res_fd, vtest->sock_dead);
++      mtx_unlock(&vtest->sock_mutex);
++      return NULL;
++   }
+    mtx_unlock(&vtest->sock_mutex);
  
     void *ptr =
        mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, res_fd, 0);
@@ -1993,7 +2022,7 @@ index 7aaebd2de34..6554b3e49cb 100644
        mtx_lock(&vtest->sock_mutex);
        vtest_vcmd_resource_unref(vtest, res_id);
        mtx_unlock(&vtest->sock_mutex);
-@@ -952,6 +1175,7 @@ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -952,6 +1189,7 @@ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
           .res_id = res_id,
           .mmap_size = size,
           .mmap_ptr = ptr,
@@ -2001,7 +2030,7 @@ index 7aaebd2de34..6554b3e49cb 100644
        },
     };
  
-@@ -1032,6 +1256,95 @@ vtest_submit(struct vn_renderer *renderer,
+@@ -1032,6 +1270,95 @@ vtest_submit(struct vn_renderer *renderer,
     return VK_SUCCESS;
  }
  
@@ -2097,7 +2126,7 @@ index 7aaebd2de34..6554b3e49cb 100644
  static void
  vtest_init_renderer_info(struct vtest *vtest)
  {
-@@ -1042,6 +1355,7 @@ vtest_init_renderer_info(struct vtest *vtest)
+@@ -1042,6 +1369,7 @@ vtest_init_renderer_info(struct vtest *vtest)
  
     info->has_dma_buf_import = vtest->has_venus_sync_fd;
     info->has_external_sync = vtest->has_venus_sync_fd;
@@ -2105,7 +2134,7 @@ index 7aaebd2de34..6554b3e49cb 100644
     info->has_implicit_fencing = false;
  
     const struct virgl_renderer_capset_venus *capset = &vtest->capset.data;
-@@ -1078,6 +1392,12 @@ vtest_destroy(struct vn_renderer *renderer,
+@@ -1078,6 +1406,12 @@ vtest_destroy(struct vn_renderer *renderer,
        close(vtest->sock_fd);
     }
  
@@ -2118,7 +2147,7 @@ index 7aaebd2de34..6554b3e49cb 100644
     mtx_destroy(&vtest->sock_mutex);
     util_sparse_array_finish(&vtest->shmem_array);
     util_sparse_array_finish(&vtest->bo_array);
-@@ -1172,11 +1492,41 @@ vtest_init(struct vtest *vtest)
+@@ -1172,11 +1506,41 @@ vtest_init(struct vtest *vtest)
  
     vtest_vcmd_context_init(vtest, vtest->capset.id);
  
