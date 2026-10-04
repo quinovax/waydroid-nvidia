@@ -8,5 +8,12 @@ base-commit: 7750307  (hwcomposer: restart touch input on resize)
 # no opaque region on FRAMEBUFFER_TARGET, LINEAR wl_shm fallback in
 # multi-window, vsync integer ns + ignore non-CLOCK_MONOTONIC presentation,
 # keep wl_buffer cache across HWC_GEOMETRY_CHANGED (prune unused instead
-# of dropping the whole map — that recreated dmabufs every frame).
-# Built standalone (no AOSP tree) via build/hwcomposer/build.sh.
+# of dropping the whole map — that recreated dmabufs every frame),
+# fake_touch (mouse clicks become MT touch: no CURSOR pointer device, hover
+# dropped), cursor LINEAR-buffer admission check on the cursor path (issue #11:
+# a modifier-0 cursor dmabuf was attached unconditionally, killing the HAL with
+# zwp_linux_buffer_params error 7), and no abort() on Wayland protocol loss
+# (exit the HAL so init restarts it instead of taking SurfaceFlinger down).
+# Built standalone (no AOSP tree) via build/hwcomposer/build.sh.  The default
+# SRC is $WNV/android_hardware_waydroid/hwcomposer — the tree carrying this
+# patch — and the script refuses to build an unpatched one.

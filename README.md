@@ -181,7 +181,7 @@ SPOOF_MODEL=SM-S908B SPOOF_BRAND=samsung sudo ./scripts/waydroid-guest-customize
 |------|--------|
 | `--magisk` | Install Magisk 30.1-Waydroid + Zygisk + Shamiko (requires [wsu](https://github.com/mistrmochov/WaydroidSU)) |
 | `--webview-gl` | Disable Vulkan draw functor in WebView, force GL path |
-| `--mouse-fix` | Enable relative mouse motion for games (`fake_touch=1`) |
+| `--mouse-fix` | Click-as-touch for games (`fake_touch=1` + `cursor_on_subsurface=true`) |
 | `--device-spoof` | Spoof device identity (default: HUAWEI VOG-AL10, override with `SPOOF_MODEL`/`SPOOF_BRAND`/`SPOOF_DEVICE`) |
 | `--settings-tweaks` | Hide dev settings, disable package verifier, set pointer speed |
 

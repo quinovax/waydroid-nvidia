@@ -80,22 +80,32 @@ webview_gl() {
 
 # ── Mouse/cursor fix ──
 mouse_fix() {
-  blue "== Mouse/cursor: enable relative motion for games"
+  blue "== Mouse/cursor: click-as-touch for games"
   adb_connect
   ADB shell settings put system pointer_speed -4 2>/dev/null || true
-  ADB shell setprop persist.waydroid.cursor_on_subsurface false 2>/dev/null || true
+  # fake_touch=1: the HAL stops exposing a CURSOR pointer device and instead
+  #   synthesises MT touch from pointer motion+buttons (logcat:
+  #   "mouse_as_touch: hover dropped, buttons become MT").
+  # cursor_on_subsurface=true is REQUIRED together with it: with false the HAL
+  #   builds a wl_cursor_cursor_handler, i.e. it uploads a cursor *surface* every
+  #   frame.  Under fake_touch Android never draws a cursor layer, so that is a
+  #   dead per-frame GPU layer -- and its LINEAR gralloc buffer is what triggered
+  #   zwp_linux_buffer_params error 7 on NVIDIA compositors, killing the HAL
+  #   (and with it SurfaceFlinger).  true keeps KWin's hardware cursor, which is
+  #   also what subsurface_cursor_handler::on_cursor_enter expects.
+  ADB shell setprop persist.waydroid.cursor_on_subsurface true 2>/dev/null || true
   ADB shell setprop persist.waydroid.fake_touch 1 2>/dev/null || true
   python3 - "$CFG" <<'PY'
 import configparser, sys
 from pathlib import Path
 cfg=Path(sys.argv[1]); cp=configparser.ConfigParser(); cp.optionxform=str; cp.read(cfg)
 p=cp.setdefault('properties',{})
-p['persist.waydroid.cursor_on_subsurface']='false'
+p['persist.waydroid.cursor_on_subsurface']='true'
 p['persist.waydroid.fake_touch']='1'
 with cfg.open('w') as f: cp.write(f)
 PY
   sync_cfg
-  green "  cursor_on_subsurface=false, fake_touch=1"
+  green "  cursor_on_subsurface=true, fake_touch=1 (click becomes MT touch)"
 }
 
 # ── Device identity spoof ──

@@ -1,5 +1,5 @@
 diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
-index a86b9aa..77e5c5e 100644
+index a86b9aa..e077871 100644
 --- a/hwcomposer/gralloc_handler.cpp
 +++ b/hwcomposer/gralloc_handler.cpp
 @@ -25,6 +25,7 @@
@@ -10,7 +10,31 @@ index a86b9aa..77e5c5e 100644
  #include <cstdint>
  #include <memory>
  
-@@ -162,6 +163,65 @@ namespace {
+@@ -101,11 +102,20 @@ std::unique_ptr<buffer> create_shm_wl_buffer(display *display, const buffer_meta
+ }
+ 
+ namespace {
+-    //TODO: Implement failure handling for dmabuf
++    /* The compositor rejected the dmabuf (typically
++     * zwp_linux_buffer_params "importing the supplied dmabufs failed", error 7,
++     * when a LINEAR buffer meets an NVIDIA EGL compositor).  Do NOT abort() here:
++     * abort() in this process kills the HIDL composer, SurfaceFlinger then hits
++     * DEAD_OBJECT and aborts too, and the whole Android framework soft-reboots --
++     * observed repeatedly before the LINEAR admission check was added to the
++     * cursor path.  There is nothing to salvage for this one buffer, so log it
++     * and let the caller fall back; the display keeps running with wl_shm. */
+     void create_failed(void *data __unused, zwp_linux_buffer_params_v1 *params __unused)
+     {
+-        ALOGE("%s: zwp_linux_buffer_params.create_immed failed.", __func__);
+-        abort();
++        static int failed_count = 0;
++        if ((failed_count++ % 50) == 0)
++            ALOGE("%s: zwp_linux_buffer_params.create_immed failed (buffer %d rejected by the "
++                  "compositor); continuing without it instead of aborting.", __func__, failed_count);
+     }
+ 
+     const struct zwp_linux_buffer_params_v1_listener params_listener = {
+@@ -162,6 +172,65 @@ namespace {
          return fmt;
      }
  }
@@ -76,7 +100,7 @@ index a86b9aa..77e5c5e 100644
  std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_metadata& metadata,
                                                                  int prime_fd, int drm_format, int byte_stride,
                                                                  int offset, uint64_t modifier, buffer_handle_t handle)
-@@ -178,6 +238,15 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_m
+@@ -178,6 +247,15 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_m
      }
      assert(drm_format >= 0);
  
@@ -92,7 +116,7 @@ index a86b9aa..77e5c5e 100644
      zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(display->dmabuf);
      zwp_linux_buffer_params_v1_add(params, prime_fd, 0, offset, byte_stride, modifier >> 32, modifier & 0xffffffff);
      zwp_linux_buffer_params_v1_add_listener(params, &params_listener, nullptr);
-@@ -264,6 +333,11 @@ std::unique_ptr<buffer> create_buffer_gbm(display *display, const buffer_metadat
+@@ -264,6 +342,11 @@ std::unique_ptr<buffer> create_buffer_gbm(display *display, const buffer_metadat
  }
  std::unique_ptr<buffer> create_buffer_cros(display *display, const buffer_metadata& metadata, buffer_handle_t handle) {
      auto *cros_handle = reinterpret_cast<const cros_gralloc_handle *>(handle);
@@ -104,7 +128,17 @@ index a86b9aa..77e5c5e 100644
      return create_dmabuf_wl_buffer(display, metadata, cros_handle->fds[0], cros_handle->format, cros_handle->strides[0], cros_handle->offsets[0], cros_handle->format_modifier, handle);
  }
  std::unique_ptr<buffer> create_buffer_android(display *display, const buffer_metadata& metadata, buffer_handle_t handle) {
-@@ -314,6 +388,8 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
+@@ -309,11 +392,17 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
+         case GrallocType::GRALLOC_DEFAULT:
+             return get_buffer_metadata_generic;
+         default:
+-            abort();
++            /* Unknown gralloc type: use the generic mapper instead of abort()ing
++             * the HAL (which would take SurfaceFlinger and the framework with it). */
++            ALOGE("unknown gralloc type %d; falling back to the generic mapper",
++                  (int)gralloc_type);
++            return get_buffer_metadata_generic;
+     }
  }
  
  gralloc_handler::create_buffer_func gralloc_handler::select_create_buffer_impl(display *display, GrallocType gralloc_type) {
@@ -113,7 +147,7 @@ index a86b9aa..77e5c5e 100644
      if (gralloc_type == GrallocType::GRALLOC_GBM && display->dmabuf) {
          return create_buffer_gbm;
      } else if (gralloc_type == GrallocType::GRALLOC_CROS && display->dmabuf) {
-@@ -333,7 +409,39 @@ gralloc_handler::update_shm_buffer_func gralloc_handler::select_update_shm_buffe
+@@ -333,7 +422,39 @@ gralloc_handler::update_shm_buffer_func gralloc_handler::select_update_shm_buffe
      }
  }
  
@@ -192,7 +226,7 @@ index 1d045e3..73a173b 100644
  };
 \ No newline at end of file
 diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
-index f509ed7..259a9b6 100644
+index f509ed7..ddeabaa 100644
 --- a/hwcomposer/hwcomposer.cpp
 +++ b/hwcomposer/hwcomposer.cpp
 @@ -17,10 +17,13 @@
@@ -367,14 +401,14 @@ index f509ed7..259a9b6 100644
 +}
 +
 +static void ns_to_timespec(uint64_t ns, struct timespec *ts)
-+{
+ {
+-    uint64_t now = (uint64_t)rt->tv_sec * 1e9 + rt->tv_nsec;
 +    ts->tv_sec = (time_t)(ns / NS_PER_SEC);
 +    ts->tv_nsec = (long)(ns % NS_PER_SEC);
 +}
 +
 +static uint64_t time_to_sleep_to_next_vsync(struct timespec *rt, uint64_t last_vsync_ns, unsigned vsync_period_ns)
- {
--    uint64_t now = (uint64_t)rt->tv_sec * 1e9 + rt->tv_nsec;
++{
 +    uint64_t now = timespec_to_ns(rt);
 +    if (vsync_period_ns == 0)
 +        vsync_period_ns = 16666666; /* ~60 Hz */
@@ -745,16 +779,57 @@ index f509ed7..259a9b6 100644
  
      for (auto& [key, window] : pdev->display->windows) {
          if (window->input_region) {
-@@ -483,6 +788,8 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+@@ -483,7 +788,18 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
  
      if (pdev->display->needHotplug && pdev->procs && pdev->procs->hotplug) {
          pdev->procs->hotplug(pdev->procs, 0, 1);
+-        pdev->display->buffer_map.clear();
 +        for (auto &[id, window] : pdev->display->windows)
 +            window->last_layer_buffer = nullptr;
-         pdev->display->buffer_map.clear();
++        /* Do NOT buffer_map.clear() here.  A hotplug happens on every window
++         * create/destroy, i.e. on every app switch in multi-window mode, and
++         * clearing the cache forced every live window to allocate a fresh
++         * dma-buf on the very next frame -- measured as bursts of ~16 Venus
++         * allocations per app switch.  That is the trigger for the NVIDIA
++         * Xid 69 (Class 0xC197 / Offset 0x19D0) on this box: the reallocation
++         * storm, not any single command.  prune_stale_cached_buffers() already
++         * reclaims entries that really stopped being used, with an 8-frame
++         * grace period, so buffers whose gralloc handle is still live stay
++         * valid across the hotplug. */
          pdev->display->needHotplug = false;
      }
-@@ -792,13 +1099,27 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+     return 0;
+@@ -686,6 +1002,19 @@ static void* hwc_binder_thread(void* data) {
+     }
+ 
+     ALOGI("Waydroid hwcomposer services are ready.");
++    /* Keep upstream's joinRpcThreadpool() exactly as it was.
++     * configureRpcThreadpool(1, callerWillJoin=true) promises this thread joins;
++     * replacing the join with a poll loop violates that promise and libbinder
++     * aborts the process with "Binder threadpool cannot be shrunk after starting".
++     * StopThreadPool() is not exported by this libbinder, so there is no way to
++     * wake the join when the Wayland connection dies.
++     *
++     * Consequence: if the compositor drops us, hwc_wayland_thread() returns
++     * (no longer abort()) and the display stops updating, while the HAL stays
++     * alive so SurfaceFlinger keeps its HIDL connection and does NOT crash-loop.
++     * Recovering that state needs a session bounce; it is still strictly better
++     * than the previous behaviour, where one protocol error took down the HAL,
++     * then SurfaceFlinger (DEAD_OBJECT), then the whole framework. */
+     joinRpcThreadpool();
+     // Should not pass this line
+ 
+@@ -781,6 +1110,9 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+     }
+ 
+     auto first_window = window::create(pdev->display, pdev->should_compose, "Waydroid", "0", {0, 0, 0, 255});
++    /* Dispatch thread must start only after the blocking roundtrips in
++     * window::create(), or HIDL never registers. */
++    start_wayland_thread(pdev->display);
+     if (!property_get_bool("waydroid.background_start", true)) {
+         pdev->display->windows.add("Waydroid", std::move(first_window));
+         property_set("waydroid.active_apps", "Waydroid");
+@@ -792,13 +1124,27 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
      if (pdev->display->refresh > 1000 && pdev->display->refresh < 1000000)
          pdev->vsync_period_ns = 1000 * 1000 * 1000 / (pdev->display->refresh / 1000);
  
@@ -783,7 +858,51 @@ index f509ed7..259a9b6 100644
  
      if (!pdev->vsync_thread) {
          ret = pthread_create (&pdev->vsync_thread, NULL, hwc_vsync_thread, pdev);
-@@ -919,11 +1240,16 @@ void wl_cursor_cursor_handler::set_cursor(display* display) const {
+@@ -823,6 +1169,22 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+ }
+ 
+ std::unique_ptr<buffer> cursor_handler::create_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata& metadata, hwc_layer_1 *hwc_layer) {
++    /* The cursor buffer needs the same importability check as every other layer.
++     * get_wl_buffer() skips the displayable_buffer() query for HWC_IS_CURSOR_LAYER
++     * (it routes cursor layers here), so without this the cursor's dmabuf was
++     * attached unconditionally.  Android's PointerBuffer / cursor gralloc often
++     * hands out LINEAR (modifier 0) dma_bufs, and a compositor on NVIDIA EGL
++     * cannot bind those as GL_TEXTURE_2D -- wl_display error 7, then
++     * hwc_wayland_thread() abort()s the whole HAL, SurfaceFlinger sees
++     * DEAD_OBJECT and Android soft-reboots.  Fall back to wl_shm, which the
++     * cursor path already uses when cursor_force_shm is set. */
++    if (hwc_layer->handle
++        && !pdev->gralloc_handler.displayable_buffer(pdev->display, hwc_layer->handle)) {
++        static int cursor_undisp_count = 0;
++        if ((cursor_undisp_count++ % 500) == 0)
++            ALOGW("cursor buffer not importable by compositor; wl_shm fallback");
++        return create_shm_wl_buffer(pdev->display, metadata, hwc_layer->handle);
++    }
+     return pdev->gralloc_handler.create_buffer(pdev->display, metadata, hwc_layer->handle);
+ };
+ 
+@@ -885,6 +1247,11 @@ int subsurface_cursor_handler::reset_cursor(waydroid_hwc_composer_device_1* pdev
+ }
+ 
+ int subsurface_cursor_handler::on_cursor_enter(display* display) {
++    /* fake_touch: Android has no pointer device and will not draw a cursor
++     * layer. Hiding the compositor cursor here makes the whole fullscreen
++     * Waydroid window unusable. Leave KWin's cursor alone. */
++    if (display->mouse_as_touch)
++        return 0;
+     if (display->pointer) {
+         wl_pointer_set_cursor(display->pointer, display->pointer_enter_serial,
+                               nullptr,
+@@ -911,6 +1278,8 @@ std::unique_ptr<buffer> wl_cursor_cursor_handler::create_buffer(waydroid_hwc_com
+ 
+ void wl_cursor_cursor_handler::set_cursor(display* display) const {
+     assert(display->pointer);
++    if (display->mouse_as_touch)
++        return;
+     wl_pointer_set_cursor (display->pointer, display->pointer_enter_serial,
+                           cursor_surface_context.surface,
+                           round(display->cursor_hotspot.x / display->scale),
+@@ -919,16 +1288,26 @@ void wl_cursor_cursor_handler::set_cursor(display* display) const {
  
  int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev, hwc_layer_1* hwc_layer, size_t hwc_layer_index) {
      if (pdev->display->pointer) {
@@ -801,6 +920,16 @@ index f509ed7..259a9b6 100644
      }
      return 0;
  }
+ 
+ int wl_cursor_cursor_handler::reset_cursor(waydroid_hwc_composer_device_1* pdev) {
++    /* Do not hide the compositor cursor when mouse_as_touch is on: there is
++     * no Android cursor layer, so this used to blank the pointer for the
++     * entire fullscreen Waydroid window. */
++    if (pdev->display->mouse_as_touch)
++        return 0;
+     if (pdev->display->pointer) {
+         wl_pointer_set_cursor(pdev->display->pointer, pdev->display->pointer_enter_serial,
+                               nullptr,
 diff --git a/hwcomposer/modes/full-ui.cpp b/hwcomposer/modes/full-ui.cpp
 index 351d780..52d27c6 100644
 --- a/hwcomposer/modes/full-ui.cpp
@@ -998,7 +1127,7 @@ index 14ffccb..f3027a6 100644
      }
  
 diff --git a/hwcomposer/modes/waydroid_mode.cpp b/hwcomposer/modes/waydroid_mode.cpp
-index a4a214a..16060ae 100644
+index a4a214a..0428c3d 100644
 --- a/hwcomposer/modes/waydroid_mode.cpp
 +++ b/hwcomposer/modes/waydroid_mode.cpp
 @@ -35,20 +35,41 @@ void clear_open_windows(waydroid_hwc_composer_device_1 *pdev) {
@@ -1050,6 +1179,44 @@ index a4a214a..16060ae 100644
          if (m_first_skipped == UNSET_VALUE) {
              m_first_skipped = i;
          }
+@@ -61,8 +82,13 @@ void skipped_layers_helper::setup_for_each_layer(size_t i, const hwc_layer_1 &la
+ 
+ void skipped_layers_helper::setup_set(hwc_layer_1* layers, size_t size) {
+     if (m_framebuffer_target_index >= size) {
+-        ALOGE("layers changed between prepare and set");
+-        abort();
++        /* SurfaceFlinger changed the layer list between prepare and set.  This is
++         * a guest-side race, not a HAL bug: abort() here would kill the composer
++         * and cascade into a SurfaceFlinger DEAD_OBJECT + framework reboot.  Point
++         * at the first layer and let the normal bounds checks handle it. */
++        ALOGE("layers changed between prepare and set (%zu >= %zu); clamping",
++              m_framebuffer_target_index, size);
++        m_framebuffer_target_index = 0;
+     }
+     m_framebuffer_target = &layers[m_framebuffer_target_index];
+ }
+@@ -133,13 +159,19 @@ void split_layer_names_helper::setup(waydroid_hwc_composer_device_1 *pdev, const
+ }
+ 
+ const std::string& layer_info::key() const {
++    /* Unknown split type: return a stable empty key instead of abort()ing.  This
++     * function hands out a reference, so it cannot signal failure by value; an
++     * empty key simply never matches a layer name, which degrades to "no split
++     * layer found" rather than killing the HAL (and, through DEAD_OBJECT,
++     * SurfaceFlinger and the whole framework). */
++    static const std::string empty_key;
+     if (type == LayerSplitType::TID) {
+         return tid;
+     } else if (type == LayerSplitType::RawName) {
+         return aid;
+-    } else {
+-        abort();
+     }
++    ALOGE("layer_info::key() called with unknown split type %d", (int)type);
++    return empty_key;
+ }
+ 
+ layer_info &split_layer_names_helper::operator[](size_t i) {
 diff --git a/hwcomposer/modes/waydroid_mode.h b/hwcomposer/modes/waydroid_mode.h
 index a93cb50..2d5daa8 100644
 --- a/hwcomposer/modes/waydroid_mode.h
@@ -1216,7 +1383,7 @@ index 000b388..0409349 100644
                  m_draw_framebuffer_at = i;
              }
 diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
-index 0bd2f35..69c001a 100644
+index 0bd2f35..6fb3471 100644
 --- a/hwcomposer/wayland-hwc.cpp
 +++ b/hwcomposer/wayland-hwc.cpp
 @@ -52,6 +52,7 @@
@@ -1227,7 +1394,19 @@ index 0bd2f35..69c001a 100644
  
  #include <libsync/sw_sync.h>
  #include <sync/sync.h>
-@@ -346,13 +347,55 @@ void surface_context::set_buffer_scale(double d_scale) {
+@@ -320,7 +321,10 @@ BufferTransform hwc_transform_to_buffer_transform(uint32_t hwc_transform) {
+             return BufferTransform::Flip_Rot_90;
+         default:
+             ALOGE("Invalid hwc_transform: %" PRIu32, hwc_transform);
+-            abort();
++            /* Fall back to identity rather than abort(): a guest sending a
++             * transform this build does not know must not kill the HAL (and with
++             * it SurfaceFlinger and the framework). */
++            return BufferTransform::Normal;
+     }
+ }
+ 
+@@ -346,13 +350,55 @@ void surface_context::set_buffer_scale(double d_scale) {
      wl_surface_set_buffer_scale(surface, scale);
  }
  
@@ -1288,7 +1467,7 @@ index 0bd2f35..69c001a 100644
  
      wp_viewport_set_source(viewport,
                             wl_fixed_from_double(x),
-@@ -380,6 +423,27 @@ void window::reset_per_set_state() {
+@@ -380,6 +426,27 @@ void window::reset_per_set_state() {
      }
  }
  
@@ -1316,7 +1495,7 @@ index 0bd2f35..69c001a 100644
  void window::set_maximize(bool enabled) {
      if (xdg_toplevel) {
          if (enabled) {
-@@ -472,6 +536,55 @@ static const struct wp_fractional_scale_v1_listener fractional_scale_listener =
+@@ -472,6 +539,55 @@ static const struct wp_fractional_scale_v1_listener fractional_scale_listener =
      .preferred_scale = fractional_scale_handle_preferred_scale
  };
  
@@ -1372,7 +1551,21 @@ index 0bd2f35..69c001a 100644
  std::unique_ptr<window>
  window::create(struct display *display, bool use_subsurfaces, std::string appID, std::string taskID, hwc_color_t color)
  {
-@@ -597,14 +710,17 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
+@@ -519,7 +635,12 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
+         wl_shell_surface_add_listener(window->shell_surface, &shell_surface_listener, window.get());
+         wl_shell_surface_set_toplevel(window->shell_surface);
+     } else {
+-        abort();
++        /* The compositor exposes neither xdg-shell nor wl_shell.  Return nullptr
++         * instead of abort(): callers already handle a null window, and killing
++         * the HAL here would cascade into SurfaceFlinger DEAD_OBJECT and a full
++         * framework reboot for a condition that is merely "cannot map windows". */
++        ALOGE("neither xdg-shell nor wl_shell is available; cannot create a window");
++        return nullptr;
+     }
+ 
+     if (display->isMaximized || calibrating) {
+@@ -597,14 +718,17 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
          wl_region_destroy(region);
      }
  
@@ -1392,7 +1585,7 @@ index 0bd2f35..69c001a 100644
          wl_surface_commit(window->surface);
          return window;
      } else if (!use_subsurfaces) {
-@@ -615,16 +731,27 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
+@@ -615,16 +739,27 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
          wl_subsurface_set_desync(window->layers[0].subsurface);
      }
  
@@ -1425,7 +1618,7 @@ index 0bd2f35..69c001a 100644
  
      return window;
  }
-@@ -732,6 +859,24 @@ ensure_pipe(struct display* display, int input_type)
+@@ -732,6 +867,24 @@ ensure_pipe(struct display* display, int input_type)
      event[n].value = value_;                       \
      n++;
  
@@ -1450,15 +1643,195 @@ index 0bd2f35..69c001a 100644
  static void
  send_key_event(display *data, uint32_t key, wl_keyboard_key_state state)
  {
-@@ -908,6 +1053,7 @@ pointer_handle_motion(void *data, struct wl_pointer *,
+@@ -856,6 +1009,9 @@ static const struct wl_keyboard_listener keyboard_listener = {
+     keyboard_handle_repeat_info,
+ };
+ 
++static void
++emit_mouse_touch(struct display *display, int down, int x, int y);
++
+ static void
+ pointer_handle_enter(void *data, struct wl_pointer *,
+                      uint32_t serial, struct wl_surface *surface,
+@@ -877,9 +1033,68 @@ pointer_handle_leave(void *data, struct wl_pointer *,
+                      uint32_t, struct wl_surface *)
+ {
+     struct display *display = (struct display *)data;
++    if (display->mouse_as_touch && display->ptr_btn_down) {
++        display->ptr_btn_down = 0;
++        emit_mouse_touch(display, -1, display->ptrPrvX, display->ptrPrvY);
++        ALOGI("mouse_as_touch: released active touch on pointer leave");
++    }
+     display->pointer_surface = NULL;
+ }
+ 
++static void
++ensure_touch_fifo(struct display *d)
++{
++    /* input_fd is 0-initialized on new display(); 0 is a live fd (stdin),
++     * not "unset". Treat only >=0 after an open() as connected. */
++    if (d->input_fd[INPUT_TOUCH] > 0)
++        return;
++    d->input_fd[INPUT_TOUCH] = -1;
++    if (access(INPUT_PIPE_NAME[INPUT_TOUCH], F_OK) != 0) {
++        if (mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRWXO | S_IRWXG | S_IRWXU) &&
++            errno != EEXIST) {
++            ALOGE("mkfifo %s: %s", INPUT_PIPE_NAME[INPUT_TOUCH], strerror(errno));
++            return;
++        }
++        chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
++    }
++    for (int i = 0; i < MAX_TOUCHPOINTS; i++)
++        d->touch_id[i] = -1;
++}
++
++static void
++emit_mouse_touch(struct display *display, int down, int x, int y)
++{
++    struct input_event event[6];
++    struct timespec rt;
++    unsigned int res, n = 0;
++    const int slot = 0;
++
++    ensure_touch_fifo(display);
++    if (ensure_pipe(display, INPUT_TOUCH))
++        return;
++    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
++        ALOGE("%s:%d error in touch clock_gettime: %s",
++              __FILE__, __LINE__, strerror(errno));
++    }
++    if (down < 0) {
++        ADD_EVENT(EV_ABS, ABS_MT_SLOT, slot);
++        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
++        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
++    } else {
++        ADD_EVENT(EV_ABS, ABS_MT_SLOT, slot);
++        if (down)
++            ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, slot);
++        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, x);
++        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, y);
++        ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
++        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
++    }
++    size_t nbytes = n * sizeof(event[0]);
++    res = write(display->input_fd[INPUT_TOUCH], &event, nbytes);
++    if (res < 0 || (size_t)res < nbytes)
++        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
++}
++
+ static void
+ pointer_handle_motion(void *data, struct wl_pointer *,
+                       uint32_t, wl_fixed_t sx, wl_fixed_t sy)
+@@ -890,16 +1105,9 @@ pointer_handle_motion(void *data, struct wl_pointer *,
+     int x, y;
+     unsigned int res, n = 0;
+ 
+-    if (ensure_pipe(display, INPUT_POINTER))
+-        return;
+-
+     if (!display->pointer_surface)
+         return;
+ 
+-    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+-        ALOGE("%s:%d error in touch clock_gettime: %s",
+-              __FILE__, __LINE__, strerror(errno));
+-    }
+     x = wl_fixed_to_int(sx);
+     y = wl_fixed_to_int(sy);
+     if (display->scale != 1) {
+@@ -908,14 +1116,32 @@ pointer_handle_motion(void *data, struct wl_pointer *,
      }
      x += display->layers[display->pointer_surface].x;
      y += display->layers[display->pointer_surface].y;
 +    clamp_to_display(display, &x, &y);
++    int dx = x - display->ptrPrvX;
++    int dy = y - display->ptrPrvY;
++    display->ptrPrvX = x;
++    display->ptrPrvY = y;
++
++    if (display->mouse_as_touch) {
++        /* Hover is what ANRs Unity via Houdini nativeInjectEvent. */
++        if (display->ptr_btn_down)
++            emit_mouse_touch(display, 0, x, y);
++        return;
++    }
++
++    if (ensure_pipe(display, INPUT_POINTER))
++        return;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
++        ALOGE("%s:%d error in touch clock_gettime: %s",
++              __FILE__, __LINE__, strerror(errno));
++    }
  
      ADD_EVENT(EV_ABS, ABS_X, x);
      ADD_EVENT(EV_ABS, ABS_Y, y);
-@@ -1147,6 +1293,7 @@ touch_handle_down(void *data, struct wl_touch *,
+-    ADD_EVENT(EV_REL, REL_X, x - display->ptrPrvX);
+-    ADD_EVENT(EV_REL, REL_Y, y - display->ptrPrvY);
++    ADD_EVENT(EV_REL, REL_X, dx);
++    ADD_EVENT(EV_REL, REL_Y, dy);
+     ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+-    display->ptrPrvX = x;
+-    display->ptrPrvY = y;
+ 
+     res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
+     if (res < sizeof(event))
+@@ -934,6 +1160,9 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
+     static double acc_x = 0;
+     static double acc_y = 0;
+ 
++    if (display->mouse_as_touch)
++        return;
++
+     if (ensure_pipe(display, INPUT_POINTER))
+         return;
+ 
+@@ -970,12 +1199,33 @@ pointer_handle_button(void *data, struct wl_pointer *,
+     struct timespec rt;
+     unsigned int res, n = 0;
+ 
+-    if (ensure_pipe(display, INPUT_POINTER))
++    if (display->mouse_as_touch) {
++        if (button != BTN_LEFT)
++            return;
++
++        if (!state) {
++            if (display->ptr_btn_down) {
++                display->ptr_btn_down = 0;
++                emit_mouse_touch(display, -1, display->ptrPrvX,
++                                 display->ptrPrvY);
++            }
++            return;
++        }
++
++        if (!display->pointer_surface || display->ptr_btn_down)
++            return;
++
++        display->ptr_btn_down = 1;
++        emit_mouse_touch(display, 1, display->ptrPrvX, display->ptrPrvY);
+         return;
++    }
+ 
+     if (!display->pointer_surface)
+         return;
+ 
++    if (ensure_pipe(display, INPUT_POINTER))
++        return;
++
+     if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+         ALOGE("%s:%d error in touch clock_gettime: %s",
+               __FILE__, __LINE__, strerror(errno));
+@@ -999,6 +1249,9 @@ pointer_handle_axis(void *data, struct wl_pointer *,
+     double fVal = wl_fixed_to_double(value) / 10.0f;
+     double step = 1.0f;
+ 
++    if (display->mouse_as_touch)
++        return;
++
+     if (ensure_pipe(display, INPUT_POINTER))
+         return;
+ 
+@@ -1147,6 +1400,7 @@ touch_handle_down(void *data, struct wl_touch *,
      }
      x += display->layers[surface].x;
      y += display->layers[surface].y;
@@ -1466,7 +1839,7 @@ index 0bd2f35..69c001a 100644
  
      ADD_EVENT(EV_ABS, ABS_MT_SLOT, touch_id);
      ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, touch_id);
-@@ -1219,6 +1366,7 @@ touch_handle_motion(void *data, struct wl_touch *,
+@@ -1219,6 +1473,7 @@ touch_handle_motion(void *data, struct wl_touch *,
          }
          x += display->layers[display->touch_surfaces[id]].x;
          y += display->layers[display->touch_surfaces[id]].y;
@@ -1474,7 +1847,24 @@ index 0bd2f35..69c001a 100644
  
          ADD_EVENT(EV_ABS, ABS_MT_SLOT, touch_id);
          ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, touch_id);
-@@ -1475,10 +1623,12 @@ static const struct wl_output_listener output_listener = {
+@@ -1346,8 +1601,14 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
+         d->ptrPrvX = 0;
+         d->ptrPrvY = 0;
+         d->reverseScroll = property_get_bool("persist.waydroid.reverse_scrolling", false);
+-        mkfifo(INPUT_PIPE_NAME[INPUT_POINTER], S_IRWXO | S_IRWXG | S_IRWXU);
+-        chown(INPUT_PIPE_NAME[INPUT_POINTER], 1000, 1000);
++        if (d->mouse_as_touch) {
++            /* No mouse device → InputFlinger cannot generate HOVER_MOVE. */
++            remove(INPUT_PIPE_NAME[INPUT_POINTER]);
++            ensure_touch_fifo(d);
++        } else {
++            mkfifo(INPUT_PIPE_NAME[INPUT_POINTER], S_IRWXO | S_IRWXG | S_IRWXU);
++            chown(INPUT_PIPE_NAME[INPUT_POINTER], 1000, 1000);
++        }
+         wl_pointer_add_listener(d->pointer, &pointer_listener, d);
+     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
+         remove(INPUT_PIPE_NAME[INPUT_POINTER]);
+@@ -1475,10 +1736,12 @@ static const struct wl_output_listener output_listener = {
  };
  
  static void
@@ -1489,7 +1879,7 @@ index 0bd2f35..69c001a 100644
  }
  
  static const struct wp_presentation_listener presentation_listener = {
-@@ -1687,6 +1837,7 @@ tablet_tool_motion(void *data, struct zwp_tablet_tool_v2 *,
+@@ -1687,6 +1950,7 @@ tablet_tool_motion(void *data, struct zwp_tablet_tool_v2 *,
          }
          x += display->layers[display->tablet_surface].x;
          y += display->layers[display->tablet_surface].y;
@@ -1497,11 +1887,23 @@ index 0bd2f35..69c001a 100644
  
          ADD_EVENT(EV_ABS, ABS_X, x);
          ADD_EVENT(EV_ABS, ABS_Y, y);
-@@ -2047,7 +2198,17 @@ static void* hwc_wayland_thread(void* data) {
+@@ -2038,6 +2302,9 @@ void open_windows::erase(const key_type& key) {
+     }
+ }
+ 
++/* set by start_wayland_thread(); create_display() only ever builds one display */
++static struct display *g_wayland_display = nullptr;
++
+ static void* hwc_wayland_thread(void* data) {
+     auto* display = static_cast<struct wl_display*>(data);
+     int ret = 0;
+@@ -2047,9 +2314,40 @@ static void* hwc_wayland_thread(void* data) {
      while (ret != -1)
          ret = wl_display_dispatch(display);
  
 -    ALOGE("*** %s: Wayland client was disconnected: %s", __PRETTY_FUNCTION__, strerror(ret));
+-
+-    abort();
 +    int err = wl_display_get_error(display);
 +    if (err == EPROTO) {
 +        const struct wl_interface *iface = nullptr;
@@ -1513,10 +1915,33 @@ index 0bd2f35..69c001a 100644
 +        ALOGE("*** %s: Wayland client was disconnected: %s", __PRETTY_FUNCTION__,
 +              strerror(err));
 +    }
- 
-     abort();
++
++    /* The Wayland connection is gone and cannot be re-established from here.
++     *
++     * It used to abort() here, which is fatal far beyond this process: SurfaceFlinger
++     * sees the HIDL composer die, aborts on DEAD_OBJECT, and the whole Android
++     * framework soft-reboots (observed repeatedly, e.g. "The system died" 90x).
++     * Do not abort.
++     *
++     * We also must not _exit() from this thread: hwc_binder_thread() is blocked in
++     * joinRpcThreadpool() under callerWillJoin semantics, and killing the process
++     * underneath it trips libbinder's "Binder threadpool cannot be shrunk after
++     * starting" abort -- just as hard (05:44:14 tombstone).
++     *
++     * So: flag the display and return.  The HAL stays alive and keeps answering HIDL
++     * calls (so SurfaceFlinger does not crash-loop), it just stops updating the
++     * display.  The flag is what lets a future change -- or a bug report -- tell
++     * "frozen because the compositor vanished" apart from "hung".  Recovery is a
++     * session bounce; that is still much better than a framework-wide reboot. */
++    ALOGE("*** %s: Wayland connection lost; marking display dead "
++          "(HAL stays up so SurfaceFlinger does not crash-loop)", __PRETTY_FUNCTION__);
++    if (g_wayland_display)
++        g_wayland_display->wayland_dead = true;
++    return nullptr;
  }
-@@ -2064,6 +2225,7 @@ create_display(const char *gralloc)
+ 
+ struct display *
+@@ -2064,9 +2362,18 @@ create_display(const char *gralloc)
      display->system_version = property_get_int32("ro.system.build.version.sdk", 0);
      display->gtype = get_gralloc_type(gralloc);
      display->refresh = 0;
@@ -1524,11 +1949,95 @@ index 0bd2f35..69c001a 100644
      display->isMaximized = true;
      display->supports_cursor_viewport = true;
      display->supports_cursor_hw_buffer = property_get_bool("persist.waydroid.cursor_force_shm", false);
++    {
++        char ft[PROPERTY_VALUE_MAX] = {};
++        property_get("persist.waydroid.fake_touch", ft, "");
++        display->mouse_as_touch = ft[0] != '\0';
++        display->ptr_btn_down = 0;
++        if (display->mouse_as_touch)
++            ALOGI("mouse_as_touch: hover dropped, buttons become MT (fake_touch='%s')", ft);
++    }
+     display->display = wl_display_connect(NULL);
+     ALOGI("WAYLAND_DISPLAY: %s", getenv("WAYLAND_DISPLAY"));
+     ALOGI("XDG_RUNTIME_DIR: %s", getenv("XDG_RUNTIME_DIR"));
+@@ -2080,29 +2387,55 @@ create_display(const char *gralloc)
+     umask(0);
+     mkdir("/dev/input", S_IRWXO | S_IRWXG | S_IRWXU);
+     chown("/dev/input", 1000, 1000);
++    for (int i = 0; i < INPUT_TOTAL; i++)
++        display->input_fd[i] = -1;
++    /* Create the touch fifo before InputFlinger scans /dev/input. niri has
++     * no wl_touch; fake_touch maps mouse clicks onto this node. Creating it
++     * only from seat.pointer (after EventHub start) left no device, so
++     * clicks vanished. */
++    if (display->mouse_as_touch)
++        ensure_touch_fifo(display);
+ 
+     display->registry = wl_display_get_registry(display->display);
+     wl_registry_add_listener(display->registry,
+                  &registry_listener, display);
+     wl_display_roundtrip(display->display);
+ 
+-    if (pthread_create(&display->wayland_thread, nullptr, hwc_wayland_thread, display->display) != 0) {
+-        ALOGE("Couldn't create wayland thread");
+-        wl_display_disconnect(display->display);
+-        sem_destroy(&display->egl_go);
+-        sem_destroy(&display->egl_done);
+-        return nullptr;
+-    }
++    /* Do NOT start the dispatch thread yet. hwc_open's window::create()
++     * does wl_display_roundtrip() until xdg configure; a concurrent
++     * wl_display_dispatch() steals that event and deadlocks HIDL
++     * registration (SurfaceFlinger waits forever for IComposer).
++     * start_wayland_thread() is called after the first window exists. */
++    display->wayland_thread_started = false;
+ 
+     display->task = IWaydroidTask::getService();
+     return display;
+ }
+ 
++void
++start_wayland_thread(struct display *display)
++{
++    if (!display || display->wayland_thread_started)
++        return;
++    /* The thread needs both the raw wl_display (to dispatch) and our struct
++     * display (to flag wayland_dead for hwc_binder_thread), so stash the latter in
++     * a file-scope pointer: create_display() only ever produces one. */
++    g_wayland_display = display;
++    if (pthread_create(&display->wayland_thread, nullptr, hwc_wayland_thread, display->display) != 0) {
++        ALOGE("Couldn't create wayland thread");
++        return;
++    }
++    display->wayland_thread_started = true;
++}
++
+ void
+ destroy_display(struct display *display)
+ {
+-    pthread_kill(display->wayland_thread, SIGTERM);
+-    pthread_join(display->wayland_thread, nullptr);
++    if (display->wayland_thread_started) {
++        pthread_kill(display->wayland_thread, SIGTERM);
++        pthread_join(display->wayland_thread, nullptr);
++        display->wayland_thread_started = false;
++    }
+ 
+     if (display->wm_base)
+         xdg_wm_base_destroy(display->wm_base);
 diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
-index 82ebbd5..9bcb874 100644
+index 82ebbd5..663355e 100644
 --- a/hwcomposer/wayland-hwc.h
 +++ b/hwcomposer/wayland-hwc.h
-@@ -107,18 +107,21 @@ struct buffer_metadata {
+@@ -30,6 +30,7 @@
+ 
+ #include <cutils/native_handle.h>
+ 
++#include <atomic>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -107,18 +108,21 @@ struct buffer_metadata {
      uint32_t width;
      uint32_t pixel_stride;
      uint32_t format;
@@ -1555,7 +2064,7 @@ index 82ebbd5..9bcb874 100644
  }
  
  struct buffer {
-@@ -130,6 +133,10 @@ struct buffer {
+@@ -130,6 +134,10 @@ struct buffer {
      bool isShm;
      void *shm_data;
      int size;
@@ -1566,7 +2075,7 @@ index 82ebbd5..9bcb874 100644
  
      ~buffer();
  };
-@@ -162,8 +169,9 @@ struct surface_context {
+@@ -162,8 +170,9 @@ struct surface_context {
      void damage_surface(int32_t x, int32_t y, int32_t width, int32_t height);
      void set_buffer_transform(BufferTransform transform);
      void set_buffer_scale(double scale);
@@ -1578,7 +2087,7 @@ index 82ebbd5..9bcb874 100644
      // TODO: This should not require scale. Scaling handling is broken
      void set_display_frame(hwc_rect_t rect, double scale);
  };
-@@ -212,6 +220,18 @@ struct window {
+@@ -212,6 +221,18 @@ struct window {
      int lastLayer;
      struct buffer *last_layer_buffer;
  
@@ -1597,7 +2106,17 @@ index 82ebbd5..9bcb874 100644
      ~window();
  
      static std::unique_ptr<window> create(struct display *display, bool use_subsurfaces, std::string appID, std::string taskID, hwc_color_t color);
-@@ -314,6 +334,10 @@ struct display {
+@@ -300,7 +321,8 @@ struct cursor_handler {
+ };
+ 
+ struct display {
+-    pthread_t wayland_thread; // constant after init
++    pthread_t wayland_thread {};
++    bool wayland_thread_started = false;
+ 
+     struct wl_display *display;
+     struct wl_registry *registry;
+@@ -314,6 +336,10 @@ struct display {
      struct wl_touch *touch;
      struct wl_output *output;
      struct wp_presentation *presentation;
@@ -1608,3 +2127,34 @@ index 82ebbd5..9bcb874 100644
      struct wp_viewporter *viewporter;
      struct android_wlegl *android_wlegl;
      struct zwp_linux_dmabuf_v1 *dmabuf;
+@@ -335,6 +361,11 @@ struct display {
+     int input_fd[INPUT_TOTAL];
+     int ptrPrvX;
+     int ptrPrvY;
++    /* persist.waydroid.fake_touch is a package glob in Java and does not
++     * rewrite HOVER_MOVE for Unity/Houdini. When the prop is set we never
++     * emit a mouse device: buttoned motion becomes MT touch, hover is dropped. */
++    bool mouse_as_touch;
++    int ptr_btn_down;
+     double wheelAccumulatorX;
+     double wheelAccumulatorY;
+     bool wheelEvtIsDiscrete;
+@@ -384,6 +415,11 @@ struct display {
+     bool supports_cursor_hw_buffer;
+ 
+     bool isMaximized;
++    /* Set by hwc_wayland_thread() when the Wayland connection dies.  The binder
++     * thread polls this so it can leave joinRpcThreadpool() and exit the process
++     * in an orderly way -- see the comment there for why neither abort() nor
++     * _exit() from that thread is safe. */
++    std::atomic<bool> wayland_dead{false};
+     sp<IWaydroidTask> task;
+ 
+     const hwc_procs_t *procs;
+@@ -399,5 +435,6 @@ snapshot_inactive_app_window(struct display *display, struct window *window);
+ 
+ struct display *
+ create_display(const char* gralloc);
++void start_wayland_thread(struct display *display);
+ void
+ destroy_display(struct display *display);

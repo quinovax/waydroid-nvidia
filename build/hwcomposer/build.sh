@@ -24,9 +24,22 @@ CXX="$NDK/x86_64-linux-android34-clang++"
 CC="$NDK/x86_64-linux-android34-clang"
 STRIP="$NDK/llvm-strip"
 
-SRC="${1:-$WNV/hwcomposer-src/hwcomposer}"
+# The default SRC must be the tree that carries patches/hwcomposer/0001 (the
+# `displayable_buffer` / `mouse_as_touch` / LINEAR-client-composition work).
+# $WNV/hwcomposer-src is a pristine upstream clone, so defaulting to it silently
+# built a HAL with every repo fix stripped -- that is how a deployed HAL ended up
+# without fake_touch support at all.
+SRC="${1:-$WNV/android_hardware_waydroid/hwcomposer}"
 OUT="${2:-$HERE/out}"
 GEN="$HERE/gen"
+
+if ! grep -q displayable_buffer_impl "$SRC/gralloc_handler.h" 2>/dev/null; then
+    echo "hwcomposer/build.sh: $SRC does not carry the repo patches." >&2
+    echo "  Expected patches/hwcomposer/0001 to be applied (it adds" >&2
+    echo "  gralloc_handler::displayable_buffer).  Apply it first:" >&2
+    echo "    cd \$(dirname $SRC) && git apply <repo>/patches/hwcomposer/0001-*.patch" >&2
+    exit 1
+fi
 
 # The final link resolves vendor.waydroid.*.so from the image rootfs, which is
 # only present when the container has been started at least once.
