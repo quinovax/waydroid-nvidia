@@ -226,7 +226,7 @@ index 1d045e3..73a173b 100644
  };
 \ No newline at end of file
 diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
-index f509ed7..c855a10 100644
+index f509ed7..37be675 100644
 --- a/hwcomposer/hwcomposer.cpp
 +++ b/hwcomposer/hwcomposer.cpp
 @@ -17,10 +17,14 @@
@@ -244,6 +244,17 @@ index f509ed7..c855a10 100644
  #include <sys/time.h>
  #include <sys/resource.h>
  #include <unistd.h>
+@@ -57,8 +61,8 @@
+ #include "modes/multi-window.h"
+ #include "modes/single-window.h"
+ 
+-using ::android::hardware::configureRpcThreadpool;
+-using ::android::hardware::joinRpcThreadpool;
++using ::android::hardware::setupBinderPolling;
++using ::android::hardware::handleBinderPoll;
+ 
+ using ::vendor::waydroid::display::V1_2::IWaydroidDisplay;
+ using ::vendor::waydroid::display::V1_2::implementation::WaydroidDisplay;
 @@ -86,6 +90,100 @@ namespace {
          return src;
      }
@@ -800,27 +811,88 @@ index f509ed7..c855a10 100644
          pdev->display->needHotplug = false;
      }
      return 0;
-@@ -686,6 +1003,19 @@ static void* hwc_binder_thread(void* data) {
+@@ -650,7 +967,42 @@ static void* hwc_binder_thread(void* data) {
+     sp<IWaydroidClipboard> waydroidClipboard;
+ 
+     setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
+-    configureRpcThreadpool(1, true /*callerWillJoin*/);
++
++    /* Do NOT call configureRpcThreadpool()/joinRpcThreadpool() here.
++     *
++     * hwc_open() runs on the main thread and already registers
++     * IComposer/default, which makes libbinder start the thread pool with
++     * libhidlbase's default max thread count.  Calling
++     * configureRpcThreadpool(1, callerWillJoin=true) afterwards reaches
++     * ProcessState::setThreadPoolMaxThreadCount() with the pool already
++     * started, and libbinder's own guard fires:
++     *
++     *   ProcessState.cpp:393
++     *     LOG_ALWAYS_FATAL_IF(mThreadPoolStarted && maxThreads < mMaxThreads,
++     *            "Binder threadpool cannot be shrunk after starting");
++     *
++     * That is LOG_ALWAYS_FATAL, i.e. abort(): the HIDL composer dies at
++     * startup, SurfaceFlinger's first getColorModes() gets DEAD_OBJECT and
++     * aborts in return_status::assertOk(), DisplayManagerService then fails
++     * with "Timeout waiting for default display to be initialized" and the
++     * framework soft-reboots.  Observed 2026-10-04 14:53:43 -- the HAL died
++     * twice in a row and only the third attempt came up.
++     *
++     * This is a race, which is why it looked fine for a long time: whether the
++     * main thread has registered IComposer/default by the time this thread
++     * runs decides whether the shrinking guard trips.
++     *
++     * The supported way to serve HIDL from an already-running pool is libhidl's
++     * polling interface -- the same mechanism AOSP's HIDL_FATAL /
++     * "async" wrappers use.  setupBinderPolling()/handleBinderPoll() take no
++     * thread-count argument at all, so there is nothing to shrink and the
++     * fatal above cannot be reached from here.
++     */
++    int pollFd = setupBinderPolling();
++    if (pollFd < 0) {
++        ALOGE("setupBinderPolling failed; Waydroid services will not be served.");
++        goto shutdown;
++    }
+ 
+     waydroidDisplay = new WaydroidDisplay(pdev->display);
+     if (waydroidDisplay == nullptr) {
+@@ -686,8 +1038,34 @@ static void* hwc_binder_thread(void* data) {
      }
  
      ALOGI("Waydroid hwcomposer services are ready.");
-+    /* Keep upstream's joinRpcThreadpool() exactly as it was.
-+     * configureRpcThreadpool(1, callerWillJoin=true) promises this thread joins;
-+     * replacing the join with a poll loop violates that promise and libbinder
-+     * aborts the process with "Binder threadpool cannot be shrunk after starting".
-+     * StopThreadPool() is not exported by this libbinder, so there is no way to
-+     * wake the join when the Wayland connection dies.
+-    joinRpcThreadpool();
+-    // Should not pass this line
++    /* Serve HIDL on the poll fd obtained above.
 +     *
-+     * Consequence: if the compositor drops us, hwc_wayland_thread() returns
-+     * (no longer abort()) and the display stops updating, while the HAL stays
-+     * alive so SurfaceFlinger keeps its HIDL connection and does NOT crash-loop.
-+     * Recovering that state needs a session bounce; it is still strictly better
-+     * than the previous behaviour, where one protocol error took down the HAL,
-+     * then SurfaceFlinger (DEAD_OBJECT), then the whole framework. */
-     joinRpcThreadpool();
-     // Should not pass this line
++     * A previous revision joined the thread pool instead (joinRpcThreadpool()
++     * paired with configureRpcThreadpool(1, callerWillJoin=true)).  That is
++     * fatal here for two independent reasons: the shrinking guard quoted
++     * above fires at configure time, and libbinder additionally asserts that
++     * a callerWillJoin=true caller is the one that joins -- which is not true
++     * any more, because hwc_open() on the main thread started the pool first.
++     * handleBinderPoll() has neither contract, so this thread simply services
++     * whatever the already-running pool routes to it.
++     *
++     * Consequence unchanged from the round-13 design: if the compositor drops
++     * the Wayland connection, hwc_wayland_thread() returns and only the display
++     * updates stop, while this loop keeps answering HIDL so SurfaceFlinger does
++     * not crash-loop.  Recovery from a dead display needs a session bounce,
++     * which is still far better than taking the whole framework down. */
++    for (;;) {
++        int err = handleBinderPoll();
++        if (err != OK) {
++            /* handlePolledCommands() returns -EINTR when a binder call lands on
++             * this thread; that is normal traffic, not a shutdown request. */
++            if (err == -EINTR || err == -EAGAIN)
++                continue;
++            ALOGE("handleBinderPoll returned %d (%s); stopping binder loop",
++                  err, strerror(-err));
++            break;
++        }
++    }
  
-@@ -705,6 +1035,28 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+ shutdown:
+     // In normal operation, we don't expect the thread pool to shutdown
+@@ -705,6 +1083,28 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
          return -EINVAL;
      }
  
@@ -849,7 +921,7 @@ index f509ed7..c855a10 100644
      waydroid_hwc_composer_device_1 *pdev = new waydroid_hwc_composer_device_1();
      if (!pdev) {
          ALOGE("%s failed to allocate dev", __FUNCTION__);
-@@ -781,6 +1133,9 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+@@ -781,6 +1181,9 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
      }
  
      auto first_window = window::create(pdev->display, pdev->should_compose, "Waydroid", "0", {0, 0, 0, 255});
@@ -859,7 +931,7 @@ index f509ed7..c855a10 100644
      if (!property_get_bool("waydroid.background_start", true)) {
          pdev->display->windows.add("Waydroid", std::move(first_window));
          property_set("waydroid.active_apps", "Waydroid");
-@@ -792,13 +1147,27 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+@@ -792,13 +1195,27 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
      if (pdev->display->refresh > 1000 && pdev->display->refresh < 1000000)
          pdev->vsync_period_ns = 1000 * 1000 * 1000 / (pdev->display->refresh / 1000);
  
@@ -888,7 +960,7 @@ index f509ed7..c855a10 100644
  
      if (!pdev->vsync_thread) {
          ret = pthread_create (&pdev->vsync_thread, NULL, hwc_vsync_thread, pdev);
-@@ -823,6 +1192,22 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+@@ -823,6 +1240,22 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
  }
  
  std::unique_ptr<buffer> cursor_handler::create_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata& metadata, hwc_layer_1 *hwc_layer) {
@@ -911,7 +983,7 @@ index f509ed7..c855a10 100644
      return pdev->gralloc_handler.create_buffer(pdev->display, metadata, hwc_layer->handle);
  };
  
-@@ -885,6 +1270,11 @@ int subsurface_cursor_handler::reset_cursor(waydroid_hwc_composer_device_1* pdev
+@@ -885,6 +1318,11 @@ int subsurface_cursor_handler::reset_cursor(waydroid_hwc_composer_device_1* pdev
  }
  
  int subsurface_cursor_handler::on_cursor_enter(display* display) {
@@ -923,7 +995,7 @@ index f509ed7..c855a10 100644
      if (display->pointer) {
          wl_pointer_set_cursor(display->pointer, display->pointer_enter_serial,
                                nullptr,
-@@ -911,6 +1301,8 @@ std::unique_ptr<buffer> wl_cursor_cursor_handler::create_buffer(waydroid_hwc_com
+@@ -911,6 +1349,8 @@ std::unique_ptr<buffer> wl_cursor_cursor_handler::create_buffer(waydroid_hwc_com
  
  void wl_cursor_cursor_handler::set_cursor(display* display) const {
      assert(display->pointer);
@@ -932,7 +1004,7 @@ index f509ed7..c855a10 100644
      wl_pointer_set_cursor (display->pointer, display->pointer_enter_serial,
                            cursor_surface_context.surface,
                            round(display->cursor_hotspot.x / display->scale),
-@@ -919,16 +1311,26 @@ void wl_cursor_cursor_handler::set_cursor(display* display) const {
+@@ -919,16 +1359,26 @@ void wl_cursor_cursor_handler::set_cursor(display* display) const {
  
  int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev, hwc_layer_1* hwc_layer, size_t hwc_layer_index) {
      if (pdev->display->pointer) {
