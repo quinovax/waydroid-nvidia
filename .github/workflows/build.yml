@@ -17,9 +17,13 @@
 # runner (label: lineage) holding the lineage-20 tree.
 name: build
 
+# Every commit on dev is verified here too, not just main: dev is where day-to-day
+# work lands, and a commit that only gets checked once it is integrated into main
+# has already been merged unverified. The release job stays tag-only (see its
+# `if:`), so adding dev below builds and tests but never publishes.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
