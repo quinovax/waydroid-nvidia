@@ -17,6 +17,30 @@ Instead of hacks and crutches, solve problems fundamentally.
 Use every available resource — sources, etc. If some command is used very
 often via sudo mcp, get NOPASSWD rights for it.
 
+## Two different "issue #11" — always qualify the repo
+
+This fork has its own issues **and** the upstream has its own, and the numbers
+collide. `Shiro836/waydroid-nvidia#11` is "Waydroid UI crashing when opening
+certain apps" (a LINEAR dma_buf / `CoglTexture2D` bind problem).
+`quinovax/waydroid-nvidia#11` is "Launching a GLES game triggers Xid-69
+(0xC997/0x274) and the device-lost path leaves the guest in an unrecoverable
+SurfaceFlinger crash-loop". Same number, unrelated bugs.
+
+Note also that the issue numbers in this fork's commit history (`#7`, `#9`,
+`#10`, ...) are **this fork's** numbers, not upstream's.
+
+Therefore:
+
+- Remotes follow the git convention: `origin` = `quinovax/waydroid-nvidia`
+  (this repo), `upstream` = `Shiro836/waydroid-nvidia`. Do not swap them.
+- `gh` has its default repository set to `quinovax/waydroid-nvidia`, so a bare
+  `gh issue view 11` resolves here. Keep it that way (`gh repo set-default
+  quinovax/waydroid-nvidia`).
+- In commit messages, issues, docs and user-facing text, **always write the
+  fully qualified reference** — `quinovax/waydroid-nvidia#11` or
+  `Shiro836/waydroid-nvidia#11` — never a bare `#11`. A bare number is
+  ambiguous here and is the single most likely way to work on the wrong bug.
+
 ## Branch model — do not push daily work to main
 
 - **`dev` is the working branch.** Every ordinary commit lands here, and `dev` is
