@@ -94,8 +94,14 @@ it still crashes and can take the host session with it (gamescope#1590).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/quinovax/waydroid-nvidia/main/packaging/install-from-release.sh | sudo bash
-# or, from a checkout, without sudo:
-#   ./pkexec-install.sh
+```
+
+On a desktop where `sudo` prompts every time, run the script under `pkexec`
+instead — it needs no changes. For a checkout you already have (deploying this
+working tree rather than a release tarball):
+
+```sh
+pkexec ./packaging/install-from-release.sh --local "$PWD" --skip-build
 ```
 
 This auto-detects your distro, installs dependencies, downloads the latest
