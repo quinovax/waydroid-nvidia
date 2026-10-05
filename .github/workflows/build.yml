@@ -32,6 +32,15 @@ permissions:
   contents: read
 
 jobs:
+  repo-hygiene:
+    name: repo hygiene (no pinned checksums, no large blobs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Cheap and hermetic: catches a release checksum being pinned in-tree
+      # (it goes stale and kills the release job) and binaries being committed
+      # (they stay in history forever). See tests/repo-hygiene.sh.
+      - run: tests/repo-hygiene.sh
   mesa:
     name: guest venus driver (mesa, ${{ matrix.android_abi }})
     runs-on: ubuntu-latest
@@ -339,9 +348,26 @@ jobs:
             cp -a artifacts/guest-surfaceflinger/. prebuilts/
           else
             echo "::warning::ANGLE/surfaceflinger artifacts missing — fetching this repo's v0.1.1 prebuilts"
-            curl -fSL -o prebuilts-fallback.tar.zst \
-              https://github.com/quinovax/waydroid-nvidia/releases/download/v0.1.1/waydroid-nvidia-guest-prebuilts-v0.1.1.tar.zst
-            echo "d23394537e671d135554ad029d0406052d46da3e52f85540ab4998ea80632b3d  prebuilts-fallback.tar.zst" | sha256sum -c -
+            FALLBACK_REPO="${FALLBACK_REPO:-quinovax/waydroid-nvidia}"
+            FALLBACK_TAG="${FALLBACK_TAG:-v0.1.1}"
+            FALLBACK_ASSET="waydroid-nvidia-guest-prebuilts-${FALLBACK_TAG}.tar.zst"
+            FALLBACK_URL="https://github.com/${FALLBACK_REPO}/releases/download/${FALLBACK_TAG}"
+            curl -fSL -o prebuilts-fallback.tar.zst "${FALLBACK_URL}/${FALLBACK_ASSET}"
+            # Verify against the SHA256SUMS published with that release rather
+            # than a hash pinned in this file. A pinned hash goes stale the
+            # moment the asset is re-uploaded, and it fails as an opaque
+            # `sha256sum -c` error that takes the whole release down (it did
+            # twice — the v0.1.2 release never got created because of it).
+            # Demand an entry for our asset: `sha256sum -c --ignore-missing`
+            # exits 0 when the file is simply not listed.
+            curl -fSL -o fallback-SHA256SUMS "${FALLBACK_URL}/SHA256SUMS"
+            want=$(awk -v a="$FALLBACK_ASSET" '{ n=$2; sub(/^\.\//,"",n)
+                       if (n==a) { print $1; exit } }' fallback-SHA256SUMS)
+            if [ -z "$want" ]; then
+              echo "::error::SHA256SUMS of ${FALLBACK_TAG} has no entry for ${FALLBACK_ASSET}"
+              exit 1
+            fi
+            echo "$want  prebuilts-fallback.tar.zst" | sha256sum -c -
             mkdir -p fallback && tar --zstd -C fallback -xf prebuilts-fallback.tar.zst
             # Keep this job's hwcomposer (NVIDIA patches) over the fallback copy.
             if [ -d artifacts/guest-hwcomposer ]; then

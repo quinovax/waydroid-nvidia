@@ -25,11 +25,36 @@ SKIP_BUILD=0
 # repository's last release that includes them.
 PREBUILTS_FALLBACK_URL="https://github.com/quinovax/waydroid-nvidia/releases/download/v0.1.1"
 PREBUILTS_FALLBACK_FILE="waydroid-nvidia-guest-prebuilts-v0.1.1.tar.gz"
-PREBUILTS_FALLBACK_SHA256="31a76fe8f811295ef9ccbd5ffb7005249978a128ce0cf95e32148c3de11515d7"
+# No checksum is pinned here on purpose. A pinned value goes stale the moment
+# the release asset is re-uploaded, and a stale value bricks every install with
+# an opaque "checksum mismatch". The expected hash is read from the SHA256SUMS
+# published next to the asset instead (see verify_release_checksum).
 
 die()  { echo "FATAL: $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*"; }
 ok()   { echo -e "\033[1;32m  OK\033[0m $*"; }
+
+# verify_release_checksum <base-url> <filename> <local-path>
+#
+# Checks <local-path> against the entry for <filename> in the SHA256SUMS that
+# the release publishes next to its assets, rather than against a hash copied
+# into this script. `sha256sum -c --ignore-missing` exits 0 when the file we
+# care about is simply absent from the list, so require an entry explicitly:
+# an unverified tarball is unpacked into /usr as root.
+verify_release_checksum() {
+    local base="$1" file="$2" path="$3" sums line
+    sums="$WORK/.fallback-SHA256SUMS"
+    curl -fSL "$base/SHA256SUMS" -o "$sums" || \
+        die "failed to download $base/SHA256SUMS — cannot verify $file"
+    # CI writes the list with `sha256sum ./*.tar.*`, so names may carry "./".
+    line=$(grep -E "^[0-9a-fA-F]{64} [ *]?(\./)?${file//./\\.}\$" "$sums" | head -n1) || true
+    [ -n "$line" ] || \
+        die "SHA256SUMS has no entry for $file — refusing to install unverified binaries"
+    line=$(printf '%s\n' "$line" | sed -E "s#([ *])\./#\1#")
+    printf '%s\n' "$line" | (cd "$WORK" && sha256sum -c --strict -) || \
+        die "checksum mismatch for $file"
+    ok "checksum verified for $file"
+}
 
 assert_host_alloc_gpu() {
     local bin="${1:-$PREFIX/virgl_test_server}"
@@ -367,8 +392,7 @@ install_prebuilts() {
         local fb="$WORK/$PREBUILTS_FALLBACK_FILE"
         curl -fSL "$PREBUILTS_FALLBACK_URL/$PREBUILTS_FALLBACK_FILE" -o "$fb" || \
             die "failed to download prebuilts fallback from $PREBUILTS_FALLBACK_URL"
-        echo "$PREBUILTS_FALLBACK_SHA256  $fb" | sha256sum -c - || \
-            die "prebuilts fallback checksum mismatch"
+        verify_release_checksum "$PREBUILTS_FALLBACK_URL" "$PREBUILTS_FALLBACK_FILE" "$fb"
         extract_archive "$fb" "$dest"
     fi
 

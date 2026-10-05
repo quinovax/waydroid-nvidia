@@ -45,3 +45,16 @@ result
 
 # Agent workspace
 .workbuddy/
+
+# Release / packaging artifacts. These must never be committed: 92 MiB of AUR
+# makepkg output once landed in packaging/aur/ and, although it was later
+# `git rm`-ed, every clone still carries those blobs in history. Ship tarballs
+# as release assets; tests/repo-hygiene.sh enforces the rest.
+*.tar.gz
+*.tar.zst
+*.tar.xz
+*.tar.bz2
+*.tgz
+*.zip
+*.apk
+*.pkg.tar.*
