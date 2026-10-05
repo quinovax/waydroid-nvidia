@@ -292,7 +292,12 @@ jobs:
 
   release:
     name: release (tarballs + SHA256SUMS + provenance)
-    if: startsWith(github.ref, 'refs/tags/v')
+    # A tag push runs this job, but a MOVED tag must not: the job starts by
+    # deleting the published release and re-creating it, so rewriting history
+    # (e.g. purging blobs from it) would silently replace shipped assets.
+    # `created` is false on a force-update of an existing ref, true on a new
+    # one; treat a missing field as "new" so a real release is never skipped.
+    if: startsWith(github.ref, 'refs/tags/v') && github.event.created != false
     needs: [mesa, virglrenderer, gralloc, hwcomposer, waydroid-patch-check]
     runs-on: ubuntu-latest
     permissions:
