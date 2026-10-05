@@ -7,6 +7,19 @@ Works with the proprietary NVIDIA kernel module; the open kernel module
 [![build](https://github.com/quinovax/waydroid-nvidia/actions/workflows/build.yml/badge.svg)](https://github.com/quinovax/waydroid-nvidia/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/quinovax/waydroid-nvidia)](https://github.com/quinovax/waydroid-nvidia/releases)
 
+## Note on this fork's history
+
+This is a fork of [Shiro836/waydroid-nvidia](https://github.com/Shiro836/waydroid-nvidia).
+Upstream once committed 92 MiB of AUR build artifacts under `packaging/aur/**`;
+a later `git rm` removed them from the tree but every clone still carried the
+blobs, so this fork rebuilt its history to purge them (`.git` went from 106 MB
+to 816 KB). Rewriting history changes every commit id, so the fork no longer
+shares a common ancestor with upstream and GitHub's badge reads *"89 commits
+ahead, 36 commits behind"*. **Nothing is actually missing** — upstream's last
+commit is `152b1d7` (2026-07-24, before this fork existed), and all 36 of its
+commits are present here as rewritten equivalents. `tests/repo-hygiene.sh`
+runs in CI to keep large blobs and pinned checksums out of the tree.
+
 ## Highlights
 
 - **Proprietary NVIDIA driver support** — `nvidia.ko` (closed-source) works alongside `nvidia-open`; no DMA-BUF difference between the two on this stack.
