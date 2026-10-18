@@ -7,6 +7,48 @@ Works with the proprietary NVIDIA kernel module; the open kernel module
 [![build](https://github.com/CinQwQeggs01/waydroid-nvidia/actions/workflows/build.yml/badge.svg)](https://github.com/CinQwQeggs01/waydroid-nvidia/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/CinQwQeggs01/waydroid-nvidia)](https://github.com/CinQwQeggs01/waydroid-nvidia/releases)
 
+## Branches: which one to use
+
+| Branch | What it is | Who it is for |
+|---|---|---|
+| `main` | The Venus stack, released and stable. Vulkan is proxied over a unix socket to a host-side renderer (Mesa Venus → `virgl_test_server`). | Anyone on a supported GPU who wants the shipped behaviour. |
+| `dev` | The next-generation stack, in testing. Adds three driver modes (`nvidia-prolapse`, `glibc-shim`, `venus`) that run the NVIDIA userspace inside the container instead of proxying Vulkan, plus the build and packaging work needed for them. | Testers, and maintainers of pre-GSP cards. |
+
+`dev` is where this fork's maintenance now happens. It is a superset of `main`: it keeps the Venus
+mode (so `main`'s behaviour remains available as one of its three modes) and adds the other two.
+`main` stays the released line; fixes that matter for the Venus path land on `dev` first and are
+carried back to `main` with the next release.
+
+### What `dev` is maintained for
+
+- **Pre-GSP NVIDIA cards, GTX 10 and GTX 9 series first.** Pascal (GTX 10xx) and Maxwell 2
+  (GTX 9xx) are the target: they are old enough that NVIDIA's own userspace assumes GSP firmware
+  and newer interfaces the hardware does not have, so running it inside the container needs the
+  compatibility work that `dev` carries. `nvidia-prolapse` is the mode built for them; `glibc-shim`
+  is the fallback that loads the host's unmodified glibc-built NVIDIA libraries into the bionic
+  guest. See the per-mode table on `dev`'s README for the current status of each card.
+- **Build and packaging fixes, Fedora first.** A large share of `dev`'s commits are build-system
+  work: locale-independent tool invocation (`readelf` output is translated under a non-English
+  locale), host library-directory layout (`/usr/lib64` + `/usr/lib` on Fedora multilib versus
+  `/usr/lib` + `/usr/lib32` on Debian and Arch), missing `-devel` packages, and the AppArmor
+  difference in Fedora's `liblxc`. These are what make `packaging/native/build-native.sh` and the
+  component checks run on a stock Fedora host instead of only in the pinned container image.
+- **Upstream tracking.** `dev` merges every upstream `public-test` release (currently v0.2.0-rc7)
+  and keeps this fork's own transport work on top, so the compatibility work above is always
+  tested against current upstream rather than a frozen snapshot.
+
+### Trying `dev`
+
+```
+git clone -b dev https://github.com/quinovax/waydroid-nvidia
+git clone -b dev ssh://git@ssh.github.com:443/quinovax/waydroid-nvidia.git   # if you have access
+```
+
+`dev` is not a drop-in replacement for a `main` install: it changes the container configuration
+(`nvidia_driver_mode`), stages its own vendor tree under `/var/lib/waydroid`, and can switch back.
+Read `docs/dev-workflow.md` and the branch's own README before switching, and keep a `main` install
+around if you need the released behaviour.
+
 ## Highlights
 
 - **Proprietary NVIDIA driver support** — `nvidia.ko` (closed-source) works alongside `nvidia-open`; no DMA-BUF difference between the two on this stack.
