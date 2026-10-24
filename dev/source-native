@@ -309,6 +309,20 @@ def source_mismatches(manifest):
 
 # ---------------------------------------------------------------- host facts
 
+def _owner_of(path):
+    """Package that owns `path`, or None. pacman on Arch, rpm on Fedora and the rest of the rpm family:
+    the activate path only needs this to record which package a later boot should check."""
+    for argv in (['pacman', '-Qqo', path], ['rpm', '-qf', path]):
+        try:
+            owner = subprocess.run(argv, capture_output=True, text=True)
+        except FileNotFoundError:
+            continue
+        if owner.returncode == 0 and owner.stdout.strip():
+            return owner.stdout.strip()
+        error = owner.stderr.strip()
+    return None
+
+
 def module_package():
     """Package that provides the NVIDIA kernel module for the running kernel.
 
@@ -316,17 +330,17 @@ def module_package():
     to the package that installed its DKMS source tree (/var/lib/dkms/nvidia/<v>/source).
     """
     module = subprocess.check_output(['modinfo', '-n', 'nvidia'], text=True).strip()
-    owner = subprocess.run(['pacman', '-Qqo', module], capture_output=True, text=True)
-    if owner.returncode == 0:
-        return owner.stdout.strip()
+    package = _owner_of(module)
+    if package:
+        return package
     if '/updates/dkms/' in module:
         version = subprocess.check_output(['modinfo', '-F', 'version', 'nvidia'], text=True).strip()
         source = os.path.realpath(f'/var/lib/dkms/nvidia/{version}/source')
-        owner = subprocess.run(['pacman', '-Qqo', source], capture_output=True, text=True)
-        if owner.returncode == 0:
-            return owner.stdout.strip()
-        raise RuntimeError(f'No package owns the DKMS source {source} of {module}: {owner.stderr.strip()}')
-    raise RuntimeError(f'No package owns the NVIDIA kernel module {module}: {owner.stderr.strip()}')
+        package = _owner_of(source)
+        if package:
+            return package
+        raise RuntimeError(f'No package owns the DKMS source {source} of {module}')
+    raise RuntimeError(f'No package owns the NVIDIA kernel module {module}')
 
 
 def installed_module_version():
