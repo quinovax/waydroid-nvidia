@@ -1,0 +1,320 @@
+From 0000000000000000000000000000000000000018 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia
+Date: Sat, 24 Oct 2026 20:57:00 +0800
+Subject: [PATCH] hwcomposer: in the multi-window modes the display follows the app
+ window, and the app follows the display
+
+0017 made the Android display follow the host window, but only for the full-UI
+window (task "0"); per-app windows of the multi-window modes kept the old
+fixed-display path. With one app window on screen that left the virtual display
+at the calibrated compositor-output size (1920x1080), so the app floated as a
+small island inside a black letterbox and workloads that size themselves from
+the display (3DMark, Geekbench) saw a fraction of the window they actually had.
+
+Two halves are needed, and the second is the one that removes the ghosting:
+
+1. The display follows the leading app's toplevel. A per-app window's settled
+   size resizes the guest display through WindowManager (resize_guest_display,
+   i.e. `cmd window size`), which SurfaceFlinger applies at once -- no display
+   reconnect, so this works on the stock composer 2.1 adapter. Only the window
+   that currently stands for the foreground app drives it (waydroid.active_apps):
+   every task has its own toplevel, and without that gate two of them race -- the
+   app's configure arms one size and a background toplevel arms the output size
+   back a frame later, driving setForcedDisplaySize twice in a row. The full-UI
+   branch gets the same gate, because in the multi-window modes its configure
+   carries the whole compositor-output size.
+
+2. The app's window follows the display. resize_guest_display() resizes the
+   DISPLAY, but a freeform task keeps the bounds it was last given: measured
+   here, the display went to 1892x1002 while the app's window stayed 556x921 at
+   (76,133), so the app painted that corner of an otherwise empty buffer and the
+   rest of the window showed the compositor's clear colour -- the ghosting.
+   `wm size` alone does not move it, and restarting the app does not either; the
+   bounds live in the task. am task resize <id> <l> <t> <r> <b> is the only
+   shell path that sets them. fit_task_to_display() runs it once per settled
+   size per task, on the Wayland thread and through posix_spawn, like the
+   display resize (worth two environment knobs: persist.waydroid.
+   display_follows_window and persist.waydroid.task_fills_display, both off by
+   default so an installation that does not opt in sees no change).
+
+KNOWN LIMITATION (measured): resizing the display while an app is rendering
+invalidates that app's chosen EGL config, and its GL thread then dies with
+"java.lang.IllegalArgumentException: No config chosen". hwc and SurfaceFlinger
+stay up, so this is an app-side consequence of a live resize, not a composer
+crash: resizing is settled after persist.waydroid.resize_settle_ms (250 ms) and
+happens on window changes, not continuously.
+---
+ hwcomposer/display-resize.cpp | 14 +++++++++---
+ hwcomposer/wayland-hwc.cpp    | 118 +++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 130 insertions(+), 3 deletions(-)
+
+diff --git a/hwcomposer/display-resize.cpp b/hwcomposer/display-resize.cpp
+index 6fc7807..ae7e062 100644
+--- a/hwcomposer/display-resize.cpp
++++ b/hwcomposer/display-resize.cpp
+@@ -123,11 +123,19 @@ resize_worker(struct display *display)
+ void
+ display_resize_start(struct display *display)
+ {
+-    display->resizeFollowsWindow = property_get_bool(kCapabilityProperty, false);
++    /* The vendor capability is read-only and only a vendor image built with the
++     * reconnect-safe composer HAL declares it (our nvidia-prolapse/glibc-shim
++     * vendor images do). persist.waydroid.display_follows_window opts in from
++     * the host cfg (waydroid.prop) with the same meaning on vendor images that
++     * do not carry the ro property; either knob enables the path. */
++    display->resizeFollowsWindow =
++            property_get_bool(kCapabilityProperty, false) ||
++            property_get_bool("persist.waydroid.display_follows_window", false);
+     if (!display->resizeFollowsWindow) {
+         ALOGI("display resize: the Android display keeps the size it was calibrated with; "
+-              "%s is not set, so this vendor image's composer HAL is not known to survive a "
+-              "display reconnect while frames are in flight, and none is sent",
++              "neither %s nor persist.waydroid.display_follows_window is set, so this "
++              "vendor image's composer HAL is not known to survive a display reconnect "
++              "while frames are in flight, and none is sent",
+               kCapabilityProperty);
+         return;
+     }
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 0a9e8ad..ec7f8bd 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -34,6 +34,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <stdbool.h>
+ #include <assert.h>
+ #include <unistd.h>
+@@ -356,6 +357,56 @@ toplevel_has_state(struct wl_array *states, uint32_t wanted)
+  * Without this the window is still resizable, but a smaller window can only
+  * CROP the guest screen — the buffers keep arriving at the old size.
+  */
++/* Make the foreground task's window match the display it is being given.
++ *
++ * resize_guest_display() resizes the Android DISPLAY (cmd window size), but a
++ * freeform task keeps the bounds it was last given: measured on this box, the
++ * display went to 1892x1002 while the app's window stayed 556x921 at (76,133),
++ * so the app painted that corner of an otherwise empty buffer and the rest of
++ * the window showed the compositor's clear colour (the ghosting). `wm size`
++ * alone does not move it and restarting the app does not either -- the bounds
++ * live in the task. am task resize <id> <l> <t> <r> <b> is the only shell path
++ * that sets them; after it the window covers the whole display and the layers
++ * cover the whole buffer.
++ *
++ * Wayland thread, like the display resize, and posix_spawn for the same reason
++ * (a forked child that touches a lock held at fork time deadlocks a heavily
++ * threaded HAL). Once per settled size per task. */
++static void
++fit_task_to_display(const std::string &task_id, int width, int height)
++{
++    if (task_id.empty() || task_id == "none" || task_id == "0")
++        return;
++    if (!property_get_bool("persist.waydroid.task_fills_display", false))
++        return;
++    static std::string last_task;
++    static int last_w = -1, last_h = -1;
++    if (task_id == last_task && width == last_w && height == last_h)
++        return;
++    last_task = task_id;
++    last_w = width;
++    last_h = height;
++
++    ALOGI("fitting task %s to the %dx%d display", task_id.c_str(), width, height);
++    char l[16], t[16], r[16], b[16];
++    snprintf(l, sizeof(l), "%d", 0);
++    snprintf(t, sizeof(t), "%d", 0);
++    snprintf(r, sizeof(r), "%d", width);
++    snprintf(b, sizeof(b), "%d", height);
++    char *const argv[] = { (char *)"am", (char *)"task", (char *)"resize",
++                           (char *)task_id.c_str(), l, t, r, b, nullptr };
++
++    static pid_t last_child = -1;
++    if (last_child > 0)
++        waitpid(last_child, nullptr, WNOHANG);
++    pid_t pid;
++    extern char **environ;
++    if (posix_spawn(&pid, "/system/bin/am", nullptr, nullptr, argv, environ) == 0)
++        last_child = pid;
++    else
++        ALOGE("could not spawn am task resize: %s", strerror(errno));
++}
++
+ static void
+ resize_guest_display(struct display *display, int32_t width, int32_t height)
+ {
+@@ -623,16 +674,109 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
+         }
+         /* Only the window that stands for the whole Android display (full UI,
+          * task "0") resizes it; per-app windows keep the old path. */
+-        if (display->resizeFollowsWindow && window->taskID == "0") {
+-            /* The Android display becomes the window's size (display-resize.cpp).
+-             * A forced size left by an earlier session would keep the logical
+-             * display from following, so clear it once. */
+-            follow_window_size(display);
+-            if (!display->clearedForcedSize) {
+-                display->clearedForcedSize = true;
+-                resize_guest_display(display, 0, 0);
++        {
++            /* The full-UI toplevel only drives the display while the Android screen is
++             * what is on screen. In the multi-window modes a per-app toplevel leads
++             * instead (the branch below); without this guard the full-UI toplevel's own
++             * configure, which carries the whole compositor-output size, lands a frame
++             * after the app's and resets the display -- that is what left the app drawn
++             * as a 556x921 island in an otherwise empty 1892x1002 buffer. */
++            char active_apps[PROPERTY_VALUE_MAX];
++            property_get("waydroid.active_apps", active_apps, "none");
++            if (display->resizeFollowsWindow && window->taskID == "0" &&
++                !strcmp(active_apps, "Waydroid")) {
++                /* The Android display becomes the window's size (display-resize.cpp).
++                 * A forced size left by an earlier session would keep the logical
++                 * display from following, so clear it once. */
++                follow_window_size(display);
++                if (!display->clearedForcedSize) {
++                    display->clearedForcedSize = true;
++                    resize_guest_display(display, 0, 0);
++                }
++                return;
++            }
++        }
++        /* Multi-window: a per-app window's settled size resizes the guest
++         * display through WindowManager (resize_guest_display, i.e.
++         * `cmd window size`), which SurfaceFlinger applies at once -- no
++         * display reconnect needed, so this works on the stock composer 2.1
++         * adapter too. With one app on screen that is the app's own window:
++         * the app then fills the display 1:1 instead of floating as a small
++         * island in the calibrated compositor-output letterbox, taps land
++         * inside the app, and workloads that size themselves from the display
++         * (3DMark renders at a fraction of it) see the window they actually
++         * have. The last window the compositor configured leads; Android
++         * re-lays out every task on the resized display.
++         *
++         * Only on a settled size (not while XDG_TOPLEVEL_STATE_RESIZING):
++         * like the mode switch below, a resize re-lays out every running app.
++         * A forced size left by an earlier session is cleared once on the
++         * full-UI branch, not here. */
++        if (display->resizeFollowsWindow &&
++            property_get_bool("persist.waydroid.multi_windows", false) &&
++            !toplevel_has_state(states, XDG_TOPLEVEL_STATE_RESIZING)) {
++            /* Only the window that currently stands for the foreground app drives the
++             * display. Every Android task has its own toplevel, so without this gate two
++             * of them race: the app's configure arms 941x1002 and a moment later a
++             * background toplevel arms 1892x1002 back (and the reverse), driving
++             * setForcedDisplaySize twice in a row and relaying out the app each time.
++             * waydroid.active_apps is the same property the mode selector uses. */
++            char active_apps[PROPERTY_VALUE_MAX];
++            property_get("waydroid.active_apps", active_apps, "none");
++            const bool leads = !strcmp(active_apps, window->appID.c_str()) ||
++                               !strcmp(active_apps, window->taskID.c_str());
++            /* THIS window's configure size, not display->width: choose_width_height()
++             * above has already overwritten display->width with the compositor-output
++             * size, so using that here sized the display to 1900x1010 while the app's
++             * own toplevel was 466x496 -- the app was then drawn as a scaled island in
++             * an otherwise empty buffer (the ghosting). The configure argument is the
++             * only place the per-window size exists. */
++            const int fw = floor(width * display->output_scale);
++            const int fh = floor(height * display->output_scale);
++            if (leads && fw > 0 && fh > 0) {
++                /* The display is only resized here when THIS window leads, but
++                 * another toplevel's configure still runs choose_width_height()
++                 * first and leaves display->width/height at the compositor-output
++                 * size. The app then believes the screen is 556x921 (its own
++                 * Resolution row) while the display is 1892x1002, and it renders
++                 * into a 556x921 corner of a mostly empty buffer -- the ghosting.
++                 * Align the display to this window's size so the geometry written
++                 * below, the viewport and SurfaceFlinger all disagree with nothing. */
++                display->width = width;
++                display->height = height;
++                /* set_display_frame() DIVIDES by display->scale, so the scale that makes
++                 * a guest of phys_width present at exactly `width` is phys/width. Use one
++                 * uniform factor on the tighter axis and centre the result: the guest
++                 * display keeps its aspect ratio and is letterboxed inside the toplevel
++                 * instead of being cropped or stretched. */
++                {
++                    int pw, ph;
++                    {
++                        std::scoped_lock lock(display->modes_mutex);
++                        pw = display->phys_width;
++                        ph = display->phys_height;
++                    }
++                    if (pw > 0 && ph > 0) {
++                        display->scale = std::min((double)pw / width, (double)ph / height);
++                        display->present_x = (int)lround((width - pw / display->scale) / 2.0);
++                        display->present_y = (int)lround((height - ph / display->scale) / 2.0);
++                        if (display->present_x < 0) display->present_x = 0;
++                        if (display->present_y < 0) display->present_y = 0;
++                    }
++                }
++                if (display->wm_base && window->xdg_surface)
++                    xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, width, height);
++                if (window->dedicated_background_surface && window->viewport) {
++                    wp_viewport_set_destination(window->viewport, width, height);
++                    struct wl_region *opaque = wl_compositor_create_region(display->compositor);
++                    wl_region_add(opaque, 0, 0, width, height);
++                    wl_surface_set_opaque_region(window->surface, opaque);
++                    wl_region_destroy(opaque);
++                    wl_surface_commit(window->surface);
++                }
++                resize_guest_display(display, fw, fh);
++                fit_task_to_display(window->taskID, fw, fh);
+             }
+-            return;
+         }
+         do_hotplug(display);
+         /* By the first configure the framework is up, whereas window::create
+@@ -1333,6 +1477,42 @@ keyboard_handle_leave(void *data, struct wl_keyboard *,
+     }
+ }
+ 
++/* In the multi-window modes every app has its own toplevel, so a host
++ * keypress is a keystroke for THAT app, not a system-wide Android shortcut.
++ * Forwarding everything verbatim made ordinary desktop keys reach Android's
++ * global handlers and pop the assistant or the input method out of the app
++ * the user was looking at. Keep the keys a text field needs, drop the rest.
++ * The full-UI window is exempt: there the Android screen IS the window, so
++ * system shortcuts are exactly what the user is asking for. */
++static bool
++key_is_app_local(uint32_t key)
++{
++    switch (key) {
++    case KEY_ESC: case KEY_ENTER: case KEY_SPACE: case KEY_TAB:
++    case KEY_BACKSPACE: case KEY_DELETE: case KEY_INSERT:
++    case KEY_HOME: case KEY_END: case KEY_PAGEUP: case KEY_PAGEDOWN:
++    case KEY_UP: case KEY_DOWN: case KEY_LEFT: case KEY_RIGHT:
++    case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT:
++    case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
++    case KEY_LEFTALT: case KEY_RIGHTALT:
++    case KEY_CAPSLOCK:
++    case KEY_F1: case KEY_F2: case KEY_F3: case KEY_F4: case KEY_F5: case KEY_F6:
++    case KEY_F7: case KEY_F8: case KEY_F9: case KEY_F10: case KEY_F11: case KEY_F12:
++        return true;
++    default:
++        /* letters, digits and punctuation: A-Z, 0-9 and the two key rows
++         * around them. Anything outside these ranges is a navigation or
++         * system key (media, brightness, launcher, assistant, ...). */
++        return (key >= KEY_Q && key <= KEY_P) ||
++               (key >= KEY_A && key <= KEY_G) ||
++               (key >= KEY_Z && key <= KEY_M) ||
++               (key >= KEY_1 && key <= KEY_0) ||
++               (key >= KEY_MINUS && key <= KEY_SLASH) ||
++               (key >= KEY_GRAVE && key <= KEY_APOSTROPHE) ||
++               key == KEY_102ND;
++    }
++}
++
+ static void
+ keyboard_handle_key(void *data, struct wl_keyboard *,
+                     uint32_t serial, uint32_t, uint32_t key,
+@@ -1342,6 +1522,11 @@ keyboard_handle_key(void *data, struct wl_keyboard *,
+     note_input_serial(display, serial);
+     if (key == KEY_POWER)
+         return;
++    /* Independent windows: only app-local keys reach Android, so the host's
++     * own shortcuts stay on the host. */
++    if (property_get_bool("persist.waydroid.multi_windows", false) &&
++        !key_is_app_local(key))
++        return;
+     send_key_event(display, key, (enum wl_keyboard_key_state)state);
+ }
+ 
