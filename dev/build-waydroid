@@ -35,9 +35,6 @@ git -C "$TREE" reset -q --hard "$SHA"
 git -C "$TREE" clean -qfdx -e __pycache__
 git -C "$TREE" apply "$BASELINE/patches/waydroid/0001-nvidia-integration.patch" || die "baseline patch failed"
 git -C "$TREE" apply "$REPO/waydroid/0001-lxc-nvidia-native-mounts.patch" || die "our patch failed"
-# Fedora/RHEL liblxc has no AppArmor: the stock lxc.apparmor.profile key makes lxc-start refuse
-# the whole generated config. Applied after the mounts patch so both edits to lxc.py stay apart.
-git -C "$TREE" apply "$REPO/waydroid/0002-lxc-skip-apparmor-profile-without-libapparmor.patch" || die "apparmor patch failed"
 cmp -s "$REPO/waydroid/nvidia_native.py" "$TREE/tools/helpers/nvidia_native.py" \
     || die "waydroid/nvidia_native.py differs from the copy inside the patch; regenerate the patch"
 python3 -c "import ast,sys; [ast.parse(open(f).read()) for f in sys.argv[1:]]" \

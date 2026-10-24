@@ -1756,9 +1756,16 @@ pub unsafe extern "C" fn nv_rm_alloc(
             }
             let b = unsafe { bridge(p) }?;
             b.core.live()?;
-            if placement > PLACEMENT_VRAM_COMPRESSIBLE || kind != 0 || tile != 0 {
+            // `tile` (nouveau's per-BO tile mode for legacy GL importers) has
+            // no RM memory attribute: the block height travels in the DRM
+            // modifier. A kind is only meaningful for an uncompressed
+            // block-linear VRAM/GART allocation (Device::allocate_block_linear).
+            if placement > PLACEMENT_VRAM_COMPRESSIBLE
+                || tile != 0
+                || (kind != 0 && placement == PLACEMENT_VRAM_COMPRESSIBLE)
+            {
                 return Err(Error::Contract(
-                    "unsupported memory placement/tiled allocation; use VA kind override".into(),
+                    "unsupported memory placement/tiled allocation (tile mode, or a kind on compressible memory)".into(),
                 ));
             }
             let mut guard = b.lock();
@@ -1771,6 +1778,9 @@ pub unsafe extern "C" fn nv_rm_alloc(
                 .map_err(|_| Error::Contract("memory alignment overflow".into()))?;
             let memory = if placement == PLACEMENT_VRAM_COMPRESSIBLE {
                 s.device.allocate_compressible(size, alignment)?
+            } else if kind != 0 {
+                s.device
+                    .allocate_block_linear(size, alignment, placement == 1, kind)?
             } else {
                 s.device
                     .allocate_aligned(size, alignment, false, placement == 1)?

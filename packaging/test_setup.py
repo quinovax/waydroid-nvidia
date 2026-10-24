@@ -9,6 +9,7 @@ from pathlib import Path
 import os
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -39,11 +40,14 @@ def env(tmp_path):
     for tool in ('python3', 'basename', 'cat', 'awk'):
         os.symlink(shutil.which(tool), bin_dir / tool)
 
-    def run(*argv, system_ota=None):
+    def run(*argv, system_ota=None, environ=None, stubs=None):
         if system_ota is not None:
             cfg.write_text(f'[waydroid]\nsystem_ota = {system_ota}\nimages_path = /var/lib/waydroid/images\n')
+        for name, body in (stubs or {}).items():
+            (bin_dir / name).write_text(f'#!/bin/sh\n{body}\n')
+            (bin_dir / name).chmod(0o755)
         out = subprocess.run([shutil.which('bash'), str(script), *argv], capture_output=True, text=True,
-                             env={'PATH': str(bin_dir), 'LC_ALL': 'C'})
+                             env={'PATH': str(bin_dir), **(environ or {'LC_ALL': 'C'})})
         made = calls.read_text().splitlines() if calls.exists() else []
         return out.returncode, out.stdout + out.stderr, made
     return run
@@ -108,3 +112,48 @@ def test_restore_takes_no_system_type(env):
 def test_help_names_the_option(env):
     code, out, _ = env('--help')
     assert code == 0 and '-s, --system-type VANILLA|GAPPS|FOSS' in out
+
+
+APPARMOR = ("lxc-info: waydroid: ../src/lxc/confile.c: set_config_apparmor_profile: 1651 Invalid argument - Built "
+            "without AppArmor support")
+
+
+def test_lxc_info_failure_stops_with_lxc_message_and_remedy(env):
+    """Issue #27: an LXC that rejects the container config must stop the setup with LXC's own message, not read as
+    a stopped container."""
+    code, out, calls = env('--restore-official-vendor', system_ota='None',
+                           stubs={'lxc-info': f'echo "{APPARMOR}" >&2; exit 1'})
+    assert code != 0 and calls == []
+    assert 'lxc-info cannot read the Waydroid container: ' + APPARMOR in out
+    assert 'Remedy: sudo waydroid upgrade -o' in out
+    assert 'stopping the Waydroid container' not in out
+
+
+def test_tools_run_in_the_c_locale(env):
+    """Issue #28: parsed tool output must not depend on the user's locale (LANG=es_ES printed "Biblioteca compartida")."""
+    code, out, _ = env('--restore-official-vendor', system_ota='None',
+                       environ={'LANG': 'es_ES.UTF-8', 'LANGUAGE': 'es', 'LC_MESSAGES': 'es_ES.UTF-8'},
+                       stubs={'lxc-info': 'echo "LC_ALL=$LC_ALL LANGUAGE=${LANGUAGE-unset}" >&2; exit 1'})
+    assert code != 0 and 'LC_ALL=C LANGUAGE=unset' in out
+
+
+@pytest.mark.parametrize('script', ['packaging/install.sh', 'packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-setup',
+                                    'nvidia-prolapse/media/stage-odm.sh', 'packaging/native/wd-native'])
+def test_shell_entrypoints_set_the_c_locale(script):
+    text = (REPO / script).read_text()
+    assert 'set -euo pipefail\n' in text
+    head = text.split('set -euo pipefail\n', 1)[1]
+    assert '\nexport LC_ALL=C\nunset LANGUAGE\n' in '\n' + head[:400], script
+
+
+@pytest.mark.parametrize('script', ['packaging/native/vendor_image.py', 'dev/source-native', 'dev/driver-mode'])
+def test_python_entrypoints_set_the_c_locale(script, tmp_path):
+    """Run the entrypoint's __main__ with a stub main(): the environment its children get has LC_ALL=C."""
+    text = (REPO / script).read_text()
+    main = text.split("if __name__ == '__main__':\n", 1)[1]
+    code = ('import os, sys\nos.environ["LANGUAGE"] = "es"\n'
+            'def main():\n    print(os.environ["LC_ALL"], os.environ.get("LANGUAGE", "unset")); return 0\n'
+            'import subprocess\nif True:\n' + main)
+    out = subprocess.run([sys.executable, '-c', code, 'status'], capture_output=True, text=True,
+                         env={'PATH': os.environ['PATH'], 'LANG': 'es_ES.UTF-8'})
+    assert out.stdout.split() == ['C', 'unset'], out.stderr

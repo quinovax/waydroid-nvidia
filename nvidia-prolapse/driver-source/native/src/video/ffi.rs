@@ -1,5 +1,7 @@
-//! C ABI of video/nv_video.h (v1).
+//! C ABI of video/nv_video.h (v1 entry points, v2 additions: HDR static metadata and the
+//! per-unit displayable-picture count).
 use super::{
+    hdr::HdrStaticMetadata,
     session::{Session, SessionInfo, Target},
     NvVideoCaps, NvVideoDeviceInfo, VideoDevice, VideoError,
 };
@@ -60,6 +62,54 @@ pub struct NvVideoPicture {
     pub full_range: u32,
     pub keyframe: u32,
     pub reserved: [u32; 5],
+}
+
+/// `mastering_display_colour_volume` as coded in the bitstream (ST 2086 units).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NvVideoMasteringDisplay {
+    pub display_primaries_x: [u16; 3],
+    pub display_primaries_y: [u16; 3],
+    pub white_point_x: u16,
+    pub white_point_y: u16,
+    pub max_luminance: u32,
+    pub min_luminance: u32,
+}
+
+/// HDR static metadata of a picture (ABI v2, `nv_video_picture_hdr`). A field group with
+/// its `has_*` flag clear carries no values.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NvVideoHdrMetadata {
+    pub has_mastering_display: u32,
+    pub mastering_display: NvVideoMasteringDisplay,
+    pub has_content_light_level: u32,
+    pub max_content_light_level: u32,
+    pub max_pic_average_light_level: u32,
+    pub reserved: [u32; 6],
+}
+
+impl From<HdrStaticMetadata> for NvVideoHdrMetadata {
+    fn from(m: HdrStaticMetadata) -> Self {
+        let mut out = Self::default();
+        if let Some(d) = m.mastering {
+            out.has_mastering_display = 1;
+            out.mastering_display = NvVideoMasteringDisplay {
+                display_primaries_x: d.primaries_x,
+                display_primaries_y: d.primaries_y,
+                white_point_x: d.white_x,
+                white_point_y: d.white_y,
+                max_luminance: d.max_luminance,
+                min_luminance: d.min_luminance,
+            };
+        }
+        if let Some((cll, fall)) = m.content_light {
+            out.has_content_light_level = 1;
+            out.max_content_light_level = u32::from(cll);
+            out.max_pic_average_light_level = u32::from(fall);
+        }
+        out
+    }
 }
 
 #[repr(C)]
@@ -201,8 +251,10 @@ pub unsafe extern "C" fn nv_video_decode(
             // SAFETY: caller guarantees the buffer.
             unsafe { std::slice::from_raw_parts(data, len) }
         };
-        unsafe { &mut *s }.0.decode(d, timestamp, flags)?;
-        Ok(0)
+        let shown = unsafe { &mut *s }.0.decode(d, timestamp, flags)?;
+        // ABI v2: the displayable pictures this unit produced (callers test rc < 0).
+        i32::try_from(shown)
+            .map_err(|_| VideoError::Invalid("unit produced more than 2^31 pictures".into()))
     })
 }
 
@@ -238,6 +290,46 @@ pub unsafe extern "C" fn nv_video_next_picture(
         };
         unsafe { pic.write(p) };
         Ok(1)
+    })
+}
+
+/// # Safety
+/// Valid session, writable metadata.
+#[no_mangle]
+pub unsafe extern "C" fn nv_video_picture_hdr(
+    s: *mut NvVideoSession,
+    id: u64,
+    metadata: *mut NvVideoHdrMetadata,
+) -> i32 {
+    guard(|| {
+        null(s, "session")?;
+        null(metadata, "metadata")?;
+        let m = unsafe { &*s }.0.picture_hdr(id)?;
+        unsafe { metadata.write(NvVideoHdrMetadata::from(m)) };
+        Ok(0)
+    })
+}
+
+/// # Safety
+/// Valid session, writable width/height.
+#[no_mangle]
+pub unsafe extern "C" fn nv_video_required_size(
+    s: *mut NvVideoSession,
+    width: *mut u32,
+    height: *mut u32,
+) -> i32 {
+    guard(|| {
+        null(s, "session")?;
+        null(width, "width")?;
+        null(height, "height")?;
+        let (w, h) = unsafe { &*s }.0.required_size().ok_or_else(|| {
+            VideoError::Invalid("no unit of this session returned NV_VIDEO_E_RESIZE".into())
+        })?;
+        unsafe {
+            width.write(w);
+            height.write(h);
+        }
+        Ok(0)
     })
 }
 
@@ -302,3 +394,41 @@ pub extern "C" fn nv_video_last_error() -> *const std::ffi::c_char {
 
 // The C struct keeps its v1 size (the Cr-plane fields took over reserved words).
 const _: () = assert!(std::mem::size_of::<NvVideoTarget>() == 80);
+// ABI v2 structs: fixed C layout, no implicit padding.
+const _: () = assert!(std::mem::size_of::<NvVideoMasteringDisplay>() == 24);
+const _: () = assert!(std::mem::size_of::<NvVideoHdrMetadata>() == 64);
+
+#[cfg(test)]
+mod tests {
+    use super::super::hdr::{HdrStaticMetadata, MasteringDisplay};
+    use super::NvVideoHdrMetadata;
+
+    #[test]
+    fn hdr_metadata_conversion() {
+        let m = HdrStaticMetadata {
+            mastering: Some(MasteringDisplay {
+                primaries_x: [34000, 13250, 7500],
+                primaries_y: [16000, 34500, 3000],
+                white_x: 15635,
+                white_y: 16450,
+                max_luminance: 10_000_000,
+                min_luminance: 1,
+            }),
+            content_light: Some((1000, 400)),
+        };
+        let c = NvVideoHdrMetadata::from(m);
+        assert_eq!((c.has_mastering_display, c.has_content_light_level), (1, 1));
+        assert_eq!(
+            c.mastering_display.display_primaries_x,
+            [34000, 13250, 7500]
+        );
+        assert_eq!(c.mastering_display.max_luminance, 10_000_000);
+        assert_eq!(
+            (c.max_content_light_level, c.max_pic_average_light_level),
+            (1000, 400)
+        );
+        let e = NvVideoHdrMetadata::from(HdrStaticMetadata::default());
+        assert_eq!((e.has_mastering_display, e.has_content_light_level), (0, 0));
+        assert_eq!(e, NvVideoHdrMetadata::default());
+    }
+}

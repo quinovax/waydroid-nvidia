@@ -166,10 +166,11 @@ static void test_vp9_hidden_frames(NvVideoDevice *dev)
     out.clear();
     /* superframe pattern: hidden alt-ref (1), shown inter (2), show_existing of the alt-ref (3) */
     CHECK(q(d, unit(0, 640, 360), 1, pool, out) == Status::Ok);
-    CHECK(out.empty()); /* pending until a later unit shows */
+    /* ABI 2: the hidden frame's unit produced no displayable picture -> finished at once */
+    CHECK(out.size() == 1 && out[0].index == 1 && out[0].empty);
+    out.clear();
     CHECK(q(d, unit(SHOW, 640, 360), 2, pool, out) == Status::Ok);
-    CHECK(out.size() == 2 && out[0].index == 1 && out[0].empty && out[1].index == 2 && !out[1].empty &&
-          !out[1].size_changed);
+    CHECK(out.size() == 1 && out[0].index == 2 && !out[0].empty && !out[0].size_changed);
     for (auto &o : out)
         if (!o.empty)
             pool.give_back(o);
@@ -253,11 +254,126 @@ static void test_resolution_change_and_10bit(NvVideoDevice *dev)
     CHECK(out.size() == 3 && out[0].size_changed && !out[1].size_changed && out[2].size_changed);
     CHECK(pool.last_w == 1920 && pool.last_h == 1080 && pool.last_fmt == NV_VIDEO_FORMAT_P010);
     CHECK(g_stub.last_copy_format == NV_VIDEO_FORMAT_P010);
-    /* larger than the session: UNSUPPORTED is terminal and named */
-    CHECK(q(d, unit(KEY | SHOW, 4096, 2160), 3, pool, out) == Status::Error);
+    /* a non-keyframe larger than the session: UNSUPPORTED is terminal and named */
+    CHECK(q(d, unit(SHOW, 4096, 2160), 3, pool, out) == Status::Error);
     CHECK(d->error().find("UNSUPPORTED") != std::string::npos);
     CHECK(d->error().find("larger than the session") != std::string::npos);
     CHECK(q(d, unit(KEY | SHOW, 640, 360), 4, pool, out) == Status::Error); /* stays dead */
+    delete d;
+}
+
+/* Adaptive upswitch: a keyframe past the session max re-creates the session at the new size,
+ * after every picture of the old session was copied out; the csd is replayed. */
+static void test_upswitch_recreates_session(NvVideoDevice *dev)
+{
+    reset_stub();
+    TestPool pool(8);
+    Decoder *d = make(dev, NV_VIDEO_CODEC_HEVC); /* max 1920x1088 */
+    std::vector<Output> out;
+    std::vector<uint8_t> ps = {'P', 0x40};
+    CHECK(d->queue(ps.data(), ps.size(), 0, false, true, &pool, &out) == Status::Ok);
+    CHECK(q(d, unit(KEY | SHOW, 1280, 720, 0), 1, pool, out) == Status::Ok);
+    CHECK(q(d, unit(SHOW, 1280, 720, 1), 2, pool, out) == Status::Ok);
+    for (auto &o : out)
+        if (!o.empty)
+            pool.give_back(o);
+    out.clear();
+    const unsigned created = g_stub.sessions_created, decodes = g_stub.decode_calls;
+    CHECK(q(d, unit(KEY | SHOW, 3840, 2160, 0), 3, pool, out) == Status::Ok);
+    CHECK(g_stub.sessions_created == created + 1 && g_stub.sessions_destroyed == 1);
+    CHECK(g_stub.outstanding_at_destroy == 0);
+    /* resize attempt + drain + replayed csd + the unit again */
+    CHECK(g_stub.decode_calls == decodes + 4);
+    /* the two 720p pictures came out of the old session, in order, before the new size */
+    CHECK(out.size() >= 2 && out[0].index == 1 && out[1].index == 2 && !out[0].empty && !out[1].empty);
+    for (auto &o : out)
+        if (!o.empty)
+            pool.give_back(o);
+    out.clear();
+    CHECK(d->queue(nullptr, 0, 4, true, false, &pool, &out) == Status::Ok);
+    CHECK(out.size() == 2 && out[0].index == 3 && !out[0].empty && out[0].size_changed &&
+          out[0].picture.width == 3840 && out[1].eos);
+    out.clear();
+    delete d;
+
+    /* the drain waits for a buffer: Again, and the same unit completes the switch later */
+    reset_stub();
+    TestPool small(1);
+    d = make(dev, NV_VIDEO_CODEC_VP9);
+    CHECK(q(d, unit(KEY | SHOW, 1280, 720), 0, small, out) == Status::Ok);
+    CHECK(out.size() == 1 && !out[0].empty);
+    Output held = out[0];
+    out.clear();
+    CHECK(q(d, unit(SHOW, 1280, 720), 1, small, out) == Status::Ok); /* picture waits for a buffer */
+    CHECK(out.empty());
+    CHECK(q(d, unit(KEY | SHOW, 2560, 1440), 2, small, out) == Status::Again);
+    CHECK(g_stub.sessions_created == 1);
+    small.give_back(held);
+    CHECK(q(d, unit(KEY | SHOW, 2560, 1440), 2, small, out) == Status::Ok);
+    CHECK(g_stub.sessions_created == 2 && out.size() == 1 && out[0].index == 1 && !out[0].empty);
+    small.give_back(out[0]);
+    out.clear();
+    CHECK(d->drain(&small, &out) == Status::Ok);
+    CHECK(out.size() == 1 && out[0].index == 2 && out[0].picture.width == 2560);
+    delete d;
+}
+
+/* ABI 2: an H.264/HEVC unit that produces no picture (pic_output_flag = 0) is finished at once */
+static void test_unit_without_picture_retires(NvVideoDevice *dev)
+{
+    reset_stub();
+    TestPool pool(8);
+    Decoder *d = make(dev, NV_VIDEO_CODEC_HEVC);
+    std::vector<Output> out;
+    CHECK(q(d, unit(KEY | SHOW, 1280, 720, 0), 0, pool, out) == Status::Ok);
+    CHECK(q(d, unit(16, 1280, 720, 1), 1, pool, out) == Status::Ok);
+    CHECK(out.size() == 1 && out[0].index == 1 && out[0].empty);
+    delete d;
+}
+
+static bool near(float a, float b) { return a > b - 1e-4f && a < b + 1e-4f; }
+
+/* Coded values -> Codec2 units: x265's master-display example
+ * G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) and the same display
+ * in AV1's fixed-point units (SVT-AV1 --mastering-display "G(0.265,0.69)B(0.15,0.06)
+ * R(0.68,0.32)WP(0.3127,0.329)L(1000,0.0001)") give the same C2 values. */
+static void test_hdr_units()
+{
+    NvVideoHdrMetadata m{};
+    m.has_mastering_display = 1;
+    m.mastering_display = {{13250, 7500, 34000}, {34500, 3000, 16000}, 15635, 16450, 10000000, 1};
+    m.has_content_light_level = 1;
+    m.max_content_light_level = 1000;
+    m.max_pic_average_light_level = 400;
+    HdrStatic h = hdr_static(NV_VIDEO_CODEC_HEVC, m);
+    CHECK(h.present && near(h.red[0], 0.68f) && near(h.red[1], 0.32f) && near(h.green[0], 0.265f) &&
+          near(h.green[1], 0.69f) && near(h.blue[0], 0.15f) && near(h.blue[1], 0.06f) &&
+          near(h.white[0], 0.3127f) && near(h.white[1], 0.329f) && near(h.max_luminance, 1000.0f) &&
+          near(h.min_luminance, 0.0001f) && h.max_cll == 1000 && h.max_fall == 400);
+    NvVideoHdrMetadata a{};
+    a.has_mastering_display = 1;
+    a.mastering_display = {{44564, 17367, 9830}, {20972, 45220, 3932}, 20493, 21561, 256000, 2};
+    h = hdr_static(NV_VIDEO_CODEC_AV1, a);
+    CHECK(h.present && near(h.red[0], 0.68f) && near(h.green[1], 0.69f) && near(h.blue[0], 0.15f) &&
+          near(h.white[0], 0.3127f) && near(h.max_luminance, 1000.0f) && near(h.min_luminance, 0.000122f) &&
+          h.max_cll == 0);
+    CHECK(!hdr_static(NV_VIDEO_CODEC_AV1, NvVideoHdrMetadata{}).present);
+}
+
+/* HDR static metadata travels with the picture's output */
+static void test_hdr_metadata_on_output(NvVideoDevice *dev)
+{
+    reset_stub();
+    g_stub.hdr.has_mastering_display = 1;
+    g_stub.hdr.mastering_display.max_luminance = 10000000;
+    g_stub.hdr.has_content_light_level = 1;
+    g_stub.hdr.max_content_light_level = 1000;
+    TestPool pool(8);
+    Decoder *d = make(dev, NV_VIDEO_CODEC_VP9);
+    std::vector<Output> out;
+    CHECK(q(d, unit(KEY | SHOW, 640, 360), 0, pool, out) == Status::Ok);
+    CHECK(out.size() == 1 && out[0].hdr.has_mastering_display && out[0].hdr.mastering_display.max_luminance == 10000000 &&
+          out[0].hdr.max_content_light_level == 1000);
     delete d;
 }
 
@@ -358,6 +474,10 @@ int main()
     test_h264_reorder_and_eos(dev);
     test_flush_seek(dev);
     test_resolution_change_and_10bit(dev);
+    test_upswitch_recreates_session(dev);
+    test_unit_without_picture_retires(dev);
+    test_hdr_metadata_on_output(dev);
+    test_hdr_units();
     test_backpressure(dev);
     test_device_lost(dev);
     test_fence_passthrough(dev);

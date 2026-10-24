@@ -143,7 +143,9 @@ NVK_PATCHES = ("build-compat.patch", "rm-integration.patch", "pascal-a-clear.pat
                "nvk-upstream-bfb90f05-memory-plane-aspects.patch",
                "nvk-explicit-plane-layouts.patch", "nvk-angle-nan-preserve-min-max.patch",
                "mesa-disk-cache-create-with-path.patch", "mesa-disk-cache-keep-file-backend.patch",
-               "mesa-disk-cache-evict-invalid-item.patch", "nvk-android-app-disk-cache.patch")
+               "mesa-disk-cache-evict-invalid-item.patch", "nvk-android-app-disk-cache.patch",
+               "nvk-shader-upload-publish.patch", "nvk-shader-prefetch-in-range.patch",
+               "nvk-prevolta-modifier-memory-types.patch", "nvk-3d-view-of-2d-image.patch")
 
 GL_TRIPLES = {"android": "x86_64-linux-android", "android32": "i686-linux-android"}
 # Android: distinct library names so the image's own Mesa (libEGL_mesa.so,
@@ -182,6 +184,19 @@ NVK_PATCH_LIST = [
     HERE / "mesa-disk-cache-keep-file-backend.patch",
     HERE / "mesa-disk-cache-evict-invalid-item.patch",
     HERE / "nvk-android-app-disk-cache.patch",
+    # Shader programs published as the proprietary driver does: copy-engine
+    # uploads into an unmapped heap, an upload count, and an instruction-
+    # cache invalidate after the upload wait in the first submission after
+    # the count moved; programs in whole 256 B prefetch blocks (Ampere B+).
+    HERE / "nvk-shader-upload-publish.patch",
+    HERE / "nvk-shader-prefetch-in-range.patch",
+    # Fermi..Volta: block-linear DRM-modifier images get no host-visible
+    # VRAM (BAR1) memory type, as the proprietary driver offers none; BAR1
+    # does not return the modifier's byte layout there.
+    HERE / "nvk-prevolta-modifier-memory-types.patch",
+    # A 3D view of a 2D image (invalid usage NVIDIA's driver accepts) is
+    # described as a depth-1 3D image instead of tripping nil's assert.
+    HERE / "nvk-3d-view-of-2d-image.patch",
 ]
 
 def prepared_stamp(source, inputs):

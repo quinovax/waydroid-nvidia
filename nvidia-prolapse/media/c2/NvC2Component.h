@@ -34,8 +34,9 @@ bool decode_routed_here();
 class Store : public C2ComponentStore {
 public:
     /* Opens the device and queries caps. A failure is fatal for the service (no store,
-     * no silent empty list): *error names it. */
-    static std::shared_ptr<Store> Create(std::string *error);
+     * no silent empty list): *error names it. A GPU without an NVDEC class this decoder
+     * drives is no failure: no store, *error empty, *no_nvdec_gpu = its name. */
+    static std::shared_ptr<Store> Create(std::string *error, std::string *no_nvdec_gpu);
     ~Store() override;
 
     C2String getName() const override { return "nvprolapse"; }
@@ -111,6 +112,7 @@ private:
     std::map<uint64_t, std::shared_ptr<C2GraphicBlock>> mBlocks; /* cookie -> fetched block */
     std::map<uint64_t, native_handle_t *> mHandles;             /* cookie -> unwrapped gralloc handle */
     uint64_t mNextCookie = 1;
+    std::unique_ptr<C2StreamHdrStaticInfo::output> mHdr; /* last HDR static info reported */
 };
 
 } // namespace nvc2

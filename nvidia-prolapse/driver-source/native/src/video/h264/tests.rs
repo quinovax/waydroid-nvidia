@@ -180,6 +180,183 @@ fn stock_legacy_h264_setup_mbaff() {
     );
 }
 
+/// Minimal MSB-first bit writer for the hand-built streams of the refusal tests below.
+struct Bw {
+    bytes: Vec<u8>,
+    nbits: usize,
+}
+impl Bw {
+    fn new() -> Self {
+        Bw {
+            bytes: Vec::new(),
+            nbits: 0,
+        }
+    }
+    fn bit(&mut self, b: bool) {
+        if self.nbits % 8 == 0 {
+            self.bytes.push(0);
+        }
+        if b {
+            self.bytes[self.nbits / 8] |= 0x80 >> (self.nbits % 8);
+        }
+        self.nbits += 1;
+    }
+    fn bits(&mut self, n: u32, v: u32) {
+        for i in (0..n).rev() {
+            self.bit((v >> i) & 1 != 0);
+        }
+    }
+    fn ue(&mut self, v: u32) {
+        let x = v + 1;
+        let n = 32 - x.leading_zeros();
+        self.bits(n - 1, 0);
+        self.bits(n, x);
+    }
+    fn se(&mut self, v: i32) {
+        self.ue(if v <= 0 {
+            (-2 * v) as u32
+        } else {
+            (2 * v - 1) as u32
+        });
+    }
+    /// rbsp_trailing_bits: a stop bit, then zero to the byte boundary.
+    fn finish(mut self) -> Vec<u8> {
+        self.bit(true);
+        self.bytes
+    }
+}
+
+/// A syntax-valid SPS: baseline (`profile_idc` 66) or High (100, with `ext` = chroma format,
+/// bit depths). `poc_order_cnt_type` is 2 so the slice header below carries no POC fields.
+fn sps_nal(profile: u8, ext: Option<(u32, u32, u32)>, frame_mbs_only: bool) -> Vec<u8> {
+    let mut w = Bw::new();
+    w.bits(8, 0x67); // nal_ref_idc 3, nal_unit_type 7
+    w.bits(8, u32::from(profile));
+    w.bits(8, 0); // constraint flags
+    w.bits(8, 40); // level
+    w.ue(0); // seq_parameter_set_id
+    if let Some((chroma, luma, chroma_depth)) = ext {
+        w.ue(chroma);
+        if chroma == 3 {
+            w.bit(false); // separate_colour_plane_flag
+        }
+        w.ue(luma); // bit_depth_luma_minus8
+        w.ue(chroma_depth); // bit_depth_chroma_minus8
+        w.bit(false); // qpprime_y_zero_transform_bypass_flag
+        w.bit(false); // seq_scaling_matrix_present_flag
+    }
+    w.ue(0); // log2_max_frame_num_minus4
+    w.ue(2); // pic_order_cnt_type
+    w.ue(1); // max_num_ref_frames
+    w.bit(false); // gaps_in_frame_num_value_allowed_flag
+    w.ue(1); // pic_width_in_mbs_minus1 (2 MBs)
+    w.ue(1); // pic_height_in_map_units_minus1
+    w.bit(frame_mbs_only);
+    if !frame_mbs_only {
+        w.bit(false); // mb_adaptive_frame_field_flag
+    }
+    w.bit(true); // direct_8x8_inference_flag
+    w.bit(false); // frame_cropping_flag
+    w.bit(false); // vui_parameters_present_flag
+    w.finish()
+}
+
+fn pps_nal() -> Vec<u8> {
+    let mut w = Bw::new();
+    w.bits(8, 0x68); // nal_ref_idc 3, nal_unit_type 8
+    w.ue(0); // pic_parameter_set_id
+    w.ue(0); // seq_parameter_set_id
+    w.bit(false); // entropy_coding_mode_flag
+    w.bit(false); // bottom_field_pic_order_in_frame_present_flag
+    w.ue(0); // num_slice_groups_minus1
+    w.ue(0); // num_ref_idx_l0_default_active_minus1
+    w.ue(0); // num_ref_idx_l1_default_active_minus1
+    w.bit(false); // weighted_pred_flag
+    w.bits(2, 0); // weighted_bipred_idc
+    w.se(0); // pic_init_qp_minus26
+    w.se(0); // pic_init_qs_minus26
+    w.se(0); // chroma_qp_index_offset
+    w.bit(false); // deblocking_filter_control_present_flag
+    w.bit(false); // constrained_intra_pred_flag
+    w.bit(false); // redundant_pic_cnt_present_flag
+    w.finish()
+}
+
+/// An IDR I slice with only the fields the parser needs for the picture-level checks.
+fn idr_i_slice_nal(field: bool, bottom: bool) -> Vec<u8> {
+    let mut w = Bw::new();
+    w.bits(8, 0x65); // nal_ref_idc 3, nal_unit_type 5
+    w.ue(0); // first_mb_in_slice
+    w.ue(2); // slice_type 2 = I
+    w.ue(0); // pic_parameter_set_id
+    w.bits(4, 0); // frame_num (log2_max_frame_num_minus4 = 0)
+    if field {
+        w.bit(true); // field_pic_flag
+        w.bit(bottom); // bottom_field_flag
+    }
+    w.ue(0); // idr_pic_id
+    // pic_order_cnt_type 2: no POC fields.
+    w.bit(false); // no_output_of_prior_pics_flag
+    w.bit(false); // long_term_reference_flag
+    w.finish()
+}
+
+fn au(sps: &[u8], pps: &[u8], slice: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for n in [sps, pps, slice] {
+        v.extend_from_slice(&[0, 0, 1]);
+        v.extend_from_slice(n);
+    }
+    v
+}
+
+/// Runs the front end over `data` and requires the loud refusal to name `feature`.
+fn expect_unsupported(data: &[u8], feature: &str) {
+    let mut dec = Decoder::new(EngineParams::blackwell(None));
+    match dec.begin(data) {
+        Err(crate::video::VideoError::Unsupported(reason)) => assert!(
+            reason.contains(feature),
+            "refusal reason {reason:?} does not name {feature:?}"
+        ),
+        Err(e) => panic!("expected Unsupported({feature:?}), got {e:?}"),
+        Ok(_) => panic!("expected Unsupported({feature:?}), the picture was accepted"),
+    }
+}
+
+#[test]
+fn field_pictures_refuse_naming_paff() {
+    // Interlaced SPS, field_pic_flag = 1: PAFF field pictures stay a named refusal: the
+    // legacy setup's field-picture fields have no verified values (no PAFF capture).
+    let data = au(
+        &sps_nal(66, None, false),
+        &pps_nal(),
+        &idr_i_slice_nal(true, false),
+    );
+    expect_unsupported(&data, "field pictures (PAFF)");
+}
+
+#[test]
+fn chroma_422_and_444_refuse_naming_the_format() {
+    for chroma in [2, 3] {
+        let data = au(
+            &sps_nal(100, Some((chroma, 0, 0)), true),
+            &pps_nal(),
+            &idr_i_slice_nal(false, false),
+        );
+        expect_unsupported(&data, &format!("chroma_format_idc {chroma}"));
+    }
+}
+
+#[test]
+fn high_bit_depth_refuses_naming_the_gate() {
+    let data = au(
+        &sps_nal(100, Some((1, 2, 2)), true),
+        &pps_nal(),
+        &idr_i_slice_nal(false, false),
+    );
+    expect_unsupported(&data, "bit depth above 8");
+}
+
 #[test]
 fn scaling_list_fallback_rules() {
     // SPS with seq_scaling_matrix_present and every list absent → fall-back rule A = defaults.

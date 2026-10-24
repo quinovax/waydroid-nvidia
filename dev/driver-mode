@@ -432,6 +432,10 @@ def main():
 
 
 if __name__ == '__main__':
+    # tools whose output is parsed (lxc-info, debugfs, nm, modinfo, systemctl) print C-locale text, here and in
+    # every child process (waydroid upgrade, the gate)
+    os.environ['LC_ALL'] = 'C'
+    os.environ.pop('LANGUAGE', None)
     try:
         sys.exit(main())
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:

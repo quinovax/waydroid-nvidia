@@ -56,7 +56,7 @@ pub struct PictureJob {
     /// Colocated slot of the current picture (setup+0x1cc bits 0-4).
     pub slot: u8,
     /// `SET_PICTURE_INDEX`: stock sends a running picture counter (observed 0, 1, 2, … in decode
-    /// order; its wrap is untraced).
+    /// order).
     pub picture_index: u32,
     /// Caller's surface id for the current picture.
     pub surface: u32,
@@ -509,12 +509,16 @@ impl Decoder {
         }
         if sps.chroma_format_idc != 1 {
             return unsupported(format!(
-                "H.264 chroma_format_idc {} (only 4:2:0)",
+                "H.264 chroma_format_idc {} (only 4:2:0: the session's surfaces and copy-out are \
+                 NV12/P010 4:2:0, so 4:2:2/4:4:4 needs a new surface layout and copy path)",
                 sps.chroma_format_idc
             ));
         }
         if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
-            return unsupported("H.264 bit depth above 8");
+            return unsupported(
+                "H.264 bit depth above 8 (the H.264 codec creates 8-bit surfaces -- the session \
+                 passes no bit depth to it -- and there is no 10-bit setup path)",
+            );
         }
         if sps.width() > 4096 || sps.height() > 4096 {
             return unsupported(format!(
@@ -642,7 +646,7 @@ impl Decoder {
         // DPB position whose slot is not the current one, kept from the previous picture when
         // there is none (stock ELF 0x3ceea). Legacy: the last
         // reference picture's slot (observed in the MBAFF capture and, for progressive pictures on
-        // the legacy path, in the Ada High-profile trace; builder untraced).
+        // the legacy path, in the Ada High-profile capture).
         if new_h264 {
             if let Some(s) = self
                 .dpb
@@ -835,8 +839,8 @@ impl Decoder {
     /// Colocated slot for the target surface. Slots are sticky per surface (stock keeps a record
     /// {surface → slot} per slot, ELF 0x35a70): a surface reuses its slot;
     /// a new surface takes the lowest unassigned slot, else the lowest slot whose surface is no
-    /// longer a reference (stock's recycling rule is untraced; this one never moves a live
-    /// reference, which is the engine contract).
+    /// longer a reference (this rule never moves a live reference, which is the engine
+    /// contract).
     fn colocated_slot(&mut self, surface: u32) -> u8 {
         if let Some(s) = self.slot_surface.iter().position(|&e| e == Some(surface)) {
             return s as u8;

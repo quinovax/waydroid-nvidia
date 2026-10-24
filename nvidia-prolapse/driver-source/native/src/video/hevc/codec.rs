@@ -171,10 +171,9 @@ impl CodecDecoder for HevcDecoder {
             }
             if j.width > self.max.0.next_multiple_of(8) || j.height > self.max.1.next_multiple_of(8)
             {
-                return Err(VideoError::Unsupported(format!(
-                    "HEVC picture {}x{} larger than the session max {}x{}",
-                    j.width, j.height, self.max.0, self.max.1
-                )));
+                return Err(crate::video::too_large(
+                    "HEVC", j.width, j.height, self.max, j.keyframe,
+                ));
             }
             // Output epochs: an IRAP whose POC does not exceed every POC of the current epoch
             // resets POC (IDR/BLA/CRA with NoRaslOutputFlag); pictures before it output first.

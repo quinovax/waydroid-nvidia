@@ -27,9 +27,19 @@ pub fn select(
     if h.frame_is_intra || !seq.enable_order_hint {
         return (mf, out);
     }
+    // Stock libnvcuvid 615.78.08 compares each reference's stored width (the upscaled width, as
+    // CUVID reports it: "coded width, if superres enabled then it is upscaled width") with the
+    // current picture's coded width taken from pic_s, both rounded to 8 (ELF 0x454a0). A
+    // superres frame therefore has no motion-field candidates: its coded grid differs from its
+    // own references' upscaled geometry. Our session always sizes surfaces by the session max,
+    // so the pitch never changes and only these dimensions can disagree.
     let usable = |k: usize| -> bool {
         match recs[k] {
-            Some(r) => !r.intra && r.mi_rows == h.mi_rows && r.mi_cols == h.mi_cols,
+            Some(r) => {
+                !r.intra
+                    && (r.upscaled_width + 7) >> 3 == (h.frame_width + 7) >> 3
+                    && (r.frame_height + 7) >> 3 == (h.frame_height + 7) >> 3
+            }
             None => false,
         }
     };

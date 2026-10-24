@@ -5,8 +5,21 @@
 //! Field derivations follow stock libnvcuvid 615.71.09: picture setup at ELF
 //! 0x13f400 (bsd/flt above sizes, gptimer, word 0x108); method list and
 //! seg/colMV slot rules at 0x141d50. Checked against FFmpeg/libvpx
-//! (error-resilient sign bias, seg-map reset, stride from surface pitch,
-//! scaled-reference validity).
+//! (error-resilient sign bias, stride from surface pitch, scaled-reference
+//! validity).
+//!
+//! Segment maps (libnvcuvid 615.78.08): the side buffer holding the two maps
+//! and the colMV pair is zeroed once when the decoder is created, before the
+//! first picture (ELF 0x3b7c0, a copy-engine fill of the whole buffer); here
+//! the session zeroes every side buffer through its mapping at allocation,
+//! before any submission. Per picture the pair is programmed READ = slot 0
+//! (method 0x5c8), WRITE = slot 1 (0x5cc) and swapped after a picture whose
+//! segmentation_update_map is set (ELF 0x3fbe1, swap at 0x437f3). Nothing is
+//! cleared, copied or reselected at key, intra-only or error-resilient
+//! pictures: the engine applies the VP9 reset (libvpx
+//! `vp9_setup_past_independence`) from the picture flags (pic_s +0x68 bits 0,
+//! 3 and 5). Engine work is ordered by submission, so the CPU never touches
+//! the maps after creation.
 use super::{
     BuildContext, CodecDecoder, DecodeJob, Job, NvdecGen, PictureInfo, VResult, VideoError,
     CODEC_VP9,
@@ -48,10 +61,13 @@ pub struct Vp9Decoder {
     filter: u64,
     seg_flip: usize,
     mv_flip: usize,
-    /// A seg map was written since the last reset (needs clearing on
-    /// key / intra-only / error-resilient / resize, libvpx).
-    seg_dirty: bool,
-    seg_clear: bool,
+    /// Coded size of the last picture that wrote a segment map into the side
+    /// buffer (None: still the zeroed allocation). Survives `flush`, like the
+    /// buffer contents.
+    seg_extent: Option<(u32, u32)>,
+    /// A coded size change on a picture that is not a key frame while a map is
+    /// written: refused (see `next_job`).
+    seg_extent_change: bool,
     prev_key: bool,
     prev_show: bool,
     last_decoded: Option<(u32, u32)>,
@@ -74,8 +90,8 @@ impl Vp9Decoder {
             filter: 0,
             seg_flip: 0,
             mv_flip: 0,
-            seg_dirty: false,
-            seg_clear: false,
+            seg_extent: None,
+            seg_extent_change: false,
             prev_key: false,
             prev_show: false,
             last_decoded: None,
@@ -268,6 +284,13 @@ fn stock_ext_108(width: u32) -> u32 {
     (((2 * width + 0x7e) & 0x3ff80) + 0x1ff) >> 8
 }
 
+/// Whether the segment map pair swaps after this picture: stock sets its swap flag iff
+/// pic_s +0x81 (segment_map_update) is non-zero, which `pic` writes as
+/// `enabled && update_map`.
+fn seg_swaps_after(seg: &crate::vp9::Segmentation) -> bool {
+    seg.enabled && seg.update_map
+}
+
 impl CodecDecoder for Vp9Decoder {
     fn codec(&self) -> u32 {
         CODEC_VP9
@@ -284,8 +307,10 @@ impl CodecDecoder for Vp9Decoder {
         _max_width: u32,
         _max_height: u32,
     ) -> VResult<()> {
-        // Sized for 8192x8192 like stock (ffmpeg's max); no initialisation
-        // beyond zero (stock does none).
+        // Sized for 8192x8192 like stock (ffmpeg's max). The allocator zeroes
+        // each buffer before the session submits anything: stock zeroes the
+        // whole seg + colMV side buffer once at create (ELF 0x3b7c0) and never
+        // again.
         self.seg = alloc.vram(2 * SEG_SIZE)?;
         self.colmv = alloc.vram(2 * COLMV_SIZE)?;
         self.filter = alloc.vram(FILTER_SIZE)?;
@@ -340,16 +365,30 @@ impl CodecDecoder for Vp9Decoder {
             info.keyframe = false;
             return Ok(Some(Job::ShowExisting { surface, info }));
         }
+        let key = h.frame_type == KEY_FRAME;
         if h.width > self.max.0 || h.height > self.max.1 {
-            return Err(VideoError::Unsupported(format!(
-                "VP9 frame {}x{} larger than the session max {}x{}",
-                h.width, h.height, self.max.0, self.max.1
-            )));
+            // A key frame refreshes every reference slot.
+            return Err(super::too_large("VP9", h.width, h.height, self.max, key));
         }
-        // Seg map reset rule (libvpx vp9_entropymode.c:433-437 via
-        // setup_past_independence, and on resize).
-        let resized = self.last_decoded.is_some_and(|s| s != (h.width, h.height));
-        self.seg_clear = self.seg_dirty && (h.is_intra() || h.error_resilient || resized);
+        // A coded size change also changes the segment map extent: libvpx zeroes the maps
+        // on every size change (vp9_alloccommon.c vp9_init_context_buffers via
+        // resize_context_buffers). With no map written yet the side buffer is still the
+        // zeroed allocation. Otherwise a key frame starts a fresh session (zeroed side
+        // buffer, as FFmpeg re-creates its decoder at every VP9 size change, libavcodec/vp9.c:182-254), and any other picture is refused:
+        // what the engine does with a written map of the old extent is not established.
+        let extent_changed = self.seg_extent.is_some_and(|e| e != (h.width, h.height));
+        self.seg_extent_change = extent_changed && !key;
+        if extent_changed && key {
+            return Err(VideoError::Resize {
+                width: h.width,
+                height: h.height,
+                reason: format!(
+                    "VP9 key frame changes the coded size to {}x{} after segment maps were \
+                     written: a new session starts from zeroed maps",
+                    h.width, h.height
+                ),
+            });
+        }
         let info = self.info(&h, h.width, h.height);
         let tiles = frame
             .get(h.uncompressed_size + h.header_size..)
@@ -389,11 +428,11 @@ impl CodecDecoder for Vp9Decoder {
         }
         let probs = self.st.entropy_table();
         d[PROBS..PROBS + probs.as_bytes().len()].copy_from_slice(probs.as_bytes());
-        if self.seg_clear {
-            // Both maps start from zero (segment 0) after a reset point.
+        if self.seg_extent_change {
             return Err(VideoError::Unsupported(
-                "VP9 segmentation map reset after key/intra-only/error-resilient/resize with \
-                 segmentation in use (GPU clear not implemented)"
+                "VP9 coded size change on a non-key picture after segment maps were written \
+                 (libvpx zeroes both maps at every size change): the engine's handling of a \
+                 map written at the old extent is not established"
                     .into(),
             ));
         }
@@ -455,12 +494,12 @@ impl CodecDecoder for Vp9Decoder {
         let h = p.header;
         let counts = readback.and_then(Vp9EntropyCounts::from_bytes);
         self.mv_flip ^= 1;
-        // libvpx swaps the seg maps iff segmentation is enabled
-        // (vp9_decoder.c:483-487); stock swaps after map updates (+0x65e4).
-        // Both agree on every stream with update_map whenever enabled.
-        if self.st.seg.enabled {
+        // Stock swaps the read/write pair after a picture whose
+        // segmentation_update_map is set (libnvcuvid ELF 0x3fbd7/0x3fbe1, the swap at
+        // 0x437f3). The update flag only exists with segmentation enabled.
+        if seg_swaps_after(&self.st.seg) {
             self.seg_flip ^= 1;
-            self.seg_dirty = true;
+            self.seg_extent = Some((h.width, h.height));
         }
         self.prev_key = h.frame_type == KEY_FRAME;
         self.prev_show = h.show_frame;
@@ -478,6 +517,8 @@ impl CodecDecoder for Vp9Decoder {
             seg: self.seg,
             colmv: self.colmv,
             filter: self.filter,
+            // The maps keep their contents across a flush.
+            seg_extent: self.seg_extent,
             ..Self::new(self.gen.class, max.0, max.1, self.bit_depth)
         };
     }
@@ -501,6 +542,43 @@ mod tests {
             stock_bsd_flt(2160, 2),
             ((3 * 2176 * 48) >> 8, (544 * 3 * 16 + 3 * 2176 * 48) >> 8)
         );
+    }
+    #[test]
+    fn segment_map_pair_swaps_on_update_map_only() {
+        use crate::vp9::Segmentation;
+        let seg = |enabled, update_map, temporal_update| Segmentation {
+            enabled,
+            update_map,
+            temporal_update,
+            ..Default::default()
+        };
+        // Stock swaps after a picture with segment_map_update set, temporal or not.
+        assert!(seg_swaps_after(&seg(true, true, false)));
+        assert!(seg_swaps_after(&seg(true, true, true)));
+        // Segmentation on without a map update reads the map in place: no swap
+        // (libvpx would swap here; stock does not).
+        assert!(!seg_swaps_after(&seg(true, false, false)));
+        // Segmentation off: no map write, no swap.
+        assert!(!seg_swaps_after(&seg(false, false, false)));
+    }
+    #[test]
+    fn key_frame_past_the_session_max_asks_for_a_new_session() {
+        let ivf = include_bytes!("testdata/vp9_160x144.ivf");
+        let frames = crate::vp9::ivf_frames(ivf).unwrap();
+        // The first frame is a 160x144 key frame: a 128x128 session cannot hold it, a new
+        // session of the reported size can.
+        let mut d = Vp9Decoder::new(0xcfb0, 128, 128, 8);
+        d.push_unit(frames[0]).unwrap();
+        match d.next_job() {
+            Err(VideoError::Resize { width, height, .. }) => {
+                assert_eq!((width, height), (160, 144))
+            }
+            Err(e) => panic!("expected Resize, got {e}"),
+            Ok(_) => panic!("expected Resize, got a job"),
+        }
+        let mut d = Vp9Decoder::new(0xcfb0, 160, 144, 8);
+        d.push_unit(frames[0]).unwrap();
+        assert!(matches!(d.next_job(), Ok(Some(Job::Decode(_)))));
     }
     #[test]
     fn interp_filter_is_the_bitstream_literal() {
@@ -532,6 +610,14 @@ mod tests {
         let d = Vp9Decoder::new(0xcfb0, 640, 480, 8);
         assert!(matches!(
             d.surfaces_needed(&[0x92, 0, 0]),
+            Err(VideoError::Unsupported(_))
+        ));
+        // Profile 1 (4:4:4) is refused in every session: NVDEC's VP9 decode
+        // supports profiles 0 and 2 only (the engine input is NV12/P010;
+        // 4:2:0 is a session surface contract), so there is no 4:4:4 path to
+        // size a surface for.
+        assert!(matches!(
+            d.surfaces_needed(&[0xa2, 0, 0]),
             Err(VideoError::Unsupported(_))
         ));
         assert_eq!(d.surfaces_needed(&[0x88]).unwrap(), 0); // show_existing

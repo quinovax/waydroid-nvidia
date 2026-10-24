@@ -510,6 +510,110 @@ pub struct ParserState {
 }
 
 impl ParserState {
+    /// Spec 7.8 `set_frame_refs()`: derive the reference slots for
+    /// LAST..ALTREF from the reference slots' order hints when
+    /// `frame_refs_short_signaling` is set. Control flow follows FFmpeg's
+    /// cbs_av1_syntax_template.c:348-455 (a transcription of the spec
+    /// pseudocode): pick ALTREF (latest at/after the current frame), BWDREF
+    /// (earliest at/after), ALTREF2 (the next one), LAST2/LAST3 (latest before),
+    /// then fill anything left with the earliest slot overall.
+    pub(super) fn set_frame_refs(
+        &self,
+        last_frame_idx: u8,
+        gold_frame_idx: u8,
+        cur_order_hint: u32,
+    ) -> Result<[u8; REFS_PER_FRAME]> {
+        let seq = self.seq.as_ref().ok_or(Av1Error::NoSequenceHeader)?;
+        // 0 = LAST, 1 = LAST2, 2 = LAST3, 3 = GOLDEN, 4 = BWDREF, 5 = ALTREF2,
+        // 6 = ALTREF. 0xff = AV1_REF_FRAME_NONE.
+        let mut idx = [0xffu8; REFS_PER_FRAME];
+        idx[0] = last_frame_idx;
+        idx[3] = gold_frame_idx;
+        let mut used = [false; NUM_REF_FRAMES];
+        used[last_frame_idx as usize] = true;
+        used[gold_frame_idx as usize] = true;
+
+        let cur = 1i32 << (seq.order_hint_bits - 1);
+        let mut shifted = [0i32; NUM_REF_FRAMES];
+        for i in 0..NUM_REF_FRAMES {
+            shifted[i] = cur + get_relative_dist(seq, self.refs[i].order_hint, cur_order_hint);
+        }
+        let mut latest = shifted[last_frame_idx as usize];
+        let mut earliest = shifted[gold_frame_idx as usize];
+
+        // ALTREF
+        let mut r: i8 = -1;
+        for i in 0..NUM_REF_FRAMES {
+            let hint = shifted[i];
+            if !used[i] && hint >= cur && (r < 0 || hint >= latest) {
+                r = i as i8;
+                latest = hint;
+            }
+        }
+        if r >= 0 {
+            idx[6] = r as u8;
+            used[r as usize] = true;
+        }
+        // BWDREF
+        let mut r: i8 = -1;
+        for i in 0..NUM_REF_FRAMES {
+            let hint = shifted[i];
+            if !used[i] && hint >= cur && (r < 0 || hint < earliest) {
+                r = i as i8;
+                earliest = hint;
+            }
+        }
+        if r >= 0 {
+            idx[4] = r as u8;
+            used[r as usize] = true;
+        }
+        // ALTREF2
+        let mut r: i8 = -1;
+        for i in 0..NUM_REF_FRAMES {
+            let hint = shifted[i];
+            if !used[i] && hint >= cur && (r < 0 || hint < earliest) {
+                r = i as i8;
+                earliest = hint;
+            }
+        }
+        if r >= 0 {
+            idx[5] = r as u8;
+            used[r as usize] = true;
+        }
+        // LAST2, LAST3
+        for k in [1usize, 2] {
+            if idx[k] == 0xff {
+                let mut r: i8 = -1;
+                for j in 0..NUM_REF_FRAMES {
+                    let hint = shifted[j];
+                    if !used[j] && hint < cur && (r < 0 || hint >= latest) {
+                        r = j as i8;
+                        latest = hint;
+                    }
+                }
+                if r >= 0 {
+                    idx[k] = r as u8;
+                    used[r as usize] = true;
+                }
+            }
+        }
+        // Anything still unset: the earliest slot overall (may be reused).
+        let mut r: i8 = -1;
+        for i in 0..NUM_REF_FRAMES {
+            let hint = shifted[i];
+            if r < 0 || hint < earliest {
+                r = i as i8;
+                earliest = hint;
+            }
+        }
+        for k in idx.iter_mut() {
+            if *k == 0xff {
+                *k = r as u8;
+            }
+        }
+        Ok(idx)
+    }
+
     pub fn parse_frame_header(
         &mut self,
         data: &[u8],
@@ -645,10 +749,14 @@ impl ParserState {
                 false
             };
             if short {
-                return Err(Av1Error::Unsupported("frame_refs_short_signaling"));
+                let last_frame_idx = r.f(3)? as u8;
+                let gold_frame_idx = r.f(3)? as u8;
+                h.ref_frame_idx = self.set_frame_refs(last_frame_idx, gold_frame_idx, h.order_hint)?;
             }
             for i in 0..REFS_PER_FRAME {
-                h.ref_frame_idx[i] = r.f(3)? as u8;
+                if !short {
+                    h.ref_frame_idx[i] = r.f(3)? as u8;
+                }
                 if seq.frame_id_numbers_present {
                     r.f(seq.delta_frame_id_length_minus_2 + 2)?;
                 }

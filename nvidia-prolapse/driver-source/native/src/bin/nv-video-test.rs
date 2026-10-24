@@ -9,6 +9,7 @@
 //! p010le: 16-bit little-endian samples, 10 MSBs).
 //! NV_VIDEO_DUMP=<out.nv12>: also write every output picture (display order,
 //! display window, tightly packed NV12, concatenated) to that file.
+use nv_bionic_native::video::ffi::NvVideoHdrMetadata;
 use nv_bionic_native::video::{
     ffi::*, NvVideoDeviceInfo, TestDmaBuf, VideoDevice, CODEC_AV1, CODEC_VP9, FORMAT_NV12,
     FORMAT_P010, FORMAT_YUV420P,
@@ -109,6 +110,9 @@ fn main() {
             config.extend_from_slice(o.payload);
         }
     }
+    // NV_VIDEO_REPORT=1: per-unit picture counts (nv_video_decode's ABI 2 return) and the
+    // HDR static metadata of every picture that carries any.
+    let report = std::env::var_os("NV_VIDEO_REPORT").is_some();
     let bit_depth: u32 =
         std::env::var("NV_VIDEO_BIT_DEPTH").map_or(8, |v| v.parse().expect("NV_VIDEO_BIT_DEPTH"));
     let bps = if bit_depth > 8 { 2usize } else { 1 };
@@ -170,6 +174,35 @@ fn main() {
                 break;
             }
             let pic = unsafe { pic.assume_init() };
+            if report {
+                let mut hdr = std::mem::MaybeUninit::<NvVideoHdrMetadata>::zeroed();
+                check(
+                    unsafe { nv_video_picture_hdr(s, pic.id, hdr.as_mut_ptr()) },
+                    "picture_hdr",
+                );
+                let hdr = unsafe { hdr.assume_init() };
+                if hdr.has_mastering_display != 0 || hdr.has_content_light_level != 0 {
+                    println!(
+                        "picture {} HDR: mdcv {} R({},{}) G({},{}) B({},{}) WP({},{}) L({},{}) \
+                         CLL {} ({},{})",
+                        pic.id,
+                        hdr.has_mastering_display,
+                        hdr.mastering_display.display_primaries_x[0],
+                        hdr.mastering_display.display_primaries_y[0],
+                        hdr.mastering_display.display_primaries_x[1],
+                        hdr.mastering_display.display_primaries_y[1],
+                        hdr.mastering_display.display_primaries_x[2],
+                        hdr.mastering_display.display_primaries_y[2],
+                        hdr.mastering_display.white_point_x,
+                        hdr.mastering_display.white_point_y,
+                        hdr.mastering_display.max_luminance,
+                        hdr.mastering_display.min_luminance,
+                        hdr.has_content_light_level,
+                        hdr.max_content_light_level,
+                        hdr.max_pic_average_light_level
+                    );
+                }
+            }
             let (w, h) = (pic.crop_width as usize, pic.crop_height as usize);
             target.fill(0xa5).unwrap();
             // NV_VIDEO_TARGET=yuv420p: planar target laid out like an Android YV12 buffer (Y, then
@@ -212,7 +245,8 @@ fn main() {
             }
             for y in 0..h.div_ceil(2) {
                 if planar {
-                    let row = |base: u64| &out[base as usize + y * cpitch as usize..][..w.div_ceil(2)];
+                    let row =
+                        |base: u64| &out[base as usize + y * cpitch as usize..][..w.div_ceil(2)];
                     for (u, v) in row(cb).iter().zip(row(cr)) {
                         nv12.extend_from_slice(&[*u, *v]);
                     }
@@ -246,12 +280,17 @@ fn main() {
         }
     };
     let start = Instant::now();
+    let mut empty_units = 0usize;
     for (i, p) in packets.iter().enumerate() {
         let t0 = Instant::now();
-        check(
-            unsafe { nv_video_decode(s, p.as_ptr(), p.len(), i as u64, 0) },
-            "decode",
-        );
+        let shown = unsafe { nv_video_decode(s, p.as_ptr(), p.len(), i as u64, 0) };
+        check(shown, "decode");
+        if shown == 0 {
+            empty_units += 1;
+        }
+        if report {
+            println!("unit {i}: {shown} displayable pictures, {} bytes", p.len());
+        }
         dec_times.push(t0.elapsed());
         handle(
             s,
@@ -290,7 +329,7 @@ fn main() {
     let (dm, dmed, dmax) = stat(&mut dec_times);
     let (cm, cmed, cmax) = stat(&mut copy_times);
     println!(
-        "{} packets, {frames} pictures, max {max_w}x{max_h}; nv_video_decode mean {dm:?} median {dmed:?} max {dmax:?}; copy_out+fence mean {cm:?} median {cmed:?} max {cmax:?}; wall {wall:?}",
+        "{} packets ({empty_units} without a displayable picture), {frames} pictures, max {max_w}x{max_h}; nv_video_decode mean {dm:?} median {dmed:?} max {dmax:?}; copy_out+fence mean {cm:?} median {cmed:?} max {cmax:?}; wall {wall:?}",
         packets.len()
     );
     unsafe {

@@ -102,6 +102,45 @@ newest-first and re-applies it in order. Tests: HAL `test/ahb-yuv.c`,
 1920x1080 and 1280x720, packed and DISJOINT, every memory plane's offset and pitch equal
 the explicit layout given at creation, MEMORY_PLANE_i and PLANE_i requirements agree,
 binds through MEMORY_PLANE_i succeed.
+`nvk-shader-upload-publish.patch` + `nvk-shader-prefetch-in-range.patch`: shader programs are
+published the way the proprietary driver (libnvidia-eglcore 615.78.08) does. The shader heap is
+never CPU-mapped, also with a full BAR: every upload is a copy-engine copy from system-memory
+staging (`nvk_upload_queue`, LAUNCH_DMA NON_PIPELINED | FLUSH_ENABLE). `nvk_heap` counts uploads;
+in the first submission on a queue after the count moved, the queue acquires the upload queue's
+completion and then emits INVALIDATE_SHADER_CACHES_NO_WFI(INSTRUCTION) (3D class form, compute
+form on compute-only queues) ahead of the command buffers, with no wait-for-idle. Before, heap
+ranges of destroyed shaders were rewritten through a write-combined BAR1 mapping and reused at
+once with no instruction-cache invalidate, so a draw could run a header or code cached for the
+range's previous user (the rare Xid 13 "Shader Program Header 11/18 Error" under ANGLE decodes as
+a vertex header read at a fragment program address; no deterministic reproducer exists). On
+Ampere B and later programs start at 256 B and occupy whole 256 B blocks, so
+SET_PIPELINE_PROGRAM_PREFETCH never covers the neighbouring program. Tests:
+`tests/vk-shader-reuse.c` (recycled ranges, every pixel checked) and `native/tools/nvcap_publish.py`
+on a push capture (every program address used only after its copy, the acquire and the
+invalidate; prefetch inside the copied range).
+`nvk-prevolta-modifier-memory-types.patch` (with the RM backend's `allocate_block_linear`):
+memory for a block-linear DRM-modifier image carries the image's kind on the physical allocation
+(NVOS32 FORMAT BLOCK_LINEAR, generic kind, no compression), as NVK does on nouveau
+(`nvk_device_memory.c` → `nouveau_bo.c` `tile_flags`) and as the proprietary driver requests it.
+Another process that imports the dma-buf maps it with the memory's own kind. Before Turing that
+kind decides how the GPU reads the pages, so a pitch-kind allocation sampled as block-linear
+faults (Xid 13 TEX LAYOUT in KWin on a GTX 1060/1080, closed 580). Before Turing, BAR1 also
+doesn't return the modifier's byte layout to the CPU, so these images get no host-visible VRAM
+memory type (the proprietary 580 driver offers none either: memoryTypeBits 0x82 on GP104);
+system-memory types stay. Turing and later are unchanged (generic kind 0x06; BAR1 reads back
+exactly on TU106 and GB202).
+`nvk-3d-view-of-2d-image.patch`: a `VK_IMAGE_VIEW_TYPE_3D` view of a `VK_IMAGE_TYPE_2D` image is
+invalid usage that NVIDIA's driver accepts (615.78.08 returns `VK_SUCCESS`); 3DMark Wild Life
+Extreme creates one on its second scene load in one process. nil's `normalize_extent`
+(`descriptor.rs:261`) asserts `image.dim == ImageDim::_3D`, and the panic aborts the process because
+it cannot leave the `extern "C"` `nil_image_view_descriptor`. NVK now hands nil the selected layer as
+a 3D image of depth 1 (same memory layout: one slice per level, `z_log2 = 0`), the mirror of its own
+`image_3d_view_as_2d_array()`, and logs the invalid usage once. Only a single-sampled single layer
+qualifies; any other 3D view of a non-3D image (multisampled, several layers, 1D) fails
+`vkCreateImageView` with a logged reason and `VK_ERROR_UNKNOWN` (as `nvk_image.c` reports invalid image
+parameters) instead of reaching nil's assert, which release builds keep. Upstream Mesa main (2026-10-23)
+still asserts. Reproducer: `tests/nvk-3d-view-of-2d-image.c` (aborts before; after: the 3DMark view is
+created and a 3D view of a 4x multisampled image returns an error; the stock ICDs accept both).
 `nvk-angle-nan-preserve-min-max.patch`: driconf `nvk_force_nan_preserve_min_max` (RADV's
 `radv_force_nan_preserve_min_max` mechanism -> spirv `workarounds.force_nan_preserve_min_max`),
 set for engine `^ANGLE$` in `00-nvk-defaults.conf` and folded into the compiler flags (bit 15).

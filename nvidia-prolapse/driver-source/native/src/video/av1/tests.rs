@@ -284,3 +284,114 @@ fn film_grain_hidden_frames_and_show_existing() {
     assert_eq!(r.shown + r.show_existing, 40, "{r:?}");
     assert!(r.hidden_grain > 0 && r.show_existing_grain > 0, "{r:?}");
 }
+
+/// Spec 7.8 set_frame_refs: reference slots derived from order hints. The two
+/// cases walk every branch of the selection order (ALTREF/BWDREF/ALTREF2 from
+/// the future, then LAST2/LAST3, then the earliest-slot fallback), with the
+/// expected values worked out from the order hints by hand.
+#[test]
+fn frame_refs_short_signaling_derivation() {
+    let seq = SequenceHeader {
+        enable_order_hint: true,
+        order_hint_bits: 8,
+        ..Default::default()
+    };
+    let mut p = ParserState {
+        seq: Some(seq),
+        refs: [header::RefSlotState::default(); header::NUM_REF_FRAMES],
+    };
+    // Current frame order hint 50; all reference hints are before it.
+    for (i, hint) in [40u32, 45, 48, 30, 20, 10, 0, 35].into_iter().enumerate() {
+        p.refs[i].order_hint = hint;
+    }
+    // LAST = slot 0 (hint 40), GOLDEN = slot 3 (hint 30). LAST2 = slot 2 (126,
+    // the largest below the frame and >= LAST's 118); LAST3 starts over at the
+    // first unused slot below the frame (slot 1, hint 123); the three future
+    // slots fall back to the earliest slot overall (slot 6, hint 0).
+    assert_eq!(p.set_frame_refs(0, 3, 50).unwrap(), [0, 2, 1, 3, 6, 6, 6]);
+
+    // Future references: 60 (slot 4), 55 (slot 5), 70 (slot 6).
+    for (i, hint) in [40u32, 45, 48, 30, 60, 55, 70, 20].into_iter().enumerate() {
+        p.refs[i].order_hint = hint;
+    }
+    // ALTREF = 70, BWDREF = 55 (earliest in the future), ALTREF2 = 60;
+    // LAST2 = slot 2 (126) and LAST3 = slot 1 (123), the same two-step as above.
+    assert_eq!(p.set_frame_refs(0, 3, 50).unwrap(), [0, 2, 1, 3, 5, 4, 6]);
+
+    // get_relative_dist: signed wrap around the order-hint modulus.
+    let s = p.seq.clone().unwrap();
+    assert_eq!(header::get_relative_dist(&s, 40, 50), -10);
+    assert_eq!(header::get_relative_dist(&s, 60, 50), 10);
+    assert_eq!(header::get_relative_dist(&s, 250, 5), -11);
+}
+
+/// Superres inter frames: stock writes the coded (pre-superres) width into the
+/// current frame info and its motion-field size gate then finds no candidate
+/// (reference widths are upscaled), so use_temporal stays 0 and the motion-field
+/// words are zero. Both are pinned here on the values measured from a stock
+/// libnvcuvid 615.78.08 capture (320-wide upscaled / 213-wide coded picture,
+/// denom 12).
+#[test]
+fn superres_geometry_and_motion_field_gate() {
+    let seq = SequenceHeader {
+        enable_order_hint: true,
+        order_hint_bits: 8,
+        ..Default::default()
+    };
+    let cur = header::FrameHeader {
+        frame_type: header::INTER_FRAME,
+        use_superres: true,
+        superres_denom: 12,
+        upscaled_width: 320,
+        frame_width: 213,
+        frame_height: 240,
+        mi_cols: 40,
+        mi_rows: 30,
+        order_hint: 50,
+        use_ref_frame_mvs: true,
+        ..Default::default()
+    };
+    let rec = PicRecord {
+        // A reference of the same stream: same coded size, upscaled to 320.
+        upscaled_width: 320,
+        frame_width: 213,
+        frame_height: 240,
+        mi_cols: 40,
+        mi_rows: 30,
+        ..Default::default()
+    };
+    let (mf, _) = mf::select(&seq, &cur, &[Some(rec); 7], &[None; 7]);
+    assert!(
+        mf.use_temporal.iter().all(|&t| !t),
+        "stock projects no motion field on a superres frame: {mf:?}"
+    );
+    // The same reference geometry without superres is usable.
+    let cur2 = header::FrameHeader {
+        frame_width: 320,
+        upscaled_width: 320,
+        use_superres: false,
+        order_hints: [0; 7],
+        ..cur
+    };
+    let rec2 = PicRecord {
+        upscaled_width: 320,
+        ..rec
+    };
+    let (mf2, _) = mf::select(&seq, &cur2, &[Some(rec2); 7], &[None; 7]);
+    assert!(mf2.mf_type[0] != 0, "a same-size reference must be a candidate");
+}
+
+/// Large-scale tile (OBU_TILE_LIST, type 8) is still refused loudly: NVDEC
+/// decodes ordinary frame/tile-group OBUs only, and the tile-list mode (a
+/// still-picture map of independently decodable tiles) has no engine path.
+#[test]
+fn large_scale_tile_list_stays_unsupported() {
+    let mut c = Av1Codec::new();
+    // OBU header: forbidden 0, type 8, extension 0, has_size_field 1, reserved 0.
+    c.push_unit(&[0x42, 0x01, 0x00]);
+    match c.next_out() {
+        Err(obu::Av1Error::Unsupported(msg)) => assert!(msg.contains("OBU_TILE_LIST"), "{msg}"),
+        Err(e) => panic!("expected Unsupported, got {e}"),
+        Ok(_) => panic!("expected Unsupported, got a picture"),
+    }
+}

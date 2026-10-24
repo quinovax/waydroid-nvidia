@@ -3,10 +3,13 @@
  * can be tested on the host without a GPU. It models the documented behaviour only:
  * display-order output, hidden frames + show_existing (VP9/AV1), POC reordering
  * (H.264/HEVC), a bounded number of unreleased pictures (-> NV_VIDEO_E_AGAIN),
- * keyframe-after-flush, END_OF_STREAM drain, copy_out validation, device loss.
+ * keyframe-after-flush, END_OF_STREAM drain, copy_out validation, device loss, the ABI 2
+ * picture count returned by nv_video_decode and NV_VIDEO_E_RESIZE at a keyframe larger than
+ * the session.
  *
  * Stub unit format (8 bytes): 'N', flags, w lo, w hi, h lo, h hi, poc, bit depth
- *   flags bit0 key, bit1 show, bit2 show_existing (shows the oldest hidden frame), bit3 corrupt
+ *   flags bit0 key, bit1 show, bit2 show_existing (shows the oldest hidden frame), bit3 corrupt,
+ *   bit4 (H.264/HEVC) decoded but never output (pic_output_flag = 0)
  */
 #include "nv_video_stub.h"
 
@@ -30,6 +33,8 @@ struct NvVideoSession {
     unsigned outstanding = 0;
     uint64_t next_id = 1;
     bool need_key = true;
+    bool resize = false;
+    uint32_t req_w = 0, req_h = 0;
 };
 
 extern "C" {
@@ -41,7 +46,7 @@ int nv_video_device_open(NvVideoDevice **out, NvVideoDeviceInfo *info)
         memset(info, 0, sizeof(*info));
         info->abi_version = NV_VIDEO_ABI_VERSION;
         info->pci_vendor = 0x10de;
-        info->nvdec_class = 0xcfb0;
+        info->nvdec_class = g_stub.nvdec_class;
         info->nvdec_engines = 1;
         strcpy(info->name, "stub");
     }
@@ -101,6 +106,11 @@ int nv_video_decode(NvVideoSession *s, const uint8_t *d, size_t len, uint64_t ts
         set_err("stub: channel error");
         return NV_VIDEO_E_DEVICE_LOST;
     }
+    if (len && s->resize) {
+        set_err("stub: session needs re-creation");
+        return NV_VIDEO_E_INVALID;
+    }
+    int shown = 0;
     if (len) {
         if (len < 8 || d[0] != 'N') {
             if (len >= 1 && d[0] == 'P') /* parameter set unit (codec config) */
@@ -132,12 +142,22 @@ int nv_video_decode(NvVideoSession *s, const uint8_t *d, size_t len, uint64_t ts
         p.keyframe = fl & 1;
         p.reserved[0] = d[6];
         if (p.width > s->info.max_width || p.height > s->info.max_height) {
+            if (fl & 1) {
+                s->resize = true;
+                s->req_w = p.width;
+                s->req_h = p.height;
+                set_err("stub: keyframe larger than the session");
+                return NV_VIDEO_E_RESIZE;
+            }
             set_err("stub: stream larger than the session");
             return NV_VIDEO_E_UNSUPPORTED;
         }
         if (reorders(s)) {
-            s->reorder.push_back(p);
-            reorder_out(s, g_stub.reorder_depth);
+            if (!(fl & 16)) {
+                s->reorder.push_back(p);
+                reorder_out(s, g_stub.reorder_depth);
+                shown = 1;
+            }
         } else if (fl & 4) {
             if (s->hidden.empty()) {
                 set_err("stub: show_existing without a hidden frame");
@@ -147,8 +167,10 @@ int nv_video_decode(NvVideoSession *s, const uint8_t *d, size_t len, uint64_t ts
             s->hidden.pop_front();
             h.timestamp = ts;
             s->ready.push_back(h);
+            shown = 1;
         } else if (fl & 2) {
             s->ready.push_back(p);
+            shown = 1;
         } else {
             s->hidden.push_back(p);
         }
@@ -157,6 +179,23 @@ int nv_video_decode(NvVideoSession *s, const uint8_t *d, size_t len, uint64_t ts
         reorder_out(s, 0);
         s->hidden.clear();
     }
+    return shown;
+}
+
+int nv_video_required_size(NvVideoSession *s, uint32_t *w, uint32_t *h)
+{
+    if (!s->resize) {
+        set_err("stub: no resize pending");
+        return NV_VIDEO_E_INVALID;
+    }
+    *w = s->req_w;
+    *h = s->req_h;
+    return 0;
+}
+
+int nv_video_picture_hdr(NvVideoSession *, uint64_t, NvVideoHdrMetadata *m)
+{
+    *m = g_stub.hdr;
     return 0;
 }
 
@@ -180,6 +219,7 @@ int nv_video_flush(NvVideoSession *s)
     s->hidden.clear();
     s->reorder.clear();
     s->need_key = true;
+    s->resize = false;
     return 0;
 }
 

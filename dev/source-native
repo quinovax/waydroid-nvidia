@@ -201,7 +201,12 @@ def is_source_root(root):
 
 
 def container_state():
-    return subprocess.check_output(['lxc-info', *LXC_PATH, '-sH'], text=True).strip()
+    proc = subprocess.run(['lxc-info', *LXC_PATH, '-sH'], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f'lxc-info cannot read the Waydroid container ({proc.stderr.strip() or "no message"}). '
+                           'Remedy: sudo waydroid upgrade -o (regenerates /var/lib/waydroid/lxc/waydroid/config for '
+                           'this LXC), then re-run; if LXC still rejects the config, report this message')
+    return proc.stdout.strip()
 
 
 # ---------------------------------------------------------------- rendering (pure)
@@ -360,11 +365,23 @@ def stage_sources(rust_profile='dev'):
     return sources
 
 
+_GATE = []
+
+
+def _release_gate():
+    if not _GATE:
+        _GATE.append(_load(REPO / 'packaging/native/release_gate.py', 'release_gate'))
+    return _GATE[0]
+
+
 def _needed(path):
-    # LC_ALL=C keeps readelf's field names untranslated (the regex below is English).
-    env = {**os.environ, 'LC_ALL': 'C'}
-    dynamic = subprocess.check_output(['readelf', '-d', str(path)], text=True, env=env)
-    return re.findall(r'\(NEEDED\)\s+Shared library: \[(.+?)\]', dynamic)
+    """DT_NEEDED of an ELF object, parsed from the file (release_gate.needed), not from readelf's localised text."""
+    return _release_gate().needed(path)
+
+
+def _proprietary_needed(path):
+    """DT_NEEDED names of `path` that are not bionic: glibc, the glibc shim, NVIDIA's libraries."""
+    return [n for n in _needed(path) if any(m in n for m in ('libc.so.6', 'libnvglibc', 'libEGL_nvidia', 'libnvidia-'))]
 
 
 def gate_coverage(sources, rust_profile='dev'):
@@ -503,8 +520,7 @@ def media_closure(service, libs, android_rust, system_img, vendor_img):
     for obj in [Path(service), *staged.values()]:
         if native._elf_class(obj) != 64:
             raise RuntimeError(f'Media artifact is not ELF64: {obj}')
-        dynamic = subprocess.check_output(['readelf', '-d', str(obj)], text=True)
-        if any(n in dynamic for n in ('libc.so.6', 'libnvglibc', 'libEGL_nvidia', 'libnvidia-')):
+        if _proprietary_needed(obj):
             raise RuntimeError(f'Non-bionic/proprietary dependency in media artifact: {obj}')
         where = {}
         for name in _needed(obj):
@@ -535,6 +551,16 @@ def media_codecs(xml):
     return sorted(mc.get('name') for mc in ET.parse(xml).getroot().iter('MediaCodec'))
 
 
+def media_codec_types(xml):
+    """The MIME types the generated media_codecs_c2.xml advertises on this GPU."""
+    import xml.etree.ElementTree as ET
+    return sorted({mc.get('type') for mc in ET.parse(xml).getroot().iter('MediaCodec')})
+
+
+# Advertised MIME -> nvc2 decoder core codec name (test/real_codec_test.cpp), for the decode smoke.
+SMOKE_CODECS = {'video/avc': 'h264', 'video/hevc': 'hevc', 'video/x-vnd.on2.vp9': 'vp9', 'video/av01': 'av1'}
+
+
 def run_media_gate(rust_profile, android_rust, images=IMAGES):
     """Offline gate of the Codec2 decoder against the backend being staged. Returns (record, odm sources).
 
@@ -542,7 +568,8 @@ def run_media_gate(rust_profile, android_rust, images=IMAGES):
     3. nvc2-xmlgen relinked against the host build of the SAME Rust profile and source snapshot as the
        staged Android backend; 4. stage-odm.sh builds the /odm tree (vendor.img originals, rc, VINTF,
        seccomp, media_codecs_c2.xml generated from this GPU, the service); 5. nvc2-xmlgen --check of that
-       xml against the live caps; 6. ELF closure + nv_video symbols; 7. device node access for mediacodec.
+       xml against the live caps; 6. a decode smoke of every advertised codec (real GPU, tiny committed
+       streams with pinned hashes); 7. ELF closure + nv_video symbols; 8. device node access for mediacodec.
     """
     problems = media_staleness()
     if problems:
@@ -564,9 +591,9 @@ def run_media_gate(rust_profile, android_rust, images=IMAGES):
               'log': str(log), 'steps': [],
               'host_backend': profiles.identity(host_rust), 'android_backend': profiles.identity(android_rust)}
 
-    def step(name, *cmd):
+    def step(name, *cmd, as_root=False):
         argv, env = list(map(str, cmd)), dict(os.environ)
-        if user is not None:
+        if user is not None and not as_root:
             argv = ['runuser', '-u', user.pw_name, '--', *argv]
             env.update(HOME=user.pw_dir, USER=user.pw_name, LOGNAME=user.pw_name)
         print(f'Media gate [{name}]: {" ".join(argv)}', flush=True)
@@ -585,14 +612,26 @@ def run_media_gate(rust_profile, android_rust, images=IMAGES):
     step('xmlgen-link', 'make', '-B', '-C', MEDIA, 'xmlgen',
          f'NV_VIDEO_LIB=-L{libdir} -lnv_bionic_native -Wl,-rpath,{libdir}')
     xmlgen = MEDIA / 'out/host/nvc2-xmlgen'
-    runpath = re.findall(r'\((?:RUNPATH|RPATH)\)\s+Library r(?:un)?path: \[(.+?)\]',
-                         subprocess.check_output(['readelf', '-d', str(xmlgen)], text=True))
+    runpath = _release_gate().elf_dynamic(xmlgen)['runpath']
     if runpath != [str(libdir)]:
         raise RuntimeError(f'{xmlgen} resolves the backend through {runpath}, not {libdir}')
     odm = workdir / 'odm'
     step('stage-odm', 'bash', MEDIA / 'stage-odm.sh', odm, vendor_img, MEDIA_SERVICE_BIN, xmlgen)
     xml = workdir / native.MEDIA_XML
     step('xmlgen-check', xmlgen, '--check', xml)
+    # Decode every advertised codec on the real GPU: /dev/dma_heap/system is root-only, so this
+    # step runs as root (the gate itself is root); the build outputs it creates are given back.
+    smoke = [SMOKE_CODECS[t] for t in media_codec_types(xml) if t in SMOKE_CODECS]
+    if not smoke:
+        raise RuntimeError(f'{xml} advertises no codec the decode smoke can drive '
+                           f'({media_codec_types(xml)}): the generated caps and the decoder disagree')
+    step('decode-smoke', 'make', '-B', '-C', MEDIA, 'smoke',
+         f'NV_VIDEO_LIB=-L{libdir} -lnv_bionic_native -Wl,-rpath,{libdir}', 'CODECS=' + ' '.join(smoke),
+         as_root=True)
+    if user is not None:
+        for root, dirs, files in os.walk(MEDIA / 'out'):
+            for name in dirs + files:
+                os.chown(os.path.join(root, name), user.pw_uid, user.pw_gid)
     want = set(native.MEDIA_ODM_FILES) | {'odm/etc/' + n for n in native.ODM_ORIGINALS}
     have = {str(p.relative_to(workdir)) for p in odm.rglob('*') if p.is_file() or p.is_symlink()}
     if have != want:
@@ -687,10 +726,9 @@ def run_native_gl_gate(sources, rust_profile='dev', suffix=''):
             if record['artifacts'].get(name, {}).get('sha256') != sha256(built):
                 raise RuntimeError(f'{built} differs from its build record {records[target]} (stale or partial '
                                    f'build); {native.NATIVE_GL_BUILD}')
-            dynamic = subprocess.check_output(['readelf', '-d', str(built)], text=True)
-            if any(n in dynamic for n in ('libc.so.6', 'libnvglibc', 'libEGL_nvidia', 'libnvidia-')):
+            if _proprietary_needed(built):
                 raise RuntimeError(f'Non-bionic/proprietary dependency in nvrm artifact: {built}')
-            if name == native.NVRM_GALLIUM and 'libnv_bionic_native.so' not in dynamic:
+            if name == native.NVRM_GALLIUM and 'libnv_bionic_native.so' not in _needed(built):
                 raise RuntimeError(f'{built} does not link the Rust RM library')
             out = fake / f'build/nvrm-{target}' / subdir / name
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -761,10 +799,9 @@ def stage(dest, rust_profile='dev', no_media=None, no_native_gl=None, nvrm_suffi
         bits = 64 if '/lib64/' in rel else 32
         if native._elf_class(source) != bits:
             raise RuntimeError(f'Expected source ELF{bits}: {source}')
-        dynamic = subprocess.check_output(['readelf', '-d', str(source)], text=True)
-        if any(name in dynamic for name in ('libc.so.6', 'libnvglibc', 'libEGL_nvidia', 'libnvidia-')):
+        if _proprietary_needed(source):
             raise RuntimeError(f'Non-bionic/proprietary dependency in source artifact: {source}')
-        if source.name == 'libvulkan_nouveau.so' and 'libnv_bionic_native.so' not in dynamic:
+        if source.name == 'libvulkan_nouveau.so' and 'libnv_bionic_native.so' not in _needed(source):
             raise RuntimeError(f'NVK is missing its Rust RM dependency: {source}')
     graphics = dict(sources)
     if no_media is None:
@@ -1559,6 +1596,10 @@ def main():
 
 
 if __name__ == '__main__':
+    # tools whose output is parsed (lxc-info, debugfs, nm, modinfo, systemctl) print C-locale text, here and in
+    # every child process (waydroid upgrade, the gate)
+    os.environ['LC_ALL'] = 'C'
+    os.environ.pop('LANGUAGE', None)
     if sys.argv[1:2] == ['hook']:
         try:
             sys.exit(main() or 0)

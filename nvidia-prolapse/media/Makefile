@@ -4,7 +4,10 @@
 #   make xmlgen   -> out/host/nvc2-xmlgen (links the GNU build of the nv_video backend: NV_VIDEO_LIB)
 #   make xmlgen-android -> out/android/nvc2-xmlgen (bionic, for the release gate)
 #   make stubgen  -> out/host/nvc2-xmlgen-stub (same tool on the stub; for the xml unit test)
-#   make realtest -> core on the real GPU (see the rule)
+#   make realtest -> core on the real GPU, one codec (see the rule)
+#   make realtest-all -> every codec and output layout against ffmpeg-generated streams
+#   make smoke    -> tiny committed streams with pinned hashes (media gate; no ffmpeg)
+#   make c2-smoke -> out/android/c2_smoke (bionic, MediaCodec ByteBuffer client for the guest)
 #   make android  -> out/android/libnvc2_core.a (NDK r29, x86_64, API 33, platform libc++ ABI std::__1)
 #   make android-c2 -> out/android/c2obj/*.o (Codec2 component, compile check)
 #
@@ -38,6 +41,7 @@ test: out/host/core_test out/host/xml_test
 	./out/host/core_test
 	./out/host/xml_test
 	python3 -I test/validate_xml.py out/host/media_codecs_c2.xml
+	python3 -I test/validate_xml.py --no-decoders out/host/media_codecs_c2.none.xml
 
 xmlgen: out/host/nvc2-xmlgen
 out/host/nvc2-xmlgen: $(CORE) $(HDRS) tools/nvc2_xmlgen.cpp Makefile
@@ -54,14 +58,36 @@ out/android/nvc2-xmlgen: $(CORE) $(HDRS) tools/nvc2_xmlgen.cpp Makefile
 	@mkdir -p $(@D)
 	$(NDK_CXX) $(CXXFLAGS_COMMON) -static-libstdc++ -o $@ $(CORE) tools/nvc2_xmlgen.cpp $(NV_VIDEO_ANDROID_LIB)
 
-# Real GPU: the core on the GNU nv_video backend, VP9 IVF vs an ffmpeg NV12 reference
-#   make realtest NV_VIDEO_LIB="-L<dir> -lnv_bionic_native -Wl,-rpath,<dir>" IVF=in.ivf REF=ref.nv12 W=854 H=480
-realtest: out/host/real_vp9_test
-	./out/host/real_vp9_test $(IVF) $(REF) $(W) $(H) $(POOL)
-out/host/real_vp9_test: core/nvc2_decoder.cpp $(HDRS) test/real_vp9_test.cpp Makefile
+# Real GPU: the core on the GNU nv_video backend. One codec per invocation, compared byte for
+# byte with an FFmpeg software-decoder reference; output layout from MODE (nv12 default, p010
+# for 10-bit, yv12 = the Codec2 component's CPU/ByteBuffer target):
+#   make realtest CODEC=h264 STREAM=in.h264 REF=ref.nv12 W=1920 H=1080 MODE=nv12 \
+#        NV_VIDEO_LIB="-L<dir> -lnv_bionic_native -Wl,-rpath,<dir>"
+realtest: out/host/real_codec_test
+	./out/host/real_codec_test $(CODEC) $(STREAM) $(REF) $(W) $(H) $(POOL)
+out/host/real_codec_test: core/nvc2_decoder.cpp $(HDRS) test/real_codec_test.cpp Makefile
 	@test -n "$(NV_VIDEO_LIB)" || { echo "NV_VIDEO_LIB= the GNU build of the nv_video backend"; exit 1; }
 	@mkdir -p $(@D)
-	$(HOST_CXX) $(CXXFLAGS_COMMON) -o $@ core/nvc2_decoder.cpp test/real_vp9_test.cpp $(NV_VIDEO_LIB)
+	$(HOST_CXX) $(CXXFLAGS_COMMON) -o $@ core/nvc2_decoder.cpp test/real_codec_test.cpp $(NV_VIDEO_LIB)
+
+# Generates 640x360 streams + references with ffmpeg and runs every codec/layout (H.264,
+# HEVC, VP9, AV1 in NV12; the same 8-bit codecs again through the YV12/ByteBuffer target;
+# HEVC Main10 and VP9 profile 2 in P010).
+realtest-all: out/host/real_codec_test
+	bash test/run-real-tests.sh
+
+# The release gate's decode smoke: committed streams + pinned per-frame hashes, no ffmpeg.
+# CODECS from the gate (the advertised list); defaults to all four.
+smoke: out/host/real_codec_test
+	bash test/decode-smoke.sh
+
+# Guest client for the Codec2 service through the public MediaCodec NDK (ByteBuffer output,
+# i.e. the CPU-mapped YV12/P010 path). Push to /data/local/tmp with the test MP4s; used for
+# the seccomp measurement (strace -f -c on the service) and the bionic end-to-end check.
+c2-smoke: out/android/c2_smoke
+out/android/c2_smoke: test/c2_smoke.cpp Makefile
+	@mkdir -p $(@D)
+	$(NDK_CXX) -std=c++17 -O2 -Wall -Wextra -Werror -static-libstdc++ -o $@ test/c2_smoke.cpp -lmediandk -llog
 
 android: out/android/libnvc2_core.a
 out/android/libnvc2_core.a: $(CORE) $(HDRS) Makefile
@@ -100,4 +126,4 @@ out/android/c2obj/SimpleC2Interface.o: $(AV)/media/codec2/components/base/Simple
 clean:
 	rm -rf out
 
-.PHONY: all test xmlgen xmlgen-android realtest android android-c2 clean
+.PHONY: all test xmlgen xmlgen-android realtest realtest-all smoke c2-smoke android android-c2 clean

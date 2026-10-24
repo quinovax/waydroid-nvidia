@@ -10,6 +10,7 @@
 //! p010le: 16-bit little-endian samples, 10 MSBs).
 //! NV_VIDEO_DUMP=<out.nv12>: also write every output picture (display order,
 //! display window, tightly packed NV12, concatenated) to that file.
+use nv_bionic_native::video::ffi::NvVideoHdrMetadata;
 use nv_bionic_native::video::{
     bits::access_units, ffi::*, NvVideoDeviceInfo, TestDmaBuf, VideoDevice, CODEC_H264, CODEC_HEVC,
     FORMAT_NV12, FORMAT_P010, FORMAT_YUV420P,
@@ -25,28 +26,35 @@ fn check(r: i32, what: &str) {
     }
 }
 
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    e: i16,
+    r: i16,
+}
+extern "C" {
+    fn poll(f: *mut PollFd, n: std::ffi::c_ulong, t: i32) -> i32;
+    fn close(fd: i32) -> i32;
+}
+
 fn wait_fd(fd: i32) {
     if fd < 0 {
         return;
     }
-    #[repr(C)]
-    struct P {
-        fd: i32,
-        e: i16,
-        r: i16,
-    }
-    extern "C" {
-        fn poll(f: *mut P, n: std::ffi::c_ulong, t: i32) -> i32;
-        fn close(fd: i32) -> i32;
-    }
-    let mut p = P { fd, e: 1, r: 0 };
-    // SAFETY: one pollfd; fd owned by us.
+    wait_fd_keep(fd);
+    // SAFETY: fd owned by us.
+    unsafe { close(fd) };
+}
+
+/// poll(POLLIN) but leaving the fd open (measured acquire-fence path).
+fn wait_fd_keep(fd: i32) {
+    let mut p = PollFd { fd, e: 1, r: 0 };
+    // SAFETY: one pollfd, valid for the call.
     unsafe {
         if poll(&mut p, 1, 2000) != 1 {
             eprintln!("release fence did not signal");
             std::process::exit(3);
         }
-        close(fd);
     }
 }
 
@@ -75,6 +83,9 @@ fn main() {
         info.nvdec_class,
         info.nvdec_engines
     );
+    // NV_VIDEO_REPORT=1: per-unit picture counts (nv_video_decode's ABI 2 return) and the
+    // HDR static metadata of the first picture that carries any.
+    let report = std::env::var_os("NV_VIDEO_REPORT").is_some();
     let bit_depth: u32 =
         std::env::var("NV_VIDEO_BIT_DEPTH").map_or(8, |v| v.parse().expect("NV_VIDEO_BIT_DEPTH"));
     let bps = if bit_depth > 8 { 2usize } else { 1 };
@@ -110,6 +121,12 @@ fn main() {
     let (mut frames, mut bad, mut diff_total) = (0usize, 0usize, 0usize);
     let mut dec_times = Vec::new();
     let mut copy_times = Vec::new();
+    // NV_VIDEO_MEASURE_ACQUIRE=1: pass the previous picture's (already signalled) release
+    // fence back as the acquire fence, the steady state of a media pipeline, and time the
+    // copy_out call alone. The wait on a signalled sync_file is one poll(2).
+    let measure_acquire = std::env::var_os("NV_VIDEO_MEASURE_ACQUIRE").is_some();
+    let mut acquire = -1i32;
+    let mut copy_call: Vec<Duration> = Vec::new();
     let mut out = vec![0u8; size];
     let mut dump = std::env::var_os("NV_VIDEO_DUMP")
         .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("create NV_VIDEO_DUMP")));
@@ -118,7 +135,9 @@ fn main() {
                       bad: &mut usize,
                       diff_total: &mut usize,
                       off: &mut usize,
-                      copy_times: &mut Vec<Duration>| {
+                      copy_times: &mut Vec<Duration>,
+                      acquire: &mut i32,
+                      copy_call: &mut Vec<Duration>| {
         loop {
             let mut pic = std::mem::MaybeUninit::<NvVideoPicture>::zeroed();
             let r = unsafe { nv_video_next_picture(s, pic.as_mut_ptr()) };
@@ -127,6 +146,35 @@ fn main() {
                 break;
             }
             let pic = unsafe { pic.assume_init() };
+            if report {
+                let mut hdr = std::mem::MaybeUninit::<NvVideoHdrMetadata>::zeroed();
+                check(
+                    unsafe { nv_video_picture_hdr(s, pic.id, hdr.as_mut_ptr()) },
+                    "picture_hdr",
+                );
+                let hdr = unsafe { hdr.assume_init() };
+                if hdr.has_mastering_display != 0 || hdr.has_content_light_level != 0 {
+                    println!(
+                        "picture {} HDR: mdcv {} primaries (SEI order G,B,R) ({},{}) ({},{}) ({},{}) WP({},{}) \
+                         L({},{}) CLL {} ({},{})",
+                        pic.id,
+                        hdr.has_mastering_display,
+                        hdr.mastering_display.display_primaries_x[0],
+                        hdr.mastering_display.display_primaries_y[0],
+                        hdr.mastering_display.display_primaries_x[1],
+                        hdr.mastering_display.display_primaries_y[1],
+                        hdr.mastering_display.display_primaries_x[2],
+                        hdr.mastering_display.display_primaries_y[2],
+                        hdr.mastering_display.white_point_x,
+                        hdr.mastering_display.white_point_y,
+                        hdr.mastering_display.max_luminance,
+                        hdr.mastering_display.min_luminance,
+                        hdr.has_content_light_level,
+                        hdr.max_content_light_level,
+                        hdr.max_pic_average_light_level
+                    );
+                }
+            }
             let (w, h) = (pic.crop_width as usize, pic.crop_height as usize);
             target.fill(0xa5).unwrap();
             // NV_VIDEO_TARGET=yuv420p: planar target laid out like an Android YV12 buffer (Y, then
@@ -148,7 +196,7 @@ fn main() {
                 },
                 width: max_w,
                 height: max_h,
-                acquire_fence_fd: -1,
+                acquire_fence_fd: if measure_acquire { *acquire } else { -1 },
                 cr_dmabuf_fd: if planar { tfd } else { -1 },
                 cr_pitch: if planar { cpitch } else { 0 },
                 cr_offset: if planar { cr } else { 0 },
@@ -160,7 +208,18 @@ fn main() {
                 unsafe { nv_video_copy_out(s, pic.id, &t, &mut fence) },
                 "copy_out",
             );
-            wait_fd(fence);
+            copy_call.push(t0.elapsed());
+            if measure_acquire {
+                // The acquire fd is borrowed for the call, ours afterwards.
+                if *acquire >= 0 {
+                    // SAFETY: fd owned by us.
+                    unsafe { close(*acquire) };
+                }
+                wait_fd_keep(fence);
+                *acquire = fence;
+            } else {
+                wait_fd(fence);
+            }
             copy_times.push(t0.elapsed());
             target.read(0, &mut out).unwrap();
             let mut nv12 = Vec::with_capacity(w * h * 3 / 2 * bps);
@@ -169,7 +228,8 @@ fn main() {
             }
             for y in 0..h.div_ceil(2) {
                 if planar {
-                    let row = |base: u64| &out[base as usize + y * cpitch as usize..][..w.div_ceil(2)];
+                    let row =
+                        |base: u64| &out[base as usize + y * cpitch as usize..][..w.div_ceil(2)];
                     for (u, v) in row(cb).iter().zip(row(cr)) {
                         nv12.extend_from_slice(&[*u, *v]);
                     }
@@ -203,12 +263,17 @@ fn main() {
         }
     };
     let start = Instant::now();
+    let mut empty_units = 0usize;
     for (i, p) in packets.iter().enumerate() {
         let t0 = Instant::now();
-        check(
-            unsafe { nv_video_decode(s, p.as_ptr(), p.len(), i as u64, 0) },
-            "decode",
-        );
+        let shown = unsafe { nv_video_decode(s, p.as_ptr(), p.len(), i as u64, 0) };
+        check(shown, "decode");
+        if shown == 0 {
+            empty_units += 1;
+        }
+        if report {
+            println!("unit {i}: {shown} displayable pictures, {} bytes", p.len());
+        }
         dec_times.push(t0.elapsed());
         handle(
             s,
@@ -217,6 +282,8 @@ fn main() {
             &mut diff_total,
             &mut off,
             &mut copy_times,
+            &mut acquire,
+            &mut copy_call,
         );
     }
     check(
@@ -230,6 +297,8 @@ fn main() {
         &mut diff_total,
         &mut off,
         &mut copy_times,
+        &mut acquire,
+        &mut copy_call,
     );
     let wall = start.elapsed();
     if let Some(d) = dump.as_mut() {
@@ -246,8 +315,17 @@ fn main() {
     };
     let (dm, dmed, dmax) = stat(&mut dec_times);
     let (cm, cmed, cmax) = stat(&mut copy_times);
+    let (mm, mmed, _) = stat(&mut copy_call.clone());
     println!(
-        "{} packets, {frames} pictures, max {max_w}x{max_h}; nv_video_decode mean {dm:?} median {dmed:?} max {dmax:?}; copy_out+fence mean {cm:?} median {cmed:?} max {cmax:?}; wall {wall:?}",
+        "copy_out call mean {mm:?} median {mmed:?}{}",
+        if measure_acquire {
+            " (acquire fence = the previous picture's release fence, already signalled)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "{} packets ({empty_units} without a displayable picture), {frames} pictures, max {max_w}x{max_h}; nv_video_decode mean {dm:?} median {dmed:?} max {dmax:?}; copy_out+fence mean {cm:?} median {cmed:?} max {cmax:?}; wall {wall:?}",
         packets.len()
     );
     unsafe {

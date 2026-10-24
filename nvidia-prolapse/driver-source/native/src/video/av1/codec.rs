@@ -265,17 +265,29 @@ impl CodecDecoder for Av1Decoder {
             }
             Av1Out::Decode(j) => {
                 let h = &j.hdr;
-                if h.upscaled_width > self.max.0 || h.frame_height > self.max.1 {
-                    return Err(VideoError::Unsupported(format!(
-                        "AV1 frame {}x{} larger than the session max {}x{}",
-                        h.upscaled_width, h.frame_height, self.max.0, self.max.1
-                    )));
-                }
                 if h.use_superres && !h.frame_is_intra {
-                    // Intra superres frames decode bit-exact; inter frames with superres-scaled references
-                    // report NVDEC error_status 0xb/0xd (a stock capture with superres is the next step).
+                    // Stock libnvcuvid 615.78.08 decodes superres inter frames. This decoder now
+                    // reproduces its picture descriptor for them (current frame info carries the
+                    // coded width, the reference scale factors are upscaled-ref to coded-current,
+                    // and the motion-field size gate finds no candidate), verified byte-for-byte
+                    // against a runtime capture of the installed library; the engine still
+                    // reports error_status 0xd on the fifth picture of the capture stream, so a
+                    // field outside the compared region is still missing. Refuse rather than
+                    // submit a descriptor that is known incomplete.
                     return Err(VideoError::Unsupported(
                         "AV1 superres on inter frames".into(),
+                    ));
+                }
+                if h.upscaled_width > self.max.0 || h.frame_height > self.max.1 {
+                    // A shown key frame refreshes every reference slot (spec 5.9.2:
+                    // refresh_frame_flags = allFrames).
+                    let random_access = h.frame_type == super::header::KEY_FRAME && h.show_frame;
+                    return Err(crate::video::too_large(
+                        "AV1",
+                        h.upscaled_width,
+                        h.frame_height,
+                        self.max,
+                        random_access,
                     ));
                 }
                 if j.apply_grain && !self.grain_capable {

@@ -252,6 +252,17 @@ public:
                          .withSetter(DefaultColorAspectsSetter)
                          .build());
 
+        /* HDR static metadata (ST 2086 mastering display + CEA-861.3 light levels) read from
+         * the bitstream; reported per output like AOSP declares it (C2SoftVpxDec.cpp:125-147,
+         * same key and struct) and updated the way C2SoftGav1Dec.cpp:620-626 reports a size
+         * change (interface config + output configUpdate). */
+        helper->addStructDescriptors<C2MasteringDisplayColorVolumeStruct, C2ColorXyStruct>();
+        addParameter(DefineParam(mHdrStaticInfo, C2_PARAMKEY_HDR_STATIC_INFO)
+                         .withDefault(new C2StreamHdrStaticInfo::output(0u))
+                         .withFields({C2F(mHdrStaticInfo, mastering.red.x).any()})
+                         .withSetter(HdrStaticInfoSetter)
+                         .build());
+
         /* IMPLEMENTATION_DEFINED is listed so a Surface configuration is visible; the
          * component picks NV12 or P010 from the stream's bit depth either way. */
         std::vector<uint32_t> pixelFormats = {HAL_PIXEL_FORMAT_YCBCR_420_888};
@@ -319,6 +330,12 @@ public:
         return C2R::Ok();
     }
 
+    static C2R HdrStaticInfoSetter(bool, C2P<C2StreamHdrStaticInfo::output> &me)
+    {
+        (void)me; /* values come from the bitstream */
+        return C2R::Ok();
+    }
+
     uint32_t bitDepthHint() const
     {
         switch (mProfileLevel->profile) {
@@ -342,6 +359,7 @@ private:
     std::shared_ptr<C2StreamProfileLevelInfo::input> mProfileLevel;
     std::shared_ptr<C2StreamColorInfo::output> mColorInfo;
     std::shared_ptr<C2StreamColorAspectsTuning::output> mDefaultColorAspects;
+    std::shared_ptr<C2StreamHdrStaticInfo::output> mHdrStaticInfo;
     std::shared_ptr<C2StreamPixelFormatInfo::output> mPixelFormat;
     std::shared_ptr<C2ComponentAttributesSetting> mAttrib;
 };
@@ -663,6 +681,30 @@ void Component::deliver(std::vector<Output> &outs, std::list<std::unique_ptr<C2W
                     map_primaries(o.picture.color_primaries), map_transfer(o.picture.transfer),
                     map_matrix(o.picture.matrix));
                 buf->setInfo(aspects);
+                const HdrStatic h = hdr_static(mEntry.codec, o.hdr);
+                if (h.present) {
+                    auto info = std::make_shared<C2StreamHdrStaticInfo::output>(0u);
+                    info->mastering.red = {h.red[0], h.red[1]};
+                    info->mastering.green = {h.green[0], h.green[1]};
+                    info->mastering.blue = {h.blue[0], h.blue[1]};
+                    info->mastering.white = {h.white[0], h.white[1]};
+                    info->mastering.maxLuminance = h.max_luminance;
+                    info->mastering.minLuminance = h.min_luminance;
+                    info->maxCll = h.max_cll;
+                    info->maxFall = h.max_fall;
+                    /* the Surface path reads it per buffer (CCodecBufferChannel.cpp:840) */
+                    buf->setInfo(info);
+                    if (!mHdr || memcmp(&mHdr->mastering, &info->mastering, sizeof(info->mastering)) ||
+                        mHdr->maxCll != info->maxCll || mHdr->maxFall != info->maxFall) {
+                        std::vector<std::unique_ptr<C2SettingResult>> failures;
+                        if (mIntf->mImpl->config({info.get()}, C2_MAY_BLOCK, &failures) == C2_OK) {
+                            wl->output.configUpdate.push_back(C2Param::Copy(*info));
+                            mHdr = std::make_unique<C2StreamHdrStaticInfo::output>(*info);
+                        } else {
+                            ALOGE("%s: HDR static info config failed", mEntry.name);
+                        }
+                    }
+                }
                 wl->output.buffers.push_back(buf);
                 if (o.size_changed)
                     wl->output.configUpdate.push_back(
@@ -801,7 +843,7 @@ void Component::loop()
 
 /* ------------------------------------------------------------------ store */
 
-std::shared_ptr<Store> Store::Create(std::string *error)
+std::shared_ptr<Store> Store::Create(std::string *error, std::string *no_nvdec_gpu)
 {
     std::shared_ptr<Store> s(new Store());
     NvVideoDeviceInfo info{};
@@ -813,6 +855,10 @@ std::shared_ptr<Store> Store::Create(std::string *error)
     if (info.abi_version != NV_VIDEO_ABI_VERSION) {
         *error = "nv_video backend ABI " + std::to_string(info.abi_version) + ", this service was built for " +
                  std::to_string(NV_VIDEO_ABI_VERSION);
+        return nullptr;
+    }
+    if (info.nvdec_class == 0) {
+        *no_nvdec_gpu = info.name;
         return nullptr;
     }
     s->mEntries = supported_codecs(s->mDevice, error);

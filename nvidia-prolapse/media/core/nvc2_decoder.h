@@ -18,6 +18,12 @@
  *  - Errors are never swallowed: DEVICE_LOST and UNSUPPORTED are terminal for the session
  *              and carry nv_video_last_error(); BITSTREAM finishes that unit empty with the
  *              corrupt flag (the library stays usable after the next keyframe).
+ *  - Size changes: NV_VIDEO_E_RESIZE (a keyframe larger than the session, adaptive streaming)
+ *              drains the old session's pictures, re-creates the session at the new size
+ *              with the parameter sets seen so far and decodes the unit again (AOSP
+ *              C2SoftHevcDec.cpp:881-890 on IVD_RES_CHANGED: drainInternal, resetDecoder,
+ *              re-decode). If the drain waits for a buffer, queue() returns Again and the
+ *              front re-calls it with the same unit.
  */
 #ifndef NVC2_DECODER_H
 #define NVC2_DECODER_H
@@ -59,6 +65,7 @@ struct Output {
     OutputBuffer buffer{};     /* valid if !empty */
     int release_fence = -1;    /* sync_file fd owned by the receiver, -1 = already complete */
     NvVideoPicture picture{};  /* valid if !empty */
+    NvVideoHdrMetadata hdr{};  /* valid if !empty: HDR static metadata the stream declared */
     bool size_changed = false; /* first picture with a new display size */
 };
 
@@ -87,14 +94,23 @@ public:
     bool reorders() const { return codec_ == NV_VIDEO_CODEC_H264 || codec_ == NV_VIDEO_CODEC_HEVC; }
 
 private:
-    Decoder(NvVideoSession *s, uint32_t codec) : session_(s), codec_(codec) {}
+    Decoder(NvVideoDevice *dev, NvVideoSession *s, const Config &cfg)
+        : dev_(dev), session_(s), codec_(cfg.codec), cfg_(cfg) {}
+    static NvVideoSession *open_session(NvVideoDevice *dev, const Config &cfg, std::string *error);
     Status fail(const char *what, int rc);
+    Status finish_resize(OutputPool *pool, std::vector<Output> *out);
     Status emit_picture(const NvVideoPicture &pic, OutputPool *pool, std::vector<Output> *out);
     void finish_older_than(uint64_t index, std::vector<Output> *out);
     void finish_all(std::vector<Output> *out);
 
+    NvVideoDevice *dev_;
     NvVideoSession *session_;
     uint32_t codec_;
+    Config cfg_;                               /* the current session's config (max size grows) */
+    std::vector<std::vector<uint8_t>> csd_;    /* in-band parameter-set units, replayed after a resize */
+    bool last_was_csd_ = false;
+    bool resizing_ = false;                    /* old session drained up to here, not yet replaced */
+    uint32_t resize_w_ = 0, resize_h_ = 0;
     std::deque<uint64_t> pending_;   /* decode order of units without a picture yet */
     bool have_held_ = false;          /* a picture fetched from the library but not yet copied */
     NvVideoPicture held_{};
@@ -109,6 +125,18 @@ private:
 };
 
 uint32_t output_format_for_depth(uint32_t bit_depth);
+
+/* HDR static metadata in Codec2's units (C2HdrStaticMetadataStruct: CIE 1931 xy
+ * chromaticities, luminances and light levels in cd/m2). A group that the stream did not
+ * declare stays 0, which Codec2 reads as "not specified". */
+struct HdrStatic {
+    bool present = false;
+    float red[2]{}, green[2]{}, blue[2]{}, white[2]{};
+    float max_luminance = 0, min_luminance = 0;
+    float max_cll = 0, max_fall = 0;
+};
+/* Converts nv_video's coded values (per-codec units and primary order, nv_video.h) */
+HdrStatic hdr_static(uint32_t codec, const NvVideoHdrMetadata &m);
 
 } // namespace nvc2
 

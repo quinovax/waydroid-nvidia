@@ -1,5 +1,5 @@
-//! nv_video (video/nv_video.h v1): NVDEC decode sessions on the native RM
-//! backend. No NVIDIA userspace is loaded.
+//! nv_video (video/nv_video.h v1 entry points, v2 additions): NVDEC decode
+//! sessions on the native RM backend. No NVIDIA userspace is loaded.
 //!
 //! Layering (see video/README.md for the codec plug-in contract):
 //! - `channel`: one NVDEC GPFIFO channel + its completion timeline.
@@ -16,6 +16,7 @@ pub mod bits;
 pub mod channel;
 pub mod ffi;
 pub mod h264;
+pub mod hdr;
 pub mod hevc;
 #[cfg(test)]
 pub mod pretend;
@@ -25,7 +26,12 @@ pub mod vp9;
 use crate::rm::{self, Client};
 use std::rc::Rc;
 
-pub const ABI_VERSION: u32 = 1;
+/// ABI version reported in [`NvVideoDeviceInfo`]. v2 adds `nv_video_picture_hdr`
+/// (HDR static metadata), the "displayable pictures this unit produced" return of
+/// `nv_video_decode`, and `NV_VIDEO_E_RESIZE` + `nv_video_required_size` (a random
+/// access point that needs a session of another size); every v1 entry point keeps its
+/// v1 signature and layout.
+pub const ABI_VERSION: u32 = 2;
 pub const CODEC_H264: u32 = 1;
 pub const CODEC_HEVC: u32 = 2;
 pub const CODEC_VP9: u32 = 3;
@@ -44,6 +50,14 @@ pub enum VideoError {
     NoMemory(String),
     DeviceLost(String),
     Again(String),
+    /// A random access point (key frame / IDR) that this session cannot decode at its
+    /// size: the caller drains the session, creates one of at least `width` x `height`
+    /// and submits the same unit to it (NV_VIDEO_E_RESIZE).
+    Resize {
+        width: u32,
+        height: u32,
+        reason: String,
+    },
 }
 
 impl VideoError {
@@ -55,6 +69,7 @@ impl VideoError {
             Self::NoMemory(_) => -4,
             Self::DeviceLost(_) => -5,
             Self::Again(_) => -6,
+            Self::Resize { .. } => -7,
         }
     }
     pub fn message(&self) -> &str {
@@ -64,7 +79,8 @@ impl VideoError {
             | Self::Bitstream(m)
             | Self::NoMemory(m)
             | Self::DeviceLost(m)
-            | Self::Again(m) => m,
+            | Self::Again(m)
+            | Self::Resize { reason: m, .. } => m,
         }
     }
 }
@@ -84,6 +100,38 @@ impl From<rm::Error> for VideoError {
 }
 
 pub type VResult<T> = std::result::Result<T, VideoError>;
+
+/// A picture larger than the session's maximum. At a random access point that starts a
+/// new reference chain (H.264 IDR, HEVC IRAP, VP9 key frame, AV1 shown key frame) a
+/// session of the new size decodes the stream from there on, so the caller re-creates
+/// the session ([`VideoError::Resize`]) the way FFmpeg re-creates its hardware decoder
+/// when the coded size changes (libavcodec/decode.c:1227 `ff_hwaccel_uninit` in
+/// `ff_get_format`, reached from h264_slice.c:920, hevc/hevcdec.c:725, vp9.c:254,
+/// av1dec.c:664). Anywhere else the references live in this session: refused.
+pub(crate) fn too_large(
+    codec: &str,
+    width: u32,
+    height: u32,
+    max: (u32, u32),
+    random_access: bool,
+) -> VideoError {
+    let what = format!(
+        "{codec} picture {width}x{height} larger than the session max {}x{}",
+        max.0, max.1
+    );
+    if random_access {
+        VideoError::Resize {
+            width,
+            height,
+            reason: format!("{what}: re-create the session at the new size"),
+        }
+    } else {
+        VideoError::Unsupported(format!(
+            "{what} on a picture that is not a random access point (references stay in this \
+             session)"
+        ))
+    }
+}
 
 pub(crate) fn unsupported<T>(m: impl Into<String>) -> VResult<T> {
     Err(VideoError::Unsupported(m.into()))
@@ -155,7 +203,8 @@ impl NvdecGen {
     pub fn ada_plus(self) -> bool {
         self.bit & 0x1ff0_0000 != 0
     }
-    /// Bit 0x400000: D1B0 only (stock writes a setup word from ELF 0x3bc60, UNTRACED, for H.264/HEVC/VP9).
+    /// Bit 0x400000: D1B0 only (stock writes an extra setup word from ELF 0x3bc60 for
+    /// H.264/HEVC/VP9 whose value this library does not reproduce, so those codecs are refused there).
     pub fn d1b0(self) -> bool {
         self.bit & 0x0040_0000 != 0
     }
@@ -297,9 +346,9 @@ pub fn blackwell_gob_kinds(bytes_per_sample: u32) -> [u32; 2] {
 /// GOB kinds of the engine output. Stock writes the plane kinds into the picture setup (VP9 +0xeb, HEVC
 /// +0x71, AV1 stat word bits 15..18, as `luma | chroma << 2`: 8-bit 4:2:0 = 9, 10-bit = 2) only on classes
 /// with [`NvdecGen::blackwell_b`] (stock 615 traces on GB202 and Ada); every other class gets 0 there, which we take as the standard
-/// (pre-Blackwell, GOB kind 0) block-linear layout. Measured only on CFB0 (copy_out bit-exact); the
-/// layout older engines write for tileformat 1 is UNTRACED in stock (it untiles with CUDA), see
-/// [`output_layout_verified`].
+/// (pre-Blackwell, GOB kind 0) block-linear layout. Measured on CFB0 locally and on C4B0/C7B0/C9B0
+/// in the cross-generation run (copy_out bit-exact); the layout older engines write for
+/// tileformat 1 is not established (stock untiles with CUDA), see [`output_layout_verified`].
 pub fn engine_gob_kinds(decoder_class: u32, bytes_per_sample: u32) -> [u32; 2] {
     if NvdecGen::of(decoder_class).blackwell_b() {
         blackwell_gob_kinds(bytes_per_sample)
@@ -308,10 +357,13 @@ pub fn engine_gob_kinds(decoder_class: u32, bytes_per_sample: u32) -> [u32; 2] {
     }
 }
 
-/// Whether the engine output layout copy_out assumes for this class was measured (copy of a decoded
-/// surface bit-exact against a software decoder). Only GB202 (CFB0) so far.
+/// Whether the engine output layout copy_out assumes for this class was verified bit-exact
+/// (copy of a decoded surface against a software decoder): CFB0 locally (2026-10-14) and
+/// C9B0/C7B0/C4B0 in the cross-generation run 20261015-nvdec-xgen3 (31/31 bit-exact on each).
+/// On these classes the pre-Blackwell standard block-linear output (GOB kind 0) and the
+/// Blackwell GOB kinds 1/2 are measured, not assumed.
 pub fn output_layout_verified(decoder_class: u32) -> bool {
-    decoder_class == 0xcfb0
+    matches!(decoder_class, 0xcfb0 | 0xc9b0 | 0xc7b0 | 0xc4b0)
 }
 
 /// `luma | chroma << 2` of [`engine_gob_kinds`] as stock writes it into the picture setup of a
@@ -781,6 +833,19 @@ mod tests {
             "class {:#x} capsTbl {:02x?} -> {:?}",
             d.info.nvdec_class, d.engine0_caps_tbl, d.engine0
         );
+    }
+
+    /// The copy_out layout warning fires only on classes whose engine output was never
+    /// measured: the four classes of the decoding runs (local CFB0, cross-generation
+    /// C9B0/C7B0/C4B0) do not warn, every other class does.
+    #[test]
+    fn output_layout_warning_matches_measured_classes() {
+        for c in [0xcfb0, 0xc9b0, 0xc7b0, 0xc4b0] {
+            assert!(output_layout_verified(c), "{c:#x}");
+        }
+        for c in [0xd2b0, 0xceb0, 0xd1b0, 0xcdb0, 0xb8b0, 0xc6b0, 0xc3b0] {
+            assert!(!output_layout_verified(c), "{c:#x}");
+        }
     }
 
     #[test]

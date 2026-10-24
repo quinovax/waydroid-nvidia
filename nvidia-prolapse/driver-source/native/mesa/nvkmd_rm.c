@@ -766,14 +766,18 @@ rm_mem_alloc_kind(struct nvkmd_dev* base,
     * through image VAs with a compressible kind (rm_va_bind); the backend
     * raises the alignment to the 64 KiB big page. Turing+ only:
     * the generic compressible kind (0x8) is what those VAs carry. */
-   if (placement == NV_RM_PLACEMENT_VRAM &&
+   if (kind == 0 && placement == NV_RM_PLACEMENT_VRAM &&
        !(flags & (NVKMD_MEM_CAN_MAP | NVKMD_MEM_SHARED)) &&
        nvkmd_rm_pdev(base->pdev)->info.generic_kind == 0x06 &&
        !(size & 0xffff))
       placement = NV_RM_PLACEMENT_VRAM_COMPRESSIBLE;
+   /* Tiled (DRM modifier) memory records its block-linear kind on the
+    * physical allocation, as NVK does on nouveau (nvk_device_memory.c
+    * nvkmd_dev_alloc_tiled_mem -> nouveau_bo.c tile_flags = pte_kind << 8):
+    * a dma-buf importer maps the memory with that kind, not with ours. */
    VkResult result =
      rm_result(log,
-               nv_rm_alloc(dev->rm, size, alignment, placement, 0, 0, &mem->allocation),
+               nv_rm_alloc(dev->rm, size, alignment, placement, kind, 0, &mem->allocation),
                "allocate memory");
    if (result != VK_SUCCESS) {
       free(mem);
@@ -827,14 +831,26 @@ rm_mem_tiled(struct nvkmd_dev* dev,
              enum nvkmd_mem_flags flags,
              struct nvkmd_mem** out)
 {
-   /* NIL's uncompressed 2D modifier carries explicit geometry. Physical
-    * memory uses the architecture's generic kind and each VA its own kind.
-    * No compression or implicit legacy GL tiling metadata is inferred. */
+   /* NIL's uncompressed 2D modifier carries explicit geometry. The physical
+    * memory carries the image's (generic, uncompressed) kind with FORMAT
+    * BLOCK_LINEAR, and the allocation's VA the same kind. The block height
+    * is in the modifier; RM has no per-memory tile mode, so none is stored. */
    if (kind == 0 && tile == 0)
       return rm_mem_alloc(dev, log, size, alignment, flags, out);
    const struct NvRmInfo* info = &nvkmd_rm_pdev(dev->pdev)->info;
    if (kind != info->generic_kind || (tile & ~0x70u) || (tile >> 4) > 5)
       return unsupported(log, "modifier allocation outside uncompressed 2D generic memory");
+   /* Fermi..Volta (generic kind 0xfe): BAR1 does not return a block-linear
+    * image's bytes in the modifier's layout, so memoryTypeBits of such images
+    * carries no host-visible VRAM type (nvk-prevolta-modifier-memory-types
+    * patch, nvk_get_image_memory_requirements). Reaching this with a
+    * CPU-mappable VRAM request means that contract was broken upstream. */
+   if (info->generic_kind == 0xfe && (flags & NVKMD_MEM_CAN_MAP) && !(flags & NVKMD_MEM_GART)) {
+      assert(!"CPU-mappable block-linear VRAM before Turing");
+      return vk_errorf(log, VK_ERROR_UNKNOWN,
+                       "internal contract violated: CPU-mappable block-linear VRAM before Turing "
+                       "(image memoryTypeBits must exclude host-visible VRAM types)");
+   }
    return rm_mem_alloc_kind(dev, log, size, alignment, flags, kind, out);
 }
 static VkResult

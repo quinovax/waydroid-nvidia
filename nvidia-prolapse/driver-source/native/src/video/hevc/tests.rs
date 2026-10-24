@@ -506,3 +506,211 @@ fn libx265_open_gop_random_access_and_pyramid() {
         .iter()
         .all(|j| j.bitstream.windows(3).filter(|w| *w == [0, 0, 1]).count() >= 3));
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Refusal tests: features that stay a loud E_UNSUPPORTED until their stock contract is established.
+// ---------------------------------------------------------------------------------------------------------------
+
+/// SPS/PPS of the checked-in 160x144 stream, for the descriptor-builder refusal tests.
+fn testdata_parameter_sets() -> (Sps, Pps) {
+    const HEVC: &[u8] = include_bytes!("../testdata/hevc_160x144.hevc");
+    let mut sps = None;
+    for n in split_annexb(HEVC) {
+        match (n.nal[0] >> 1) & 0x3f {
+            33 => sps = Some(ps::parse_sps(&crate::video::bits::unescape(n.nal)).unwrap()),
+            34 => {
+                let p = ps::parse_pps(&crate::video::bits::unescape(n.nal)).unwrap();
+                return (sps.unwrap(), p);
+            }
+            _ => {}
+        }
+    }
+    panic!("testdata has no SPS/PPS pair");
+}
+
+fn idle_pic_state() -> PicState {
+    PicState {
+        stream_len: 16,
+        idr: true,
+        irap: true,
+        curr_slot: 0,
+        num_poc_total_curr: 0,
+        list0: [0; 16],
+        list1: [0; 16],
+        diff: [0; 16],
+        sw_hdr_skip_length: 0,
+        num_bits_st_rps: 0,
+        num_delta_pocs_ref: 0,
+    }
+}
+
+fn session_inputs() -> SessionInputs {
+    SessionInputs {
+        framestride: [160, 320],
+        filter: FilterOffsets::default(),
+        gptimer_max: u32::MAX,
+        general_bits: 1,
+        tail_11a: 0,
+        blackwell_b: true,
+    }
+}
+
+fn expect_build_unsupported(sps: &Sps, pps: &Pps, feature: &str) {
+    match desc::build(
+        sps,
+        pps,
+        &idle_pic_state(),
+        &session_inputs(),
+        StockOpaque::observed(sps.bit_depth_luma),
+    ) {
+        Err(VideoError::Unsupported(m)) => assert!(
+            m.contains(feature),
+            "refusal reason {m:?} does not name {feature:?}"
+        ),
+        Err(e) => panic!("expected Unsupported({feature:?}), got {e:?}"),
+        Ok(_) => panic!("expected Unsupported({feature:?}), the descriptor was built"),
+    }
+}
+
+#[test]
+fn two_dimensional_tile_grids_are_raster_ordered() {
+    // Stock builds one {u16 width, u16 height} entry per tile in raster-scan order (rows outer,
+    // columns inner) at setup+0x600: uniform path ELF 0x3ec2b..0x3ecfc, explicit path
+    // 0x3eef2..0x3f01c of libnvcuvid 615.78.08 (measured with read watchpoints on
+    // column_width_minus1 / row_height_minus1).
+    let (sps, mut pps) = testdata_parameter_sets();
+    let (w, h) = (sps.width_ctbs(), sps.height_ctbs());
+    assert_eq!((w, h), (3, 3), "testdata grid");
+    // Explicit 2x2: columns [2, 1], rows [1, 2].
+    pps.tiles = Some(Tiles {
+        uniform: false,
+        col_minus1: vec![1],
+        row_minus1: vec![0],
+        cols: 2,
+        rows: 2,
+        loop_filter_across_tiles: true,
+    });
+    let d = desc::build(
+        &sps,
+        &pps,
+        &idle_pic_state(),
+        &session_inputs(),
+        StockOpaque::observed(sps.bit_depth_luma),
+    )
+    .unwrap();
+    let entry = |i: usize| {
+        (
+            u16::from_le_bytes([d[desc::TILE_SIZES_OFFSET + 4 * i], d[desc::TILE_SIZES_OFFSET + 4 * i + 1]]),
+            u16::from_le_bytes([d[desc::TILE_SIZES_OFFSET + 4 * i + 2], d[desc::TILE_SIZES_OFFSET + 4 * i + 3]]),
+        )
+    };
+    assert_eq!(
+        [entry(0), entry(1), entry(2), entry(3)],
+        [(2, 1), (1, 1), (2, 2), (1, 2)],
+        "explicit 2x2 entries are raster ordered"
+    );
+    // Uniform 2x2 over 3x3 CTBs: columns [1, 2], rows [1, 2].
+    pps.tiles = Some(Tiles {
+        uniform: true,
+        col_minus1: vec![],
+        row_minus1: vec![],
+        cols: 2,
+        rows: 2,
+        loop_filter_across_tiles: true,
+    });
+    let d = desc::build(
+        &sps,
+        &pps,
+        &idle_pic_state(),
+        &session_inputs(),
+        StockOpaque::observed(sps.bit_depth_luma),
+    )
+    .unwrap();
+    let entry = |i: usize| {
+        (
+            u16::from_le_bytes([d[desc::TILE_SIZES_OFFSET + 4 * i], d[desc::TILE_SIZES_OFFSET + 4 * i + 1]]),
+            u16::from_le_bytes([d[desc::TILE_SIZES_OFFSET + 4 * i + 2], d[desc::TILE_SIZES_OFFSET + 4 * i + 3]]),
+        )
+    };
+    assert_eq!(
+        [entry(0), entry(1), entry(2), entry(3)],
+        [(1, 1), (2, 1), (1, 2), (2, 2)],
+        "uniform 2x2 entries are raster ordered"
+    );
+}
+
+#[test]
+fn pcm_is_refused() {
+    // pcm_enabled_flag alone is not enough: the PCM sample depths and block sizes are not
+    // verified in the stock descriptor.
+    let (mut sps, pps) = testdata_parameter_sets();
+    sps.pcm = true;
+    expect_build_unsupported(&sps, &pps, "HEVC PCM");
+}
+
+#[test]
+fn slice_long_term_references_are_refused() {
+    use super::slice::parse_slice_header;
+    let (mut sps, pps) = testdata_parameter_sets();
+    sps.long_term_ref_pics_present = true;
+    sps.num_long_term_ref_pics_sps = 1;
+    // P slice header: first slice segment, our PPS, one inline (empty) short-term RPS, then a
+    // single num_long_term_sps entry (the long-term syntax itself is what is unimplemented).
+    let mut w = W(Vec::new());
+    w.u(1, 1); // first_slice_segment_in_pic_flag
+    w.ue(pps.id);
+    w.u(pps.num_extra_slice_header_bits, 0);
+    w.ue(1); // slice_type = P (non-IDR, so no no_output_of_prior_pics_flag)
+    if pps.output_flag_present {
+        w.u(1, 1);
+    }
+    if sps.separate_colour_plane {
+        w.u(2, 0);
+    }
+    w.u(sps.log2_max_poc_lsb, 0); // slice_pic_order_cnt_lsb
+    w.u(1, 0); // short_term_ref_pic_set_sps_flag = 0 (inline set)
+    w.ue(0); // num_negative_pics
+    w.ue(0); // num_positive_pics
+    w.ue(1); // num_long_term_sps
+    w.ue(0); // num_long_term_pics
+    let mut rbsp = vec![0u8, 0u8]; // the parser skips a 2-byte NAL header
+    rbsp.extend_from_slice(&w.bytes());
+    let r = parse_slice_header(
+        &rbsp,
+        1,
+        |i| (i == pps.id).then_some(&pps),
+        |i| (i == sps.id).then_some(&sps),
+    );
+    match r {
+        Err(VideoError::Unsupported(m)) => assert!(
+            m.contains("long-term reference"),
+            "refusal reason {m:?} does not name the feature"
+        ),
+        Err(e) => panic!("expected Unsupported(long-term), got {e:?}"),
+        Ok(_) => panic!("long-term slice references were accepted"),
+    }
+}
+
+#[test]
+fn range_extension_profiles_are_refused() {
+    // profile_idc 4 = Format Range Extensions (SCC is 9); parse_sps refuses before the coding
+    // tools, so only the profile_tier_level is needed.
+    let mut w = W(Vec::new());
+    w.u(4, 0); // sps_video_parameter_set_id
+    w.u(3, 0); // sps_max_sub_layers_minus1
+    w.u(1, 1); // sps_temporal_id_nesting_flag
+    w.u(2 + 1, 0); // general_profile_space, general_tier_flag
+    w.u(5, 4); // general_profile_idc = 4
+    w.u(32, 0); // general_profile_compatibility_flags
+    w.u(32, 0).u(16, 0); // source flags, 43 constraint bits, inbld
+    w.u(8, 0); // general_level_idc
+    let mut nal = vec![0u8; 2]; // NAL header (skipped by the parser)
+    nal.extend_from_slice(&w.bytes());
+    match ps::parse_sps(&nal) {
+        Err(VideoError::Unsupported(m)) => {
+            assert!(m.contains("profile_idc 4"), "reason {m:?} does not name the profile")
+        }
+        Err(e) => panic!("expected Unsupported(profile_idc 4), got {e:?}"),
+        Ok(_) => panic!("range-extension profile accepted"),
+    }
+}

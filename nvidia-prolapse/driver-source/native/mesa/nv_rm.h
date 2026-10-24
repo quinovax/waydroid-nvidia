@@ -119,6 +119,9 @@ nv_rm_open(uint32_t domain,
            struct NvRmInfo* info);
 void
 nv_rm_close(struct NvRmDevice* device);
+/* pte_kind 0: plain memory (RM picks the layout). Non-zero: uncompressed
+ * block-linear memory of that kind (the device's generic kind only, VRAM or
+ * GART); RM must grant exactly that kind. tile_mode must be 0. */
 int32_t
 nv_rm_alloc(struct NvRmDevice* device,
             uint64_t size,

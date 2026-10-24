@@ -2,21 +2,24 @@
 # waydroid-nvidia GPU import probe — run on any box with an NVIDIA GPU.
 # Works in docker containers too (screens the host via /proc and /sys first).
 # Exit: 0 = GPU fine for the stack, 1 = import quirks found (the bug!),
-#       2 = broken environment, 3 = host untestable (modeset off / closed KM).
+#       2 = broken environment, 3 = host untestable (modeset off).
 cd "$(dirname "$0")"
 
 echo "== kernel module:"
 head -1 /proc/driver/nvidia/version 2>/dev/null || echo "  (no /proc/driver/nvidia — driver not loaded?)"
+# Open and closed modules: the probe below tests dma_buf export itself
+# (closed 580 exports it with nvidia-drm.modeset=1, issue #30).
 
 echo "== nvidia-drm modeset:"
-ms=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo "unreadable (root-only)")
+ms=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo unreadable)
 echo "   $ms"
-if [ "$ms" = "N" ] || [ "$ms" = "0" ]; then
+if [ "$ms" = "N" ]; then
     echo "== UNTESTABLE: nvidia-drm.modeset=0 on the host."
-    echo "   dma_buf paths are disabled; this host can't run the test."
+    echo "   dma_buf paths are disabled; this host can't run the test. Pick another."
     exit 3
 fi
-# unreadable = root-only sysfs permission; not an error, just can't verify here
+# unreadable (root-only on newer drivers) or missing: fall through — the
+# probe itself detects the condition via the absent dma_buf extension
 
 echo "== driver:"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || true

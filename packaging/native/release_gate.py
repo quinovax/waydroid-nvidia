@@ -43,6 +43,9 @@ ABIS = {'android': ('lib64', 64, 'x86_64'), 'android32': ('lib', 32, 'x86')}
 RUNTIME_ROOTS = ('libcutils.so', 'libhardware.so', 'liblog.so', 'libsync.so', 'libnativewindow.so')
 BIONIC = ('libc.so', 'libm.so', 'libdl.so', 'libdl_android.so')
 CASE_TIMEOUT = 600
+# nvc2-xmlgen's exit status for a GPU without an NVDEC class the Codec2 decoder drives (before Turing): a
+# capability gap, not a failure (nvidia-prolapse/media/core/nvc2_caps.h kExitNoNvdec)
+XMLGEN_NO_NVDEC = 3
 REMEDY_BUNDLE = 'reinstall the package (Arch: pacman -S waydroid-nvidia-bin; other distros: packaging/install.sh)'
 
 
@@ -102,12 +105,89 @@ def elf_bits(path):
     return {1: 32, 2: 64}.get(head[4])
 
 
-def needed(path):
-    # LC_ALL=C: readelf localises its field names ('shared library' under a zh_CN
-    # locale), and the regex only matches the untranslated English form.
-    env = {**os.environ, 'LC_ALL': 'C'}
-    dynamic = subprocess.check_output(['readelf', '-dW', str(path)], text=True, env=env)
-    return re.findall(r'\(NEEDED\)\s+Shared library: \[(.+?)\]', dynamic)
+class ElfError(RuntimeError):
+    pass
+
+
+def elf_dynamic(path, remedy=REMEDY_BUNDLE):
+    """{'needed': [names], 'runpath': [entries]} of an ELF file's dynamic section, read through its program
+    headers (PT_LOAD maps DT_STRTAB, as the loader does). Raises ElfError for a file that is not a complete
+    dynamically linked ELF object. Parsed here rather than from readelf's text, which binutils localises."""
+    import struct
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise ElfError(f'cannot read {path}: {error.strerror}')
+
+    def bad(what):
+        return ElfError(f'{path}: {what}; the file is damaged or not an ELF object ({remedy})')
+    if len(data) < 52 or data[:4] != b'\x7fELF' or data[4] not in (1, 2) or data[5] not in (1, 2):
+        raise bad('no ELF header')
+    is64, end = data[4] == 2, '<' if data[5] == 1 else '>'
+
+    def unpack(fmt, offset):
+        size = struct.calcsize(end + fmt)
+        if offset < 0 or offset + size > len(data):
+            raise bad(f'truncated at offset {offset:#x}')
+        return struct.unpack_from(end + fmt, data, offset)
+    if is64:
+        phoff, = unpack('Q', 0x20)
+        phentsize, phnum = unpack('HH', 0x36)
+        phdr, dyn = 'IIQQQQQQ', 'qQ'
+    else:
+        phoff, = unpack('I', 0x1c)
+        phentsize, phnum = unpack('HH', 0x2a)
+        phdr, dyn = 'IIIIIIII', 'iI'
+    loads, dynamic = [], None
+    for i in range(phnum):
+        f = unpack(phdr, phoff + i * phentsize)
+        # (type, offset, vaddr, filesz): Elf64_Phdr has p_flags second, Elf32_Phdr seventh
+        ptype, offset, vaddr, filesz = (f[0], f[2], f[3], f[5]) if is64 else (f[0], f[1], f[2], f[4])
+        if ptype == 1:                                  # PT_LOAD
+            loads.append((vaddr, filesz, offset))
+        elif ptype == 2:                                # PT_DYNAMIC
+            dynamic = (offset, filesz)
+    if dynamic is None:
+        raise bad('no PT_DYNAMIC program header (not a dynamically linked object)')
+    tags = []
+    step = struct.calcsize(end + dyn)
+    for offset in range(dynamic[0], dynamic[0] + dynamic[1] - step + 1, step):
+        tag, value = unpack(dyn, offset)
+        if tag == 0:                                    # DT_NULL
+            break
+        tags.append((tag, value))
+    else:
+        raise bad('dynamic section without DT_NULL')
+    strtab = [v for t, v in tags if t == 5]             # DT_STRTAB (a virtual address)
+    strsz = [v for t, v in tags if t == 10]             # DT_STRSZ
+    if len(strtab) != 1 or len(strsz) != 1:
+        raise bad('dynamic section without exactly one DT_STRTAB and DT_STRSZ')
+    base = next((off + strtab[0] - va for va, size, off in loads if va <= strtab[0] < va + size), None)
+    if base is None or base + strsz[0] > len(data):
+        raise bad(f'DT_STRTAB {strtab[0]:#x} is outside the file\'s PT_LOAD segments')
+
+    def string(index):
+        if index >= strsz[0]:
+            raise bad(f'string offset {index:#x} beyond DT_STRSZ')
+        stop = data.find(b'\0', base + index, base + strsz[0])
+        if stop < 0:
+            raise bad(f'unterminated string at {index:#x}')
+        return data[base + index:stop].decode('utf-8', errors='strict')
+    runpath = [string(v) for t, v in tags if t in (15, 29)]   # DT_RPATH, DT_RUNPATH
+    return {'needed': [string(v) for t, v in tags if t == 1],  # DT_NEEDED
+            'runpath': [e for entry in runpath for e in entry.split(':')]}
+
+
+def needed(path, leaf_ok=False, remedy=REMEDY_BUNDLE):
+    """DT_NEEDED names of an ELF object. Every program and library the gate builds or ships links at least
+    bionic's libc.so, so an empty list is an error unless `leaf_ok` (libraries of the user's image, e.g.
+    ld-android.so, may need nothing)."""
+    names = elf_dynamic(path, remedy)['needed']
+    if not names and not leaf_ok:
+        raise ElfError(f'{path} has a dynamic section but no DT_NEEDED entry; every gate program and payload '
+                       f'library links bionic\'s libc.so, so the file is damaged ({remedy})')
+    return names
 
 
 def _dump(image, source, dest):
@@ -144,7 +224,8 @@ def extract_runtime(system_img, dest, sub, roots, provided):
         for source in candidates:
             if _dump(system_img, source, dest / name) and elf_bits(dest / name) == bits:
                 origin[name] = source
-                pending += needed(dest / name)
+                pending += needed(dest / name, leaf_ok=True, remedy=f'{source} in {system_img}; re-download the '
+                                  'images: sudo waydroid init -f')
                 break
         else:
             (dest / name).unlink(missing_ok=True)
@@ -199,17 +280,8 @@ class Gate:
         env = {'LD_LIBRARY_PATH': ':'.join(map(str, self.libpath(target))), 'DISPLAY': '', 'WAYLAND_DISPLAY': ''}
         command = [str(linker), *map(str, argv)]
         if bits == 32:
-            # i686 bionic's pthread TID field cannot hold large host PIDs: run in a fresh PID
-            # namespace. A user namespace is only needed to be allowed to create one, and only
-            # for an unprivileged caller: --map-root-user maps the real uid to 0 inside, which
-            # keeps a non-root caller's access to its own tree, but maps a real root to a
-            # capability-less 0 that cannot read files it does not own (the bundle under
-            # /home/<user> then fails with 'permission denied'). Root creates the PID namespace
-            # directly.
-            if os.geteuid() == 0:
-                command = ['unshare', '--pid', '--fork', *command]
-            else:
-                command = ['unshare', '--user', '--map-root-user', '--pid', '--fork', *command]
+            # i686 bionic's pthread TID field cannot hold large host PIDs: run in a fresh PID namespace
+            command = ['unshare', '--user', '--map-root-user', '--pid', '--fork', *command]
         return env, command
 
     def run(self, target, name, argv, env_extra=None, markers=(), check_exit=True, judge=None):
@@ -328,6 +400,18 @@ def media_case(gate, sn, native, vendor_img):
     step('stage-odm', 'bash', REPO / 'nvidia-prolapse/media/stage-odm.sh', odm, vendor_img, service, wrapper)
     xml = workdir / native.MEDIA_XML
     step('xmlgen-check', wrapper, '--check', xml)
+    # Decode every advertised codec on the real GPU (the gate runs as root; /dev/dma_heap/system is
+    # root-only). A caps-only check cannot see a decode regression.
+    host_rust = REPO / 'build/nv-rm-rust/release/libnv_bionic_native.so'
+    if not host_rust.is_file():
+        raise RuntimeError(f'{host_rust} missing: the media gate cannot decode without the GNU host build '
+                           'of the nv_video backend (build native/mesa --rust-profile release)')
+    smoke = [sn.SMOKE_CODECS[t] for t in sn.media_codec_types(xml) if t in sn.SMOKE_CODECS]
+    if not smoke:
+        raise RuntimeError(f'{xml} advertises no codec the decode smoke can drive ({sn.media_codec_types(xml)})')
+    step('decode-smoke', 'make', '-B', '-C', REPO / 'nvidia-prolapse/media', 'smoke',
+         f'NV_VIDEO_LIB=-L{host_rust.parent} -lnv_bionic_native -Wl,-rpath,{host_rust.parent}',
+         'CODECS=' + ' '.join(smoke))
     want = set(native.MEDIA_ODM_FILES) | {'odm/etc/' + n for n in native.ODM_ORIGINALS}
     have = {str(p.relative_to(workdir)) for p in odm.rglob('*') if p.is_file() or p.is_symlink()}
     if have != want:
@@ -360,7 +444,9 @@ def media_case_image(gate, native, vendor_img):
     --check against the live caps), the service's ELF closure against vendor_img + the system image's VNDK apex
     and LL-NDK, the nv_video symbols it imports, device access for uid mediacodec. Returns the media record;
     its 'xml' is the generated file (the setup installs it and the LXC generator binds it over the image's
-    placeholder /odm/etc/media_codecs_c2.xml)."""
+    placeholder /odm/etc/media_codecs_c2.xml). A GPU without an NVDEC class the decoder drives (nvc2-xmlgen exit
+    XMLGEN_NO_NVDEC) passes with 'hardware_decode' False: its listing has no codecs, 'reason' says why, and every
+    other check still runs (the service still starts once on such a GPU)."""
     env, command = gate.command('android', [gate.progs / 'bin/android/nvc2-xmlgen'])
     record = {'exit': None, 'kernel_module': native.driver_version(), 'started': now(),
               'runner': 'packaging/native/release_gate.py (vendor image media gate)', 'steps': []}
@@ -369,7 +455,7 @@ def media_case_image(gate, native, vendor_img):
     xml = workdir / 'media_codecs_c2.xml'
     log = gate.work / 'logs' / 'media.log'
 
-    def step(name, cmd, env_extra=None):
+    def step(name, cmd, env_extra=None, ok=(0,)):
         print(f'[media/{name}]', flush=True)
         t0 = time.monotonic()
         proc = subprocess.run(list(map(str, cmd)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -377,11 +463,18 @@ def media_case_image(gate, native, vendor_img):
         with open(log, 'a') as f:
             f.write(f'$ {" ".join(map(str, cmd))}\n{proc.stdout}exit={proc.returncode}\n\n')
         record['steps'].append({'step': name, 'exit': proc.returncode, 'seconds': round(time.monotonic() - t0, 2)})
-        if proc.returncode != 0:
+        if proc.returncode not in ok:
             raise RuntimeError(f'media gate FAILED at {name} (exit {proc.returncode}); log {log}\n' + proc.stdout[-3000:])
-    step('xmlgen', [*command, '-o', xml], env)
-    step('validate-xml', ['python3', '-I', REPO / 'nvidia-prolapse/media/test/validate_xml.py', xml])
-    step('xmlgen-check', [*command, '--check', xml], env)
+        return proc
+    gen = step('xmlgen', [*command, '-o', xml], env, ok=(0, XMLGEN_NO_NVDEC))
+    hardware = gen.returncode == 0
+    reason = None
+    if not hardware:      # the tool's own line, for the user; the decision above is its exit status
+        reason = next((l.split('nvc2-xmlgen: ', 1)[1] for l in gen.stdout.splitlines() if 'nvc2-xmlgen: ' in l),
+                      f'hardware video decode: not available on this GPU (nvc2-xmlgen exit {XMLGEN_NO_NVDEC})')
+    step('validate-xml', ['python3', '-I', REPO / 'nvidia-prolapse/media/test/validate_xml.py',
+                          *([] if hardware else ['--no-decoders']), xml])
+    step('xmlgen-check', [*command, '--check', xml], env, ok=(0,) if hardware else (XMLGEN_NO_NVDEC,))
     if native.XMLGEN_MARK not in xml.read_text():
         raise RuntimeError(f'{xml} lacks the "{native.XMLGEN_MARK}" header')
     service = gate.payload / native.MEDIA_SERVICE           # byte-identical to the image's (checked by the caller)
@@ -405,12 +498,16 @@ def media_case_image(gate, native, vendor_img):
     have = {x for x in nm(rust, '--defined-only') if x.startswith('nv_video_')}
     if not want or want - have:
         raise RuntimeError(f'{rust} lacks nv_video symbols the Codec2 service imports: {sorted(want - have) or "none imported"}')
-    native.check_media_device_access([native.DEV_DIR + '/nvidiactl'] +
-                                     sorted(str(p) for p in Path(native.DEV_DIR).glob('nvidia[0-9]*')) +
-                                     [native.nvidia_render_node()])
+    native.check_media_device_access(native.media_device_nodes())   # the render node: at every container start
     record.update(exit=0, finished=now(), log=str(log), closure={service.name: closure}, nv_video_symbols=sorted(want))
     return {'enabled': True, 'component': 'nvidia-prolapse/media Codec2 NVDEC decoder (vendor image)',
-            'xml': str(xml), 'xml_sha256': sha256(xml), 'codecs': media_codecs(xml), 'gate': record}
+            'xml': str(xml), 'xml_sha256': sha256(xml), 'codecs': media_codecs(xml), 'gate': record,
+            'hardware_decode': hardware, 'reason': reason,
+            # The vendor-image path has no GNU host build of the backend to link a decoder against;
+            # the decode smoke runs in the developer media gate (dev/source-native run_media_gate),
+            # which gates the same backend source before this image is built. Recorded, not silent.
+            'decode_smoke': {'ran': False, 'reason': 'vendor-image gate: no host backend; covered by the '
+                                                      'developer media gate decode-smoke step'}}
 
 
 def media_codecs(xml):
@@ -480,5 +577,6 @@ def run(sn, native, bundle=BUNDLE, images=Path('/var/lib/waydroid/images'), log_
                           'cases': gl_cases_run, 'stripped': 'llvm-strip --strip-debug (CI, collect.py)',
                           'rust_sha256': rust_sha}}
     sources.update(odm)
-    print(f'Release gate PASS: {len(gate.cases)} cases + media on kernel module {kernel}', flush=True)
+    decode = '' if media.get('hardware_decode', True) else ' (media: no hardware decoder on this GPU)'
+    print(f'Release gate PASS: {len(gate.cases)} cases + media on kernel module {kernel}{decode}', flush=True)
     return record, vk, media, native_gl, sources

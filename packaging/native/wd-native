@@ -13,6 +13,9 @@
 # can write is refused unless that config also says ALLOW_USER_OWNED_REPO=yes; setting it makes
 # write access to that checkout equivalent to root, which is the developer's own choice.
 set -euo pipefail
+# Tool output parsed here and in every child (readelf, debugfs, lxc-info, systemctl, ...) is the untranslated text
+export LC_ALL=C
+unset LANGUAGE
 umask 022
 
 WD=/var/lib/waydroid

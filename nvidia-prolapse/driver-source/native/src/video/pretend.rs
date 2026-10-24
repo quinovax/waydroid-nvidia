@@ -74,12 +74,32 @@ pub fn run(
     class: u32,
     host_class: u32,
     data: &[u8],
-    (w, h): (u32, u32),
+    size: (u32, u32),
     bit_depth: u32,
 ) -> VResult<Vec<Built>> {
-    // AV1: the first temporal unit carries the sequence header (as the av1 tests pass it).
+    Ok(run_units(codec, class, host_class, data, size, bit_depth)?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+/// Like [`run`], but keeps the per-unit grouping: `out[i]` holds the pictures the i-th unit
+/// produced, empty when the unit produced none (parameter sets only, a skipped RASL picture,
+/// `pic_output_flag = 0`). This is the codec-side counterpart of `nv_video_decode`'s ABI v2
+/// return value.
+pub fn run_units(
+    codec: u32,
+    class: u32,
+    host_class: u32,
+    data: &[u8],
+    (w, h): (u32, u32),
+    bit_depth: u32,
+) -> VResult<Vec<Vec<Built>>> {
+    // AV1: the first temporal unit carries the sequence header (as the av1 tests pass it);
+    // it is still decoded, like the session does when the caller sends frame 0 in-band.
+    let units = units(codec, data);
     let config = if codec == CODEC_AV1 {
-        units(codec, data).swap_remove(0)
+        units.first().cloned().unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -96,10 +116,11 @@ pub fn run(
             }
         })
         .collect();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(units.len());
     let mut picture_index = 0u32;
-    for unit in units(codec, data) {
-        dec.push_unit(&unit)?;
+    for unit in &units {
+        let mut built = Vec::new();
+        dec.push_unit(unit)?;
         while let Some(job) = dec.next_job()? {
             let Job::Decode(job) = job else { continue };
             let referenced = dec.referenced();
@@ -122,7 +143,7 @@ pub fn run(
             let words = dec.build(&job, &ctx, &mut desc)?;
             let readback = job.readback.clone().map(|r| vec![0u8; r.len()]);
             dec.finish(&job, current, readback.as_deref())?;
-            out.push(Built {
+            built.push(Built {
                 desc,
                 words,
                 descriptor: ctx.descriptor,
@@ -131,6 +152,7 @@ pub fn run(
             });
             picture_index += 1;
         }
+        out.push(built);
     }
     Ok(out)
 }
@@ -397,7 +419,7 @@ fn caps_per_generation() {
     assert!(!e([1, 0, 0, 1, 0, 0, 0, 0], 0xcfb0).decodes(CODEC_AV1));
     assert!(!e([0, 0, 0, 0, 0x10, 0, 0, 0], 0xc7b0).decodes(CODEC_VP9));
     assert!(!e([1, 1, 1, 0, 0, 0, 0, 0], 0xc7b0).decodes(CODEC_HEVC));
-    // D1B0: untraced setup word → refused with a reason.
+    // D1B0: extra setup word not reproduced → refused with a reason.
     assert!(class_gap(CODEC_HEVC, 0xd1b0).is_some() && class_gap(CODEC_AV1, 0xd1b0).is_none());
     assert!(ok(CODEC_HEVC, 0xc4b0));
     // Classes verified on hardware (CFB0/C9B0/C7B0/C4B0) are enabled without the opt-in; GA100 is not.

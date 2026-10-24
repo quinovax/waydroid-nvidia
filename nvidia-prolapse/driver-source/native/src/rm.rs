@@ -497,7 +497,47 @@ impl Device {
         contiguous: bool,
         system: bool,
     ) -> Result<Rc<Memory>> {
-        self.allocate_placed(requested_size, alignment, contiguous, system, false)
+        self.allocate_placed(requested_size, alignment, contiguous, system, false, None)
+    }
+    /// Memory that holds one block-linear (DRM modifier) image, uncompressed,
+    /// with the image's PTE kind recorded on the physical allocation: NVOS32
+    /// ATTR FORMAT BLOCK_LINEAR and `format` = the kind (public nvos.h
+    /// NVOS32_ATTR_FORMAT 17:16). Our own GPU VAs carry the same kind
+    /// explicitly; the physical attribute is what every other client of the
+    /// memory gets. A dma-buf importer (nvidia-drm PRIME, then RM
+    /// NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD) maps the memory with
+    /// NVOS46 flags 0 and no kind override, i.e. with this kind: the stock
+    /// 580/615 EGL importer does exactly that. A pitch-format request is
+    /// granted kind PITCH (0x00) on Fermi..Volta, so a block-linear texture
+    /// over it faults (Xid 13 TEX); Turing+ grants its generic kind 0x06,
+    /// which serves both layouts, either way.
+    ///
+    /// NVK records the kind on the memory object the same way
+    /// (nvk_device_memory.c:174-184 → nvkmd_dev_alloc_tiled_mem, nouveau
+    /// winsys/nouveau_bo.c:120 `tile_flags = pte_kind << 8`, recovered by an
+    /// import at :214). The stock driver also requests FORMAT BLOCK_LINEAR
+    /// for dedicated / exportable / modifier images
+    /// (libnvidia-eglcore.so.580.178.04 E 0xad7f18 `or $0x20000`;
+    /// 615.78.08 E 0xa41b60), but together with COMPR ANY and kind 0 (RM picks
+    /// a compressible kind, 0xdb on GP104, 0x08 on GB202), because its own VAs
+    /// of that memory are compressible. Ours are not, and the modifier
+    /// advertises no compression, so this asks for exactly the kind and no
+    /// compression. RM must grant the requested kind; anything else is an
+    /// error, never a different layout.
+    pub(crate) fn allocate_block_linear(
+        self: &Rc<Self>,
+        requested_size: usize,
+        alignment: usize,
+        system: bool,
+        kind: u32,
+    ) -> Result<Rc<Memory>> {
+        if kind != self.generic_kind()? {
+            return Err(Error::Contract(format!(
+                "block-linear memory kind {kind:#x} is not the uncompressed generic kind {:#x}",
+                self.generic_kind()?
+            )));
+        }
+        self.allocate_placed(requested_size, alignment, false, system, false, Some(kind))
     }
     /// Device-local memory that is never CPU-mapped or exported. Matches the
     /// stock 615 request (attr 0x01002000 /
@@ -514,7 +554,14 @@ impl Device {
                 "compressible allocation must be a 64 KiB multiple".into(),
             ));
         }
-        self.allocate_placed(requested_size, alignment.max(BIG_PAGE), false, false, true)
+        self.allocate_placed(
+            requested_size,
+            alignment.max(BIG_PAGE),
+            false,
+            false,
+            true,
+            None,
+        )
     }
     fn allocate_placed(
         self: &Rc<Self>,
@@ -523,6 +570,7 @@ impl Device {
         contiguous: bool,
         system: bool,
         compressible: bool,
+        block_linear_kind: Option<u32>,
     ) -> Result<Rc<Memory>> {
         if alignment < 4096 || !alignment.is_power_of_two() {
             return Err(Error::Contract("invalid RM memory alignment".into()));
@@ -543,9 +591,11 @@ impl Device {
         } else {
             (
                 ((if contiguous { 2 } else { 3 }) << 27)
-                    | if system { (1 << 25) | (1 << 29) } else { 0 },
+                    | if system { (1 << 25) | (1 << 29) } else { 0 }
+                    // FORMAT BLOCK_LINEAR (17:16 = 2); COMPR stays NONE.
+                    | if block_linear_kind.is_some() { 2 << 16 } else { 0 },
                 ((if system { 2 } else { 1 }) << 2) | 1, // SYS: GPU uncached; VRAM: GPU cached. ZBC_PREFER_NO_ZBC.
-                generic_kind,
+                block_linear_kind.unwrap_or(generic_kind),
             )
         };
         let mut parameters = abi::MemoryAlloc {
@@ -567,6 +617,26 @@ impl Device {
             if system { 0x3e } else { 0x40 },
             &mut parameters,
         )?;
+        if let Some(kind) = block_linear_kind {
+            // NVOS32 returns the granted PTE kind in `format` and the granted
+            // attributes in `attr` (public nvos.h).
+            if parameters.format != kind
+                || (parameters.attr >> 16) & 3 != 2
+                || (parameters.attr >> 12) & 3 != 0
+            {
+                let status = self.client.free(self.handle, handle);
+                return Err(Error::Contract(format!(
+                    "RM granted block-linear memory {size:#x} kind {:#x} attr {:#010x} (requested kind {kind:#x}, \
+                     FORMAT BLOCK_LINEAR, COMPR NONE){}",
+                    parameters.format,
+                    parameters.attr,
+                    match status {
+                        Ok(()) => String::new(),
+                        Err(e) => format!("; freeing it failed too: {e}"),
+                    }
+                )));
+            }
+        }
         if compressible && std::env::var_os("NV_RM_DEBUG_COMPRESSION").is_some() {
             crate::diag::diag!(
                 "nvk-rm: compressible VRAM {size:#x}: RM attr {:#010x} kind {:#x} granted={}",
@@ -1621,6 +1691,32 @@ mod budget_tests {
             assert_eq!(kernel_used.get(), 0);
             assert_eq!(budget.used.get(), 0);
         }
+    }
+    #[test]
+    #[ignore = "needs an accessible NVIDIA GPU"]
+    fn block_linear_memory_records_the_generic_kind_on_selected_nvidia() {
+        let client = Client::open().unwrap();
+        let card = client
+            .cards()
+            .unwrap()
+            .into_iter()
+            .find(|card| card.pci.vendor == 0x10de)
+            .expect("no NVIDIA card");
+        let device = client.device(card).unwrap();
+        let kind = device.generic_kind().unwrap();
+        for system in [false, true] {
+            // allocate_block_linear refuses anything RM does not grant exactly
+            // (kind, FORMAT BLOCK_LINEAR, COMPR NONE).
+            let memory = device
+                .allocate_block_linear(0x5a_0000, 1 << 16, system, kind)
+                .unwrap();
+            assert_eq!(memory.size, 0x5a_0000);
+        }
+        let other = if kind == 0x06 { 0xfe } else { 0x06 };
+        assert!(matches!(
+            device.allocate_block_linear(1 << 16, 1 << 16, false, other),
+            Err(Error::Contract(_))
+        ));
     }
     #[test]
     #[ignore = "requires a selected NVIDIA RM device; bounded CPU mapping only, no GPU commands"]

@@ -2,9 +2,11 @@
 # Unit tests for NVIDIA-native mode (no root, no container, no GPU access needed).
 #   python3 -m unittest -v waydroid/test_nvidia_native.py      (after dev/build-waydroid)
 # SPDX-License-Identifier: GPL-3.0-or-later
+import contextlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -887,6 +889,119 @@ def import_tree():
     return lxc, tree_nn, gpu
 
 
+class LxcAppArmorTest(unittest.TestCase):
+    """lxc.py drop_unsupported_apparmor() (baseline patch): lxc.apparmor.profile stays only when this host's LXC
+    parses it. Fedora's LXC is built without AppArmor and refuses the whole config (issue #27)."""
+    BASE = "lxc.uts.name = waydroid\n\nlxc.apparmor.profile = unconfined\nlxc.no_new_privs = 1\n"
+    REFUSED = "lxc-info: probe: ../src/lxc/confile.c: set_config_apparmor_profile: 1651 Invalid argument - Built without AppArmor support"
+
+    def setUp(self):
+        self.lxc, _, _ = import_tree()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = os.path.join(self.tmp.name, "config")
+        with open(self.config, "w") as f:
+            f.write(self.BASE)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def drop(self, verdicts):
+        import subprocess
+        probed = []
+
+        def run(argv, **kwargs):
+            self.assertEqual(argv[:2], ["lxc-info", "-P"])
+            self.assertEqual(kwargs["env"]["LC_ALL"], "C")
+            with open(os.path.join(argv[2], "probe", "config")) as f:
+                probed.append(f.read())
+            code, err = verdicts.pop(0)
+            return subprocess.CompletedProcess(argv, code, "", err)
+        with mock.patch.object(self.lxc.subprocess, "run", side_effect=run), \
+                self.assertLogs(level="INFO") if verdicts[-1][0] else contextlib.nullcontext():
+            self.lxc.drop_unsupported_apparmor(self.config)
+        with open(self.config) as f:
+            return probed, f.read()
+
+    def test_kept_where_lxc_parses_it(self):
+        probed, text = self.drop([(0, ""), (0, "")])
+        self.assertEqual(probed, ["", "lxc.apparmor.profile = unconfined\n"])
+        self.assertEqual(text, self.BASE)
+
+    def test_dropped_where_lxc_refuses_it(self):
+        probed, text = self.drop([(0, ""), (1, self.REFUSED)])
+        self.assertEqual(text, self.BASE.replace("lxc.apparmor.profile = unconfined\n", ""))
+
+    def test_lxc_that_loads_nothing_is_an_error(self):
+        with self.assertRaisesRegex(OSError, "cannot load an empty container config"):
+            self.drop([(1, "lxc-info: broken"), (0, "")])
+
+    def test_no_key_no_probe(self):
+        with open(self.config, "w") as f:
+            f.write("lxc.uts.name = waydroid\n")
+        probed, _ = self.drop([(0, "")])
+        self.assertEqual(probed, [])
+
+    @unittest.skipUnless(shutil.which("lxc-info"), "LXC not installed")
+    def test_real_lxc_answers(self):
+        self.assertEqual(self.lxc.lxc_parses(""), (True, ""))
+        ok, message = self.lxc.lxc_parses("lxc.no_such_key = 1\n")
+        self.assertFalse(ok)
+        self.assertIn('Unsupported config key "lxc.no_such_key"', message)
+
+
+class MountSelinuxContextTest(unittest.TestCase):
+    """mount.py rootfs_context() (baseline patch): the Android rootfs is mounted with the waydroid policy's
+    waydroid_rootfs_t context only when libselinux says SELinux is enabled and the loaded policy defines it."""
+
+    def setUp(self):
+        import_tree()
+        import tools.helpers.mount as mount
+        self.mount = mount
+        mount.rootfs_context.cache_clear()
+        self.addCleanup(mount.rootfs_context.cache_clear)
+
+    def context(self, lib):
+        self.mount.rootfs_context.cache_clear()
+        with mock.patch("ctypes.CDLL", side_effect=lib if callable(lib) else (lambda *a, **k: lib)):
+            return self.mount.rootfs_context()
+
+    @staticmethod
+    def lib(enabled, valid):
+        return types.SimpleNamespace(is_selinux_enabled=lambda: enabled,
+                                     security_check_context=lambda ctx: 0 if valid else -1)
+
+    def test_no_libselinux_no_context(self):
+        def missing(*a, **k):
+            raise OSError("libselinux.so.1: cannot open shared object file")
+        self.assertIsNone(self.context(missing))
+
+    def test_selinux_disabled_no_context(self):
+        self.assertIsNone(self.context(self.lib(0, True)))
+
+    def test_policy_with_the_type(self):
+        self.assertEqual(self.context(self.lib(1, True)), "system_u:object_r:waydroid_rootfs_t:s0")
+
+    def test_policy_without_the_type_warns(self):
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertIsNone(self.context(self.lib(1, False)))
+        self.assertIn("waydroid_rootfs_t", logs.output[0])
+        self.assertIn("install.sh", logs.output[0])
+
+    def test_mount_passes_the_context(self):
+        calls = []
+        args = types.SimpleNamespace()
+        for lib, want in ((self.lib(1, True), ['context="system_u:object_r:waydroid_rootfs_t:s0"', "ro"]),
+                          (self.lib(0, True), ["ro"])):
+            self.mount.rootfs_context.cache_clear()
+            calls.clear()
+            with mock.patch("ctypes.CDLL", lambda *a, **k: lib), \
+                    mock.patch.object(self.mount.tools.helpers.run, "user", lambda a, cmd, **k: calls.append(cmd)), \
+                    mock.patch.object(self.mount, "ismount", side_effect=[False, True]), \
+                    mock.patch.object(self.mount.os.path, "exists", lambda p: True):
+                self.mount.mount(args, "/img/system.img", "/rootfs", readonly=True)
+            self.assertEqual(calls, [["mount", "-o", ",".join(want), "/img/system.img", "/rootfs"]])
+
+
 class LxcIntegrationTest(FakeHostMixin, unittest.TestCase):
     """generate_nodes_lxc_config() / make_base_props() / start() of build/waydroid, every mode x GL."""
 
@@ -1550,16 +1665,16 @@ class VendorImageTest(unittest.TestCase):
         for node in ("nvidiactl", "nvidia-modeset", "nvidia0"):
             touch(os.path.join(self.dev, node))
         sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
-        self.record = {"format": 1, "version": "v0.2.0-rc1", "build_record_sha256": BUNDLE_SHA, "kernel_module": V,
+        self.record = {"format": 2, "version": "v0.2.0-rc1", "build_record_sha256": BUNDLE_SHA, "kernel_module": V,
                        "vendor_img": {"path": self.img, "sha256": sha(self.img)},
                        "gate": {"exit": 0, "kernel_module": V, "log_dir": "/x"}, "native_gl": True,
-                       "media": {"xml_sha256": sha(self.xml)}}
+                       "media": {"xml_sha256": sha(self.xml), "hardware_decode": True}}
         self.write_record()
         self.access = []
         for attr, value in (("VENDOR_IMAGE_STATE", self.state), ("DEV_DIR", self.dev),
                             ("PACKAGED_BUNDLE_RECORD", os.path.join(self.top, "no-package")),
                             ("driver_version", lambda *a: V), ("nvidia_render_node", lambda *a: RENDER),
-                            ("check_media_device_access", self.access.append)):
+                            ("check_media_device_access", lambda paths, remedy=None: self.access.append(paths))):
             p = mock.patch.object(nn, attr, value)
             p.start()
             self.addCleanup(p.stop)
@@ -1613,7 +1728,8 @@ class VendorImageTest(unittest.TestCase):
         self.assertEqual(sorted(e.split()[2] for e in nodes[:-1]),
                          sorted([os.path.join(self.dev, n) for n in ("nvidiactl", "nvidia-modeset", "nvidia0")] + [RENDER]))
         self.assertFalse([e for e in nodes if "vendor_extra" in e or "nv/guest" in e or "/egl" in e])
-        self.assertEqual(len(self.access), 1)          # the Codec2 service's device access
+        # the Codec2 service's device access: the NVIDIA nodes here, the render node at container start
+        self.assertEqual(self.access, [[os.path.join(self.dev, n) for n in ("nvidiactl", "nvidia0")]])
 
     def test_stock_image_refused_with_setup_remedy(self):
         make_vendor_img(self.img, STOCK_PROPS)
@@ -1697,6 +1813,93 @@ class VendorImageTest(unittest.TestCase):
             nn.init_nodes(nn.driver_mode(w), w)
         self.assertIn("runs on the official vendor image", str(cm.exception))
 
+    # ---- a GPU without an NVDEC class the decoder drives (before Turing): installed without hardware decode
+    def no_nvdec(self):
+        """The state the setup leaves on such a GPU: the codec list without codecs, the service .rc made oneshot
+        and the VINTF fragment without the Codec2 HAL, their sha256 in the record."""
+        import hashlib
+        with open(self.xml, "w") as f:
+            f.write("<!-- Generated by nvc2-xmlgen: no hardware decoders -->\n<MediaCodecs/>\n")
+        rc = os.path.join(REPO, "nvidia-prolapse/media", nn.MEDIA_RC)
+        files = {nn.MEDIA_RC: nn.no_nvdec_rc(open(rc).read()), nn.MEDIA_VINTF: nn.NO_NVDEC_VINTF_TEXT}
+        for target, text in files.items():
+            with open(os.path.join(self.state, nn.VENDOR_IMAGE_NO_NVDEC[target]), "w") as f:
+                f.write(text)
+        sha = lambda t: hashlib.sha256(t.encode()).hexdigest()
+        self.write_record(media={"xml_sha256": sha(open(self.xml).read()), "hardware_decode": False,
+                                 "reason": "hardware video decode: not available on Tesla P100", "codecs": [],
+                                 "no_nvdec": {t: sha(x) for t, x in files.items()}})
+        return [os.path.join(self.state, nn.VENDOR_IMAGE_NO_NVDEC[t]) for t in (nn.MEDIA_RC, nn.MEDIA_VINTF)]
+
+    def test_no_nvdec_binds_the_oneshot_rc_and_an_empty_vintf_fragment(self):
+        rc, vintf = self.no_nvdec()
+        nodes = self.nodes()
+        self.assertEqual(nodes[-3:], [
+            "lxc.mount.entry = {} vendor/odm/etc/media_codecs_c2.xml none bind,ro 0 0".format(self.xml),
+            "lxc.mount.entry = {} vendor/{} none bind,ro 0 0".format(rc, nn.MEDIA_RC),
+            "lxc.mount.entry = {} vendor/{} none bind,ro 0 0".format(vintf, nn.MEDIA_VINTF)])
+        self.assertEqual(len(self.access), 1)          # the service still starts once (and opens the GPU)
+
+    def test_no_nvdec_files_are_checked(self):
+        rc, vintf = self.no_nvdec()
+        with open(rc, "a") as f:
+            f.write("    disabled\n")
+        self.refused(rc, "not the file the setup wrote", nn.SETUP)
+        os.unlink(rc)
+        self.refused(rc, "is missing", nn.SETUP)
+        record = json.load(open(os.path.join(self.state, nn.VENDOR_IMAGE_RECORD)))
+        del record["media"]["no_nvdec"]
+        self.write_record(media=record["media"])
+        self.refused("is invalid", "media.no_nvdec")
+        self.write_record(media={"xml_sha256": "0", "codecs": []})
+        self.refused("is invalid", "media.hardware_decode")
+
+    def test_no_nvdec_rc_is_the_image_rc_run_once(self):
+        rc = open(os.path.join(REPO, "nvidia-prolapse/media", nn.MEDIA_RC)).read()
+        once = nn.no_nvdec_rc(rc)
+        self.assertTrue(once.startswith(rc.rstrip("\n") + "\n"))
+        self.assertEqual(once[len(rc.rstrip("\n")):].splitlines()[-1], "    oneshot")
+        for bad, needle in ((rc + "on boot\n    start x\n", "not a single"),
+                            (rc.replace(nn.MEDIA_INIT_SERVICE, "other-service"), "not a single"),
+                            (once, "already says oneshot")):
+            with self.subTest(needle=needle), self.assertRaises(OSError) as cm:
+                nn.no_nvdec_rc(bad)
+            self.assertIn(needle, str(cm.exception))
+
+    def test_no_nvdec_vintf_fragment_declares_nothing(self):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(nn.NO_NVDEC_VINTF_TEXT)
+        self.assertEqual((root.tag, root.get("version"), root.get("type"), list(root)), ("manifest", "1.0", "device", []))
+        image_fragment = ET.parse(os.path.join(REPO, "nvidia-prolapse/media", nn.MEDIA_VINTF)).getroot()
+        self.assertEqual((image_fragment.get("version"), image_fragment.get("type")), ("1.0", "device"))
+
+    def test_start_check_matches_the_decode_state(self):
+        dm = nn.driver_mode(self.cfg)
+        config_nodes = os.path.join(self.top, "config_nodes")
+        hardware = self.nodes()
+        self.no_nvdec()
+        with open(config_nodes, "w") as f:              # generated before the gate found no NVDEC class
+            f.write("".join(e + "\n" for e in hardware))
+        with self.assertRaises(OSError) as cm:
+            nn.check_start(dm, self.cfg, config_nodes)
+        self.assertIn("hardware video decode not available", str(cm.exception))
+        with open(config_nodes, "w") as f:
+            f.write("".join(e + "\n" for e in self.nodes()))
+        nn.check_start(dm, self.cfg, config_nodes)
+
+    def test_render_node_access_is_checked_at_container_start(self):
+        """Waydroid makes /dev/dri/renderD* 0777 right before the start (container_manager.py set_permissions);
+        the setup runs before any start, where the distro's mode (0660 on systemd < 258) would refuse."""
+        dm = nn.driver_mode(self.cfg)
+        config_nodes = os.path.join(self.top, "config_nodes")
+        with open(config_nodes, "w") as f:
+            f.write("".join(e + "\n" for e in self.nodes()))
+        calls = []
+        with mock.patch.object(nn, "check_media_device_access", lambda paths, remedy=None: calls.append((paths, remedy))):
+            nn.check_start(dm, self.cfg, config_nodes)
+        self.assertEqual(calls[0][0], [RENDER])
+        self.assertIn("set_permissions", calls[0][1])
+
     def test_start_check(self):
         dm = nn.driver_mode(self.cfg)
         config_nodes = os.path.join(self.top, "config_nodes")
@@ -1727,7 +1930,7 @@ class VendorImageLxcTest(LxcIntegrationTest):
         self.vi = VendorImageTest("test_driver_mode")
         self.vi.setUp()
         self.addCleanup(self.vi.tearDown)
-        for attr, value in (("VENDOR_IMAGE_STATE", self.vi.state), ("check_media_device_access", lambda paths: None),
+        for attr, value in (("VENDOR_IMAGE_STATE", self.vi.state), ("check_media_device_access", lambda paths, remedy=None: None),
                             ("PACKAGED_BUNDLE_RECORD", os.path.join(self.top, "no-package")),
                             ("image_build_props", nn.image_build_props)):
             p = mock.patch.object(self.module, attr, value)

@@ -438,7 +438,11 @@ pub fn build_pic_s(i: &PicInputs) -> [u8; PIC_S_SIZE] {
     };
     put(p, f::LR_UNIT_SIZE, lr_size);
     let stride = (i.pitch / 16) as u64;
-    put_frame_info(p, f::CUR_FRAME, h.upscaled_width, h.frame_height, stride);
+    // Current frame: the CUVID width is the upscaled width when superres is on, but the picture
+    // descriptor carries the coded (pre-superres) width — stock libnvcuvid 615.78.08 on a
+    // superres inter frame writes 213 for a 320-wide upscaled 213-coded picture, and the
+    // motion-field size gate compares references against this same width.
+    put_frame_info(p, f::CUR_FRAME, h.frame_width, h.frame_height, stride);
     for k in 0..7 {
         let base = f::REF_FRAME + f::REF_FRAME_BITS * k;
         if h.frame_is_intra {

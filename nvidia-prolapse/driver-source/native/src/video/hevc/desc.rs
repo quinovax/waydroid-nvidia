@@ -406,18 +406,21 @@ pub fn build(
             sl,
         );
     }
-    // Tile table, column-major (c outer, r inner), one entry when tiles are off (stock writes the
-    // same for the 3x1 tiles capture; the order with >1 row is not observed).
+    // Tile-size table: one 4-byte entry per tile in raster-scan order (rows outer, columns
+    // inner), entry = {u16 column width in CTBs, u16 row height in CTBs}; the rest of the
+    // 0x700-byte area stays zero. Stock libnvcuvid 615.78.08 builds exactly this at ELF
+    // 0x3ec2b..0x3ecfc (uniform spacing: width = ((i+1)*W)/n - (i*W)/n per column, height by
+    // the same 6-3 split over the rows) and 0x3eef2..0x3f01c (explicit column_width_minus1 /
+    // row_height_minus1 + 1, last column/row = the remainder), then copies the table to
+    // setup+0x600 (0x3eb43..0x3ec03); with tiles off it writes the single {W, H} entry
+    // (0x3eba7..0x3ebb7).
     let (cols, rows) = match &pps.tiles {
         Some(t) => t.sizes(sps.width_ctbs(), sps.height_ctbs()),
         None => (vec![sps.width_ctbs()], vec![sps.height_ctbs()]),
     };
-    if cols.len() > 1 && rows.len() > 1 {
-        return unsupported("HEVC tiles in both directions (tile-size table order for >1 row and >1 column unverified)");
-    }
     let mut o = TILE_SIZES_OFFSET;
-    for &c in &cols {
-        for &r in &rows {
+    for &r in &rows {
+        for &c in &cols {
             put16(&mut d, o, c as u16);
             put16(&mut d, o + 2, r as u16);
             o += 4;

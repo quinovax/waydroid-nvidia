@@ -15,6 +15,9 @@
 # usage: stage-odm.sh OUT VENDOR_IMG SERVICE_BINARY NVC2_XMLGEN
 # Every step fails loudly; nothing is skipped.
 set -euo pipefail
+# Tool output parsed here and in every child (readelf, debugfs, lxc-info, systemctl, ...) is the untranslated text
+export LC_ALL=C
+unset LANGUAGE
 [ $# -eq 4 ] || { echo "usage: $0 OUT VENDOR_IMG SERVICE_BINARY NVC2_XMLGEN" >&2; exit 2; }
 OUT=$1 VENDOR_IMG=$2 SERVICE=$3 XMLGEN=$4
 HERE=$(cd "$(dirname "$0")" && pwd)

@@ -530,10 +530,10 @@ class RustProfileTest(unittest.TestCase):
             # artifact hash used by the runtime gate is captured.
             touch(source, ELF[64] + b'new')
             changed = True
-            return ''
+            return ['libc.so']
         with mock.patch.object(sn, 'stage_sources', return_value={'vendor_extra/lib64/fixture.so': source}), \
              mock.patch.object(sn.profiles, 'verify_metadata', side_effect=lambda *args: {'build': 'new' if changed else 'old'}), \
-             mock.patch.object(sn.subprocess, 'check_output', side_effect=inspect), \
+             mock.patch.object(sn, '_needed', side_effect=inspect), \
              mock.patch.object(sn, 'run_gate', return_value={'kernel_module': V}):
             with self.assertRaisesRegex(RuntimeError, 'metadata changed'):
                 # graphics-only fixture: opt out of media and native GL explicitly (the real build/ may hold nvrm builds)
@@ -745,6 +745,9 @@ class DeviceAccessTest(unittest.TestCase):
         with mock.patch.object(nn.os, 'stat', return_value=fake):
             self.assertRaisesRegex(OSError, 'NVreg_DeviceFileMode', nn.check_media_device_access, ['/dev/nvidiactl'])
         self.assertRaisesRegex(OSError, 'missing', nn.check_media_device_access, ['/nonexistent/nvidiactl'])
+        with tempfile.NamedTemporaryFile() as f:
+            self.assertRaisesRegex(OSError, 'o\\+rw. Remedy: restart it', nn.check_media_device_access, [f.name],
+                                   remedy='restart it')
 
 
 class MediaClosureTest(unittest.TestCase):
@@ -767,8 +770,7 @@ class MediaClosureTest(unittest.TestCase):
         nm = lambda path, flag: self.exports.get(Path(path).name, set())
         with mock.patch.object(nn, 'image_ls', side_effect=lambda img, path: self.images[(img, path)]), \
              mock.patch.object(sn, '_needed', side_effect=lambda p: self.needed.get(Path(p).name, ['libc.so'])), \
-             mock.patch.object(sn, '_nm', side_effect=nm), \
-             mock.patch.object(sn.subprocess, 'check_output', return_value=''):
+             mock.patch.object(sn, '_nm', side_effect=nm):
             return sn.media_closure(self.service, self.libs, self.rust, 'sys', 'ven')
 
     def test_resolves_each_needed_to_its_provider(self):
@@ -782,6 +784,11 @@ class MediaClosureTest(unittest.TestCase):
     def test_unresolved_needed_refused(self):
         self.needed['svc'].append('libfoo.so')        # in /system/lib64 but not LLNDK: not reachable
         self.assertRaisesRegex(RuntimeError, 'svc NEEDS libfoo.so', self.closure)
+
+    def test_glibc_or_nvidia_dependency_refused(self):
+        self.needed['svc'] = self.needed['svc'] + ['libnvidia-glcore.so.580.0']
+        with self.assertRaisesRegex(RuntimeError, 'Non-bionic/proprietary dependency in media artifact'):
+            self.closure()
 
     def test_shadowed_library_refused(self):
         self.images[('ven', '/lib64')]['libcodec2_vndk.so'] = 0
@@ -820,7 +827,7 @@ class StageMediaTest(SourceRootFixture):
              mock.patch.object(sn, 'run_native_gl_gate', return_value=gl or (
                  {'enabled': False, 'reason': 'GL driver not built'}, {})), \
              mock.patch.object(sn.profiles, 'verify_metadata', return_value={}), \
-             mock.patch.object(sn.subprocess, 'check_output', return_value='libnv_bionic_native.so'), \
+             mock.patch.object(sn, '_needed', return_value=['libc.so', 'libnv_bionic_native.so']), \
              contextlib.redirect_stdout(io.StringIO()):
             sn.stage(dest, 'release', no_media)
         self.assertEqual(set(vk_gate.call_args.args[0]), set(graphics_files()), 'Vulkan gate gets graphics only')
@@ -918,7 +925,7 @@ class NativeGlGateTest(unittest.TestCase):
              mock.patch.object(sn, 'NVRM_SMOKE', self.repo / 'smoke.py'), \
              mock.patch.object(sn, 'run', side_effect=self.strip), \
              mock.patch.object(sn.subprocess, 'run', side_effect=self.smoke), \
-             mock.patch.object(sn.subprocess, 'check_output', return_value='libnv_bionic_native.so'), \
+             mock.patch.object(sn, '_needed', return_value=['libc.so', 'libnv_bionic_native.so']), \
              mock.patch.object(sn.native, 'driver_version', return_value=V), \
              mock.patch.object(sn, '_runner_user', return_value=None), \
              mock.patch.object(sn.native, '_elf_class', side_effect=lambda p: 64 if Path(p).read_bytes()[4] == 2 else 32), \

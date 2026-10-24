@@ -1,6 +1,6 @@
 //! Legacy H.264 setup (`SET_APPLICATION_ID` 3, public `nvdec_h264_pic_s`, 0x2fc bytes; slice
 //! offsets at setup+0x300). Stock 615.71.09 uses it for interlaced SPSs (frame_mbs_only_flag =
-//! 0); its builder (0x3d070) is untraced, so this module follows the public struct
+//! 0; builder at ELF 0x3d070); this module follows the public struct
 //! (`nvdec_drv.h`, MIT) and the values observed in stock captures of an MBAFF stream
 //! (verified byte for byte in `tests.rs`).
 //! Only frame pictures are produced (MBAFF or non-MBAFF frames of an interlaced SPS); field

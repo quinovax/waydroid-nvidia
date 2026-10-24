@@ -20,7 +20,7 @@ const SCALING: u64 = 0x200;
 const SLICE_OFFSETS: u64 = 0x300;
 const STATUS: u64 = 0x700;
 /// Blackwell 0x4dc buffer (tinygrad `_ensure_has_vid_hw`: 2 MiB; stock places it after
-/// INTRA_TOP, size untraced).
+/// INTRA_TOP).
 const SIZE_4DC: u64 = 2 << 20;
 
 pub struct H264Decoder {
@@ -132,10 +132,13 @@ impl CodecDecoder for H264Decoder {
             if b.info.width > self.max.0.next_multiple_of(16)
                 || b.info.height > self.max.1.next_multiple_of(16)
             {
-                return Err(VideoError::Unsupported(format!(
-                    "H.264 picture {}x{} larger than the session max {}x{}",
-                    b.info.width, b.info.height, self.max.0, self.max.1
-                )));
+                return Err(crate::video::too_large(
+                    "H.264",
+                    b.info.width,
+                    b.info.height,
+                    self.max,
+                    b.info.keyframe,
+                ));
             }
             let i = b.info;
             let (l, r, t, bo) = i.crop;

@@ -34,6 +34,9 @@
 # --refresh <hz> (1-1000) is an override that pins the rate hwcomposer reports (persist.waydroid.refresh_rate,
 # e.g. half your monitor's rate); --refresh auto removes an override set earlier.
 set -euo pipefail
+# Tool output parsed here and in every child (readelf, debugfs, lxc-info, systemctl, ...) is the untranslated text
+export LC_ALL=C
+unset LANGUAGE
 
 die() { echo "waydroid-nvidia-setup: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -70,15 +73,24 @@ VENDOR_TOOL="python3 $NATIVE/packaging/native/vendor_image.py"
 [ -d "$GUEST" ] || die "$GUEST missing (broken package?)"
 [ "$RESTORE" = 0 ] || [ -z "$MODE_ARG$GL_ARG$REFRESH$SYSTEM_TYPE" ] || die "--restore-official-vendor takes no other option"
 
-lxc_state() { lxc-info -P /var/lib/waydroid/lxc -n waydroid -sH 2>/dev/null || echo STOPPED; }
+lxc_state() {   # call as state=$(lxc_state): a failure then stops the setup
+    local out
+    out=$(lxc-info -P /var/lib/waydroid/lxc -n waydroid -sH 2>&1) ||
+        die "lxc-info cannot read the Waydroid container: $out
+Remedy: sudo waydroid upgrade -o (regenerates /var/lib/waydroid/lxc/waydroid/config for this LXC), then re-run this
+setup; if LXC still rejects the config, report this message"
+    echo "$out"
+}
 WAS_ACTIVE=0
 systemctl is-active --quiet waydroid-container.service && WAS_ACTIVE=1
 stop_container() {
-    if [ "$(lxc_state)" != STOPPED ] || systemctl is-active --quiet waydroid-container.service; then
+    local state
+    state=$(lxc_state)
+    if [ "$state" != STOPPED ] || systemctl is-active --quiet waydroid-container.service; then
         say "stopping the Waydroid container for the switch (a running session ends)"
         systemctl stop waydroid-container.service
-        for _ in $(seq 30); do [ "$(lxc_state)" = STOPPED ] && break; sleep 1; done
-        [ "$(lxc_state)" = STOPPED ] ||
+        for _ in $(seq 30); do state=$(lxc_state); [ "$state" = STOPPED ] && break; sleep 1; done
+        [ "$state" = STOPPED ] ||
             die "the Waydroid container did not stop; stop it (waydroid session stop; systemctl stop waydroid-container) and re-run"
     fi
 }
@@ -193,14 +205,14 @@ verify_android_elf() {
         *) die "internal error: unsupported Android ABI '$abi'" ;;
     esac
     [ -f "$file" ] || die "required guest payload missing: $file (reinstall the package)"
-    header=$(LC_ALL=C readelf -hW -- "$file" 2>/dev/null) || die "$file is not a complete ELF file"
+    header=$(readelf -hW -- "$file" 2>/dev/null) || die "$file is not a complete ELF file"
     if ! grep -Eq "^[[:space:]]*Class:[[:space:]]+${expected_class}[[:space:]]*$" <<<"$header" ||
        ! grep -Eq "^[[:space:]]*Machine:[[:space:]]+${expected_machine}[[:space:]]*$" <<<"$header" ||
        ! grep -Eq '^[[:space:]]*Type:[[:space:]]+DYN([[:space:]]|$)' <<<"$header"; then
         die "$file is not an $expected_class/$expected_machine shared object"
     fi
     if [ -n "$expected_soname" ]; then
-        dynamic=$(LC_ALL=C readelf -dW -- "$file" 2>/dev/null) || die "cannot read the dynamic section from $file"
+        dynamic=$(readelf -dW -- "$file" 2>/dev/null) || die "cannot read the dynamic section from $file"
         actual_soname=$(sed -n 's/.*(SONAME).*Library soname: \[\([^]]*\)\].*/\1/p' <<<"$dynamic")
         [ "$actual_soname" = "$expected_soname" ] ||
             die "$file has SONAME '${actual_soname:-<missing>}' (expected '$expected_soname')"

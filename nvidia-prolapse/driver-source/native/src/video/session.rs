@@ -7,13 +7,14 @@
 //!   `(len + 0x8ff) & ~0xff`: 0x141d50, allocations at 0x1393f0.
 //! - DPB surfaces in VRAM in the engine layout, chroma after an aligned luma
 //!   plane: 0x13a310.
-//! - stock un-tiles in MapVideoFrame with CUDA kernels (UNTRACED); we copy with
+//! - stock un-tiles in MapVideoFrame with CUDA kernels; we copy with
 //!   the copy engine instead: the VP9 engine output (tileformat 1 on Blackwell)
 //!   is exactly the Blackwell 8-bit (luma) / 16-bit (chroma) GOB layout that the
 //!   copy engine understands through SET_SRC_BLOCK_SIZE.GOB_KIND (measured
 //!   2026-10-14, see video/README.md).
 use super::{
     channel::{wait_sync_file, NvdecChannel},
+    hdr::HdrStaticMetadata,
     open_render_node, open_rm, Allocator, BuildContext, CodecDecoder, DecodeJob, Job, NvdecGen,
     PictureInfo, SurfaceLayout, SurfaceRef, VResult, VideoDevice, VideoError, FORMAT_NV12,
     FORMAT_P010, FORMAT_YUV420P,
@@ -119,6 +120,8 @@ struct Picture {
     timestamp: u64,
     /// NVDEC timeline value that completes this picture's decode.
     decoded_at: u64,
+    /// HDR static metadata of the unit that decoded this surface (empty: none declared).
+    hdr: HdrStaticMetadata,
 }
 
 /// An imported target dma-buf and its VA in the session's address space.
@@ -199,6 +202,24 @@ pub(crate) fn unit_admitted(
     need <= free || max_referenced.is_some_and(|n| n + 1 + held <= total)
 }
 
+/// Why a session's requested bit depth cannot be built, or `None` when the caps mask covers
+/// it. H.264 has no 10/12-bit path in this library: the codec is constructed without a bit
+/// depth (8-bit engine surfaces) and has no High-10 descriptor setup, so the refusal names
+/// that instead of reporting a bare capability mask.
+pub(crate) fn bit_depth_refusal(codec: u32, depth: u32, mask: u32) -> Option<String> {
+    if depth < 32 && mask & (1 << depth) != 0 {
+        return None;
+    }
+    let mut m = format!("bit depth {depth} for codec {codec} is not supported (mask {mask:#x})");
+    if codec == super::CODEC_H264 && depth > 8 {
+        m.push_str(
+            ": 10/12-bit H.264 is not implemented - the codec is built with 8-bit surfaces \
+             only and has no High-10 descriptor setup",
+        );
+    }
+    Some(m)
+}
+
 /// The engine's `nvdec_status_s` head (nvdec_drv.h: mbs_correctly_decoded,
 /// mbs_in_error, cycle_count, error_status): an error message when
 /// error_status is non-zero (observed 0xd when the AV1 +0x244 word is missing).
@@ -233,6 +254,17 @@ pub struct Session {
     surface_refs: Vec<SurfaceRef>,
     /// Last copy-engine token reading each surface.
     surface_copy: Vec<u64>,
+    /// HDR static metadata declared by the unit that decoded each surface (a
+    /// show_existing_frame outputs the metadata of the frame it shows).
+    surface_hdr: Vec<HdrStaticMetadata>,
+    /// Last HDR declaration of the stream (carried to pictures of later units).
+    current_hdr: HdrStaticMetadata,
+    /// Set when a unit returned `VideoError::Resize`: the session only drains from
+    /// then on (the caller re-creates it at this size and resubmits the unit).
+    resize_needed: Option<(u32, u32)>,
+    /// Displayable pictures emitted since session start (nv_video_decode returns the
+    /// increase per unit, the ABI v2 "this unit produced a picture" signal).
+    shown: u64,
     layout: SurfaceLayout,
     _side: Vec<VramBuffer>,
     pictures: HashMap<u64, Picture>,
@@ -309,18 +341,13 @@ impl Session {
                 caps.max_height
             )));
         }
-        if info.bit_depth >= 32 || caps.bit_depth_mask & 1 << info.bit_depth == 0 {
-            return Err(VideoError::Unsupported(format!(
-                "bit depth {} for codec {} (supported mask {:#x}){}",
-                info.bit_depth,
-                info.codec,
-                caps.bit_depth_mask,
-                if info.codec == super::CODEC_VP9 && !dev.engine0.vp9_high_bit_depth {
-                    ": NVDEC0's BSP caps report no high-bit-depth VP9 (capsTbl[4] bit 4), as stock reads them"
-                } else {
-                    ""
-                }
-            )));
+        if let Some(why) = bit_depth_refusal(info.codec, info.bit_depth, caps.bit_depth_mask) {
+            let hint = if info.codec == super::CODEC_VP9 && !dev.engine0.vp9_high_bit_depth {
+                ": NVDEC0's BSP caps report no high-bit-depth VP9 (capsTbl[4] bit 4), as stock reads them"
+            } else {
+                ""
+            };
+            return Err(VideoError::Unsupported(format!("{why}{hint}")));
         }
         let mut codec: Box<dyn CodecDecoder> = match info.codec {
             super::CODEC_VP9 => Box::new(super::vp9::Vp9Decoder::new(
@@ -350,6 +377,19 @@ impl Session {
             )?),
             c => return Err(VideoError::Unsupported(format!("codec {c} not built in"))),
         };
+        // The codec decides the engine surface layout from its own bit depth, and the DPB
+        // surfaces below are sized from it: a codec built for another depth would allocate
+        // the wrong sample container silently.
+        if codec.bit_depth() != info.bit_depth {
+            return Err(VideoError::Unsupported(format!(
+                "codec {} was built for {}-bit surfaces but the session requested {} bits: the \
+                 codec constructor does not take the session bit depth (H.264 is built 8-bit \
+                 only; it has no High-10 descriptor setup)",
+                info.codec,
+                codec.bit_depth(),
+                info.bit_depth
+            )));
+        }
         let (device, _) = open_rm(Some(dev.pci))?;
         let drm = open_render_node(dev.pci)?;
         let space = AddressSpace::new(&device)?;
@@ -395,6 +435,10 @@ impl Session {
             ring,
             next_ring: 0,
             surface_copy: vec![0; surfaces.len()],
+            surface_hdr: vec![HdrStaticMetadata::default(); surfaces.len()],
+            current_hdr: HdrStaticMetadata::default(),
+            resize_needed: None,
+            shown: 0,
             surfaces,
             surface_refs,
             layout,
@@ -461,9 +505,45 @@ impl Session {
         Ok(())
     }
 
-    pub fn decode(&mut self, data: &[u8], timestamp: u64, flags: u32) -> VResult<()> {
+    /// Submit one unit. Returns the number of displayable pictures this unit produced
+    /// (ABI v2): 0 for a unit the decoder drops or decodes without output (parameter sets
+    /// only, a skipped RASL picture, `pic_output_flag = 0`) and for a drain call; a caller
+    /// may therefore retire the input buffer as soon as a unit reports 0.
+    /// Submit one unit; returns the displayable pictures it produced. After a
+    /// `VideoError::Resize` only an end-of-stream drain (no data) is accepted.
+    pub fn decode(&mut self, data: &[u8], timestamp: u64, flags: u32) -> VResult<u32> {
+        if let Some((w, h)) = self.resize_needed {
+            if !data.is_empty() {
+                return Err(VideoError::Invalid(format!(
+                    "the session needs re-creation at {w}x{h} (NV_VIDEO_E_RESIZE): only an \
+                     end-of-stream drain is accepted"
+                )));
+            }
+        }
+        let r = self.decode_unit(data, timestamp, flags);
+        if let Err(VideoError::Resize { width, height, .. }) = &r {
+            self.resize_needed = Some((*width, *height));
+        }
+        r
+    }
+
+    /// The coded size the last `VideoError::Resize` asked for.
+    pub fn required_size(&self) -> Option<(u32, u32)> {
+        self.resize_needed
+    }
+
+    fn decode_unit(&mut self, data: &[u8], timestamp: u64, flags: u32) -> VResult<u32> {
         self.poll_status()?;
+        let shown_before = self.shown;
         if !data.is_empty() {
+            // HDR static metadata is stream syntax (SEI / metadata OBU), not engine
+            // state: parse it before any decoder state changes and attach it to the
+            // pictures this unit produces. Declarations persist: a stream usually
+            // declares the mastering display / content light level once, and every later
+            // picture is displayed with them until a new declaration replaces the group.
+            let declared = super::hdr::parse_unit(self.info.codec, data)?;
+            self.current_hdr.merge(declared);
+            let hdr = self.current_hdr;
             let need = self.codec.surfaces_needed(data)?;
             let free = self.free_surfaces().len();
             let held: std::collections::HashSet<usize> =
@@ -490,9 +570,10 @@ impl Session {
                             .map(|p| p.decoded_at)
                             .max()
                             .unwrap_or(self.nvdec.submitted);
-                        self.emit(surface, info, timestamp, decoded_at, None);
+                        let hdr = self.surface_hdr[surface];
+                        self.emit(surface, info, timestamp, decoded_at, None, hdr);
                     }
-                    Job::Decode(job) => self.decode_job(job, timestamp)?,
+                    Job::Decode(job) => self.decode_job(job, timestamp, hdr)?,
                 }
             }
         }
@@ -502,7 +583,8 @@ impl Session {
                 self.display.push_back(id);
             }
         }
-        Ok(())
+        u32::try_from(self.shown - shown_before)
+            .map_err(|_| VideoError::Invalid("unit produced more than 2^32 pictures".into()))
     }
 
     fn emit(
@@ -512,9 +594,11 @@ impl Session {
         timestamp: u64,
         decoded_at: u64,
         key: Option<i64>,
+        hdr: HdrStaticMetadata,
     ) {
         let id = self.next_id;
         self.next_id += 1;
+        self.shown += 1;
         self.pictures.insert(
             id,
             Picture {
@@ -522,6 +606,7 @@ impl Session {
                 info,
                 timestamp,
                 decoded_at,
+                hdr,
             },
         );
         match key {
@@ -537,7 +622,12 @@ impl Session {
         }
     }
 
-    fn decode_job(&mut self, job: DecodeJob, timestamp: u64) -> VResult<()> {
+    fn decode_job(
+        &mut self,
+        job: DecodeJob,
+        timestamp: u64,
+        hdr: HdrStaticMetadata,
+    ) -> VResult<()> {
         let current = *self
             .free_surfaces()
             .first()
@@ -608,8 +698,11 @@ impl Session {
             None => None,
         };
         self.codec.finish(&job, current, readback.as_deref())?;
+        // Keep the unit's metadata on the surface even when the picture is hidden: a
+        // later show_existing_frame outputs the metadata of the frame it shows.
+        self.surface_hdr[current] = hdr;
         if job.show {
-            self.emit(current, job.info, timestamp, value, job.display_key);
+            self.emit(current, job.info, timestamp, value, job.display_key, hdr);
         }
         Ok(())
     }
@@ -619,6 +712,15 @@ impl Session {
         let id = self.display.pop_front()?;
         let p = &self.pictures[&id];
         Some((id, p.timestamp, p.info))
+    }
+
+    /// HDR static metadata of picture `id` (ABI v2). A picture whose unit declared none
+    /// returns the empty value; an unknown id is a caller error.
+    pub fn picture_hdr(&self, id: u64) -> VResult<HdrStaticMetadata> {
+        self.pictures
+            .get(&id)
+            .map(|p| p.hdr)
+            .ok_or_else(|| VideoError::Invalid(format!("unknown picture id {id}")))
     }
 
     pub fn release(&mut self, id: u64) -> VResult<()> {
@@ -632,6 +734,9 @@ impl Session {
     pub fn flush(&mut self) -> VResult<()> {
         self.codec.flush();
         self.failed = None;
+        self.resize_needed = None;
+        // A seek may land in a different grade: the next declaration replaces it.
+        self.current_hdr = HdrStaticMetadata::default();
         for id in std::mem::take(&mut self.display) {
             self.pictures.remove(&id);
         }
@@ -737,8 +842,13 @@ impl Session {
             }
             plane_va[p] = va.address() + t.offset[p];
         }
-        // The target must be free (acquire fence). CPU wait: the backend has no
-        // GPU-side sync_file wait outside its Vulkan bridge yet (open item).
+        // The target must be free (acquire fence, an arbitrary dma-fence sync_file from
+        // the caller). Waited on the CPU: one poll(2) on the fd, which returns immediately
+        // when the producer already signalled it (measured: see video/README.md
+        // "copy_out"). A GPU-side wait needs the sync_file imported as an RM semaphore
+        // (dma-fence -> semaphore), which this backend does not implement, and stock has
+        // no equivalent to follow (libnvcuvid has no fence-fd API; its consumers
+        // synchronise through CUDA stream semantics), so no GPU method is invented here.
         if t.acquire_fence_fd >= 0 {
             wait_sync_file(t.acquire_fence_fd, Duration::from_secs(5))
                 .map_err(|e| VideoError::Invalid(format!("acquire fence: {e}")))?;
@@ -760,7 +870,14 @@ impl Session {
             let (src_va, rows_alloc, rows, line_bytes, ox, oy) = if p == 0 {
                 (src.luma, self.layout.luma_rows, ch, cw * bps, cl * bps, ct)
             } else if remap.is_some() {
-                (src.chroma, self.layout.chroma_rows, ch.div_ceil(2), cw.div_ceil(2), cl / 2, ct / 2)
+                (
+                    src.chroma,
+                    self.layout.chroma_rows,
+                    ch.div_ceil(2),
+                    cw.div_ceil(2),
+                    cl / 2,
+                    ct / 2,
+                )
             } else {
                 (
                     src.chroma,
@@ -771,9 +888,17 @@ impl Session {
                     ct / 2,
                 )
             };
-            let src_width = if remap.is_some() { self.layout.pitch / 2 } else { self.layout.pitch };
+            let src_width = if remap.is_some() {
+                self.layout.pitch / 2
+            } else {
+                self.layout.pitch
+            };
             // Source: engine block linear, 1-GOB wide, 2-GOB high blocks.
-            let gob_kind = if blackwell_ce { src_kinds[p.min(1)] << 16 } else { 0 };
+            let gob_kind = if blackwell_ce {
+                src_kinds[p.min(1)] << 16
+            } else {
+                0
+            };
             method(&mut w, 4, 0x728, &[1 << 4 | 1 << 12 | gob_kind]); // SET_SRC_BLOCK_SIZE
             method(&mut w, 4, 0x72c, &[src_width, rows_alloc, 1, 0]); // SRC W/H/D/LAYER
             method(&mut w, 4, 0x744, &[ox, oy]); // SRC_ORIGIN_X/Y
@@ -781,13 +906,22 @@ impl Session {
             if let Some(component) = remap {
                 // DST_X = SRC_X (Cb) or SRC_Y (Cr), DST_Y/Z/W = NO_WRITE (6), COMPONENT_SIZE ONE,
                 // NUM_SRC_COMPONENTS TWO, NUM_DST_COMPONENTS ONE.
-                method(&mut w, 4, 0x708, &[component | 6 << 4 | 6 << 8 | 6 << 12 | 1 << 20]);
+                method(
+                    &mut w,
+                    4,
+                    0x708,
+                    &[component | 6 << 4 | 6 << 8 | 6 << 12 | 1 << 20],
+                );
                 launch |= 1 << 10; // REMAP_ENABLE
             }
             match dst.block {
                 None => launch |= 1 << 8, // DST pitch
                 Some((h, kinds)) => {
-                    let dk = if blackwell_ce { kinds[p.min(1)] << 16 } else { 0 };
+                    let dk = if blackwell_ce {
+                        kinds[p.min(1)] << 16
+                    } else {
+                        0
+                    };
                     method(&mut w, 4, 0x70c, &[h << 4 | 1 << 12 | dk]); // SET_DST_BLOCK_SIZE
                     let dst_rows = rows.next_multiple_of(8 << h);
                     method(
@@ -945,6 +1079,18 @@ impl TargetLayout {
                 planar,
             });
         }
+        // The 2-byte-sample (P010) block-linear destination write is derived, not measured:
+        // the destination GOB layout the copy engine produces for 16-bit luma / 32-bit CbCr
+        // has never been read back and compared on hardware. Refuse it rather than write a
+        // possibly wrong layout; LINEAR P010 is bit-exact (host test) and NV12 block-linear
+        // (1-byte samples) is measured.
+        if bytes_per_sample != 1 {
+            return Err(VideoError::Unsupported(format!(
+                "P010 block-linear target (modifier {:#x}): the copy engine's 16-bit \
+                 block-linear write is not verified end to end; use a LINEAR P010 target",
+                t.modifier
+            )));
+        }
         let v = t.modifier & ((1 << 56) - 1);
         if t.modifier >> 56 != VENDOR_NVIDIA || v & 0x10 == 0 || v >> 26 != 0 {
             return Err(VideoError::Unsupported(format!(
@@ -1030,9 +1176,17 @@ mod tests {
             .is_none());
         let t = TargetLayout::parse(&target(bl(0, 1, 3, 0xfe, 4)), 0xcab5, 1).unwrap();
         assert_eq!(t.block, Some((4, [1, 2])));
-        // P010 on Blackwell GOBs: 16-bit luma, 32-bit CbCr (the engine's 10-bit output kinds).
-        let t = TargetLayout::parse(&target(bl(0, 1, 3, 0xfe, 4)), 0xcab5, 2).unwrap();
-        assert_eq!(t.block, Some((4, [2, 0])));
+        // P010 (2-byte samples) block-linear: verified end to end nowhere, refused with the
+        // reason on both GOB generations instead of writing a guessed layout.
+        for modif in [bl(0, 1, 3, 0xfe, 4), bl(0, 1, 2, 0xfe, 1)] {
+            let e = TargetLayout::parse(&target(modif), 0xcab5, 2).unwrap_err();
+            assert!(
+                e.message().contains("P010 block-linear") && e.message().contains("not verified"),
+                "{}",
+                e.message()
+            );
+            assert_eq!(e.code(), -2); // NV_VIDEO_E_UNSUPPORTED
+        }
         let t = TargetLayout::parse(&target(bl(0, 1, 2, 0xfe, 1)), 0xc7b5, 1).unwrap();
         assert_eq!(t.block, Some((1, [0, 0])));
         assert!(TargetLayout::parse(&target(bl(1, 1, 2, 0xfe, 1)), 0xcab5, 1).is_err()); // compressed
@@ -1085,6 +1239,107 @@ mod tests {
         assert!(
             m.contains("error_status 0xd") && m.contains("7 blocks") && m.contains("picture 3")
         );
+    }
+
+    /// The ABI v2 "this unit produced a picture" signal is 0 exactly when the codec hands
+    /// the session no displayable job. A unit that carries only parameter sets is the
+    /// simplest such unit (a skipped RASL picture and `pic_output_flag = 0` are the
+    /// stream cases, see `skipped_rasl_units_produce_no_picture`).
+    #[test]
+    fn parameter_set_unit_produces_no_picture() {
+        use super::super::{bits, pretend, CODEC_HEVC};
+        let stream: &[u8] = include_bytes!("testdata/hevc_160x144.hevc");
+        let aus = bits::access_units(stream, true);
+        let mut ps = Vec::new();
+        for n in bits::split_annexb(aus[0]) {
+            if (32..=34).contains(&((n.nal[0] >> 1) & 0x3f)) {
+                ps.extend_from_slice(&[0, 0, 1]);
+                ps.extend_from_slice(n.nal);
+            }
+        }
+        assert!(!ps.is_empty(), "no parameter sets in the bundled stream");
+        let out = pretend::run_units(CODEC_HEVC, 0xcfb0, 0xc96f, &ps, (160, 144), 8).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].is_empty(),
+            "parameter-set unit built {} pictures",
+            out[0].len()
+        );
+        let first = pretend::run(CODEC_HEVC, 0xcfb0, 0xc96f, aus[0], (160, 144), 8).unwrap();
+        assert_eq!(first.len(), 1, "the first access unit decodes one picture");
+    }
+
+    /// Random access at a CRA: the RASL pictures that follow it are skipped (HEVC 8.1.3,
+    /// NoRaslOutputFlag), and exactly those units produce no picture — the C2 core relies on
+    /// this signal to retire their input instead of holding them until EOS/flush.
+    #[test]
+    #[ignore = "needs NVDEC_STOCK_EVIDENCE (streams/x265-opengop.hevc)"]
+    fn skipped_rasl_units_produce_no_picture() {
+        use super::super::{bits, pretend, CODEC_HEVC};
+        let dir = std::env::var("NVDEC_STOCK_EVIDENCE")
+            .expect("NVDEC_STOCK_EVIDENCE=<stock captures dir>");
+        let stream = std::fs::read(format!("{dir}/streams/x265-opengop.hevc")).unwrap();
+        let aus = bits::access_units(&stream, true);
+        let types = |a: &[u8]| -> Vec<u32> {
+            bits::split_annexb(a)
+                .into_iter()
+                .map(|n| u32::from((n.nal[0] >> 1) & 0x3f))
+                .collect()
+        };
+        let cra: Vec<usize> = aus
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| types(a).contains(&21))
+            .map(|(i, _)| i)
+            .collect();
+        let start = cra[1];
+        let mut data = Vec::new();
+        for n in bits::split_annexb(aus[0]) {
+            if (32..=34).contains(&((n.nal[0] >> 1) & 0x3f)) {
+                data.extend_from_slice(&[0, 0, 1]);
+                data.extend_from_slice(n.nal);
+            }
+        }
+        data.extend(aus[start..].iter().flat_map(|a| a.iter().copied()));
+        let out = pretend::run_units(CODEC_HEVC, 0xcfb0, 0xc96f, &data, (176, 144), 8).unwrap();
+        assert_eq!(out.len(), aus.len() - start);
+        // Only the leading pictures of the random-access CRA are skipped (8.1.3); RASL
+        // pictures after the next CRA decode normally (NoRaslOutputFlag = 0).
+        let is_rasl = |a: &[u8]| types(a).iter().any(|&x| x == 8 || x == 9);
+        let lead = cra[2] - start;
+        let rasl_lead = aus[start..cra[2]].iter().filter(|a| is_rasl(a)).count();
+        assert!(rasl_lead > 0, "stream has no RASL pictures after the CRA");
+        let empty = out[..lead].iter().filter(|p| p.is_empty()).count();
+        assert_eq!(
+            empty, rasl_lead,
+            "skipped units must be exactly the leading RASLs"
+        );
+        for (i, pics) in out.iter().enumerate() {
+            if i < lead && is_rasl(aus[start + i]) {
+                continue;
+            }
+            assert_eq!(
+                pics.len(),
+                1,
+                "unit {i} (types {:?}) must decode one picture",
+                types(aus[start + i])
+            );
+        }
+    }
+
+    /// A 10-bit H.264 session is refused with the reason (no 16-bit surfaces are ever
+    /// allocated for it); the 8-bit path and the codecs that do take a depth are unaffected.
+    #[test]
+    fn h264_high_bit_depth_is_refused_by_name() {
+        let h264_mask = 1 << 8;
+        let m = bit_depth_refusal(super::super::CODEC_H264, 10, h264_mask).expect("refused");
+        assert!(m.contains("High-10") && m.contains("no High-10"), "{m}");
+        assert!(bit_depth_refusal(super::super::CODEC_H264, 8, h264_mask).is_none());
+        let hevc_mask = 1 << 8 | 1 << 10;
+        assert!(bit_depth_refusal(super::super::CODEC_HEVC, 10, hevc_mask).is_none());
+        let m = bit_depth_refusal(super::super::CODEC_HEVC, 12, hevc_mask).expect("refused");
+        assert!(!m.contains("High-10"), "{m}");
+        assert!(bit_depth_refusal(super::super::CODEC_VP9, 32, 1 << 8).is_some());
     }
 
     #[test]
