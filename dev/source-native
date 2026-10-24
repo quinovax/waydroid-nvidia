@@ -374,9 +374,13 @@ def _release_gate():
     return _GATE[0]
 
 
-def _needed(path):
-    """DT_NEEDED of an ELF object, parsed from the file (release_gate.needed), not from readelf's localised text."""
-    return _release_gate().needed(path)
+def _needed(path, leaf_ok=False):
+    """DT_NEEDED of an ELF object, parsed from the file (release_gate.needed), not from readelf's localised text.
+
+    leaf_ok is for the bionic runtime of the user's image (ld-android.so and friends): those are
+    complete dynamic objects that legitimately need nothing, so an empty DT_NEEDED is not damage.
+    """
+    return _release_gate().needed(path, leaf_ok=leaf_ok)
 
 
 def _proprietary_needed(path):
@@ -407,7 +411,11 @@ def gate_coverage(sources, rust_profile='dev'):
                 if path in loaded or native._elf_class(path) is None:
                     continue
                 loaded.add(path)
-                for name in _needed(path):
+                # the bionic runtime of the user's image is a legitimate leaf: ld-android.so and
+                # the linker legitimately have no DT_NEEDED, they are the thing everything else
+                # needs. Only the objects we build or ship must name their dependencies.
+                leaf = '/runtime/' in path or os.path.basename(path).startswith(('ld-android', 'linker'))
+                for name in _needed(path, leaf_ok=leaf):
                     for directory in dirs:
                         candidate = os.path.join(directory, name)
                         if os.path.isfile(candidate):
