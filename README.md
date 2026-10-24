@@ -36,6 +36,47 @@ carried back to `main` with the next release.
 - **Upstream tracking.** `dev` merges every upstream `public-test` release (currently v0.2.0-rc7)
   and keeps this fork's own transport work on top, so the compatibility work above is always
   tested against current upstream rather than a frozen snapshot.
+- **Upstream fixes, more aggressively than upstream itself.** Following a release is the floor,
+  not the goal. Where this fork hits a problem upstream has not solved — or has solved only by
+  working around it — the fix is taken to the root cause and offered back upstream as a pull
+  request, together with the minimal reproducible check that proves it. The intent is to stop
+  carrying private patches for anything upstream can accept, so this work outlives the fork.
+  See [Upstream contributions](#upstream-contributions) below for what that has produced.
+
+### Upstream contributions
+
+Maintaining pre-GSP cards means running the NVIDIA userspace in a place the vendor never
+intended, so most of what `dev` learns is a bug report upstream cannot reproduce on an RTX
+card. Three kinds of work go back upstream, and the fork's own carry-list shrinks as they land:
+
+- **Root-cause fixes instead of workarounds.** Upstream's `vtest_gpu_alloc` chose NVIDIA's own
+  LINEAR memory for CPU-readable buffers. That path faults the GPU (Xid 69, `CLEAR_SURFACE`
+  `0x19D0`) when SurfaceFlinger renders into it, so upstream's answer was an environment variable
+  to opt out. This fork makes the safe path (kernel `udmabuf`) the default and NVIDIA LINEAR the
+  opt-in, on the reasoning that the failure mode decides: a GPU fault that kills the compositor
+  is strictly worse than a possibly-imperfect render.
+- **Gaps the import census cannot see.** The glibc shim exports only the names the NVIDIA blobs
+  import, which is correct until a *loader* resolves something by glibc name that no blob does —
+  `libglvnd` wants `pthread_join@GLIBC_2.2.5`, and without it every EGL/Vulkan client aborts in
+  `hal_open`. The fix is a `runtime=` row in `dispositions.tsv`, and the same class of gap is now
+  checked rather than discovered by a crash.
+- **Distribution portability.** Several upstream paths only work on the distribution they were
+  written on: `readelf` field names are translated under a non-English locale and every checker
+  matched the English form; host library directories are `/usr/lib64` + `/usr/lib` on Fedora
+  multilib but `/usr/lib` + `/usr/lib32` on Debian and Arch; Fedora's `liblxc` is built without
+  AppArmor and rejects the stock `lxc.apparmor.profile` key outright. These become conditional
+  implementations that work on both layouts, not assumptions about one distribution.
+
+Reproducible evidence comes before the patch in each case: a minimal EGL/Vulkan probe built with
+the NDK and run inside the container with the shim's own trace enabled (this is how the missing
+`pthread_join` was found — the loader named the symbol and the version it wanted), a gate that
+fails on the old behaviour and passes on the new, or a before/after log from this GTX 1080.
+Where a fix is small enough that upstream can take it directly, that is preferred over another
+fork-only patch; the aim is that a future upstream release makes more of this branch redundant,
+not less. The work above is currently described from this fork's side — the findings are proven
+here and the fixes are in this branch, while the corresponding upstream pull requests are being
+prepared rather than merged. Anything already accepted upstream is folded in through the
+`public-test` merges above and noted in the release history.
 
 ### Trying `dev`
 
