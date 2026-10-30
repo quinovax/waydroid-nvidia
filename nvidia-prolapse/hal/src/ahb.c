@@ -925,6 +925,15 @@ VkResult nvhal_sc_bind(struct nvhal_device *d, VkImage image, const VkNativeBuff
 
 /* ------------------------------------------------------------------ memory */
 
+/* Every allocation this HAL hands to the ICD goes through here, so the opt-in census
+ * (nvhal_exp_memstats_alloc; off = one relaxed load) sees exactly the app's vkAllocateMemory calls. */
+static VkResult icd_alloc(struct nvhal_device *d, VkDevice dev, const VkMemoryAllocateInfo *ai,
+                          const VkAllocationCallbacks *alloc, VkDeviceMemory *out) {
+    VkResult r = d->AllocateMemory(dev, ai, alloc, out);
+    nvhal_exp_memstats_alloc(ai->memoryTypeIndex, ai->allocationSize, r);
+    return r;
+}
+
 static VkResult import_dmabuf(struct nvhal_device *d, const struct gbuf *b, VkImage ded_image, VkBuffer ded_buffer,
                               uint32_t type, VkDeviceSize size, const void *extra, const VkAllocationCallbacks *alloc,
                               const char *who, VkDeviceMemory *out) {
@@ -939,7 +948,7 @@ static VkResult import_dmabuf(struct nvhal_device *d, const struct gbuf *b, VkIm
                                    (ded_image || ded_buffer) ? (const void *)&ded : extra,
                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd};
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, size, type};
-    VkResult r = d->AllocateMemory(d->handle, &mai, alloc, out);
+    VkResult r = icd_alloc(d, d->handle, &mai, alloc, out);
     if (r != VK_SUCCESS) {
         close(fd);
         NVHAL_ERR("%s: ICD vkAllocateMemory(import DMA_BUF%s, %llu B, type %u) -> %s; " GB_FACTS, who,
@@ -957,6 +966,7 @@ VkResult VKAPI_CALL nvhal_AllocateMemory(VkDevice device, const VkMemoryAllocate
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     VkMemoryAllocateInfo exp_ai;
+    uint32_t app_type = ai->memoryTypeIndex; /* the app's own type: the remap summary reports it as the source */
     ai = nvhal_exp_mem_remap(d, ai, &exp_ai); /* off by default: returns ai */
     const VkImportAndroidHardwareBufferInfoANDROID *imp = NULL;
     const VkExportMemoryAllocateInfo *exp = NULL;
@@ -978,11 +988,19 @@ VkResult VKAPI_CALL nvhal_AllocateMemory(VkDevice device, const VkMemoryAllocate
         VkMemoryAllocateInfo t;
         int a = nvhal_astc_alloc_info(ai, &t, storage, sizeof storage);
         if (a < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
-        if (a > 0) return d->AllocateMemory(device, &t, alloc, pMem);
+        if (a > 0) {
+            VkResult r = icd_alloc(d, device, &t, alloc, pMem);
+            nvhal_exp_mem_remap_note(d, app_type, t.allocationSize, r);
+            return r;
+        }
     }
     struct nvhal_image *w = ded ? wrapper(ded->image) : NULL;
     if (!w && dednv) w = wrapper(dednv->image);
-    if (!imp && !exp_ahb && !w) return d->AllocateMemory(device, ai, alloc, pMem); /* not ours */
+    if (!imp && !exp_ahb && !w) { /* not ours */
+        VkResult r = icd_alloc(d, device, ai, alloc, pMem);
+        nvhal_exp_mem_remap_note(d, app_type, ai->allocationSize, r);
+        return r;
+    }
     /* this entry point is also intercepted on ANB-only devices (swapchain-bound wrappers) */
     if ((imp || exp_ahb) && !d->ahb_enabled) {
         NVHAL_ERR("vkAllocateMemory: an AHB import/export, but VK_ANDROID_external_memory_android_hardware_buffer is "
@@ -1054,12 +1072,14 @@ VkResult VKAPI_CALL nvhal_AllocateMemory(VkDevice device, const VkMemoryAllocate
             NVHAL_ERR("%s: exporting an AHB without a dedicated AHB image (a BLOB for a VkBuffer, or no dedicated "
                       "object) is not implemented; no consumer in the guest uses it (AHB-CONTRACT.md §2) -> "
                       "VK_ERROR_OUT_OF_DEVICE_MEMORY", who);
+            nvhal_exp_memstats_fail(ai->memoryTypeIndex, VK_ERROR_OUT_OF_DEVICE_MEMORY);
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
         if (!vk_to_ahb(w->ci.format)) {
             NVHAL_ERR("%s: exporting an AHB for VkFormat %d (YUV): the gralloc's NV12/P010 buffers are decoder output "
                       "imported into Vulkan; allocating them from Vulkan is not implemented -> "
                       "VK_ERROR_OUT_OF_DEVICE_MEMORY", who, w->ci.format);
+            nvhal_exp_memstats_fail(ai->memoryTypeIndex, VK_ERROR_OUT_OF_DEVICE_MEMORY);
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
         AHardwareBuffer_Desc desc = {
@@ -1071,6 +1091,7 @@ VkResult VKAPI_CALL nvhal_AllocateMemory(VkDevice device, const VkMemoryAllocate
             NVHAL_ERR("%s: AHardwareBuffer_allocate(%ux%u, %u layer(s), format 0x%x, usage 0x%" PRIx64 ") -> %d "
                       "(the gralloc log names the reason) -> VK_ERROR_OUT_OF_DEVICE_MEMORY", who, desc.width,
                       desc.height, desc.layers, desc.format, desc.usage, rc);
+            nvhal_exp_memstats_fail(ai->memoryTypeIndex, VK_ERROR_OUT_OF_DEVICE_MEMORY);
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
         owned = true;
@@ -1163,6 +1184,7 @@ VkResult VKAPI_CALL nvhal_AllocateMemory(VkDevice device, const VkMemoryAllocate
         }
         d->FreeMemory(d->handle, mem, alloc);
         r = VK_ERROR_OUT_OF_HOST_MEMORY;
+        nvhal_exp_memstats_fail(ai->memoryTypeIndex, r);
         goto fail_buf;
     }
     m->dev = d;

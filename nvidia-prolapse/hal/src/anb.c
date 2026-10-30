@@ -728,6 +728,8 @@ VkResult VKAPI_CALL nvhal_QueueSignalReleaseImageANDROID(VkQueue queue, uint32_t
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     if (d->gt) nvhal_gt_frame(d);
+    nvhal_xst_frame(); /* no-op unless NVHAL_XLATE_STATS / debug.nvhal.xlate_stats is on */
+    nvhal_exp_memstats_present(d); /* no-op unless debug.nvhal.exp.memstats is on: ends the preload phase */
     if (!d->anb_enabled) {
         NVHAL_ERR("vkQueueSignalReleaseImageANDROID: VK_ANDROID_native_buffer not enabled on device %p",
                   (void *)d->handle);

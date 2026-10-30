@@ -14,8 +14,13 @@
 
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 /* ------------------------------------------------------------------ command buffer -> device */
 
@@ -109,6 +114,181 @@ static VKAPI_ATTR void VKAPI_CALL xl_DestroyCommandPool(VkDevice device, VkComma
     d->xl.DestroyCommandPool(device, pool, alloc);
 }
 
+/* ------------------------------------------------------------------ translation cost statistics
+ *
+ * Opt-in measurement of what VkImage translation costs per command and per frame: NVHAL_XLATE_STATS=1
+ * on the host, the property debug.nvhal.xlate_stats in the guest (report window in seconds:
+ * NVHAL_XLATE_STATS_WINDOW / debug.nvhal.xlate_stats.window, default 1). Off by default: xl1, xl_arr and
+ * real_handle then pay one acquire atomic load and a not-taken branch -- no clock_gettime, no logging, no
+ * counter write. The value picks the tier: 1 = counts and per-call timing, 2 = counts only (the counters
+ * and the per-frame call counts without one clock read per call, so the reading carries no measurement
+ * overhead of its own), any other positive value behaves as 1.
+ *
+ * Counters are per translator class ("img" = xl1, one image reference; "arr" = xl_arr, one image array;
+ * "obj" = real_handle, one object handle) in two classes: "calls" (the entry was invoked) and "xlated"
+ * (it named a wrapper, so the handle really had to be rewritten). One line per window carries the
+ * per-frame figures and, in the timing tier, the share of the process CPU time the translation accounts
+ * for. The ms come from two clock_gettime(CLOCK_MONOTONIC) reads around the translated body, so they
+ * exclude the measurement itself while the "cpu" denominator includes it: the reported share slightly
+ * under-estimates, never over-estimates, which is the safe direction for the go/no-go question.
+ *
+ * The array path is a container: its ns include the xl1 ns of its elements (those are counted in "img"),
+ * so the translation total in the report is img + obj, never img + arr + obj. nvhal_xst_frame (called by
+ * anb.c on the present path) counts frames and also drives the report when image commands are sparse. */
+enum { XST_IMG, XST_ARR, XST_OBJ, XST_NK };
+/* three flat arrays and not a struct of atomics: on i686 a struct holding _Atomic uint64_t has an
+ * alignment GCC notes as ABI-relevant, and the build is -Werror clean without the noise */
+static _Atomic uint64_t xst_n[XST_NK], xst_xlated[XST_NK], xst_ns[XST_NK];
+static _Atomic uint64_t xst_ticks, xst_frames, xst_arr_el, xst_last_report;
+static _Atomic int xst_state; /* 0 = not probed yet, 1 = off, 2 = counts + timing, 3 = counts only */
+static pthread_once_t xst_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t xst_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t xst_window_ns = 1000000000ull;
+static double xst_clk_ns; /* self-measured cost of one clock_gettime, timing tier only */
+
+struct xst_snap {
+    uint64_t n[XST_NK], xlated[XST_NK], ns[XST_NK], frames, el, cpu_ns, wall_ns;
+};
+static struct xst_snap xst_prev; /* only touched under xst_mu */
+
+static uint64_t xst_clock(clockid_t id) {
+    struct timespec t;
+    clock_gettime(id, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static inline uint64_t xst_now(void) { return xst_clock(CLOCK_MONOTONIC); }
+
+static void xst_report(uint64_t now);
+
+/* one translator invocation: its counter class, whether it really translated, and its body's ns */
+static void xst_note(int k, bool xlated, uint64_t t0, uint64_t t1) {
+    atomic_fetch_add_explicit(&xst_n[k], 1, memory_order_relaxed);
+    if (xlated) atomic_fetch_add_explicit(&xst_xlated[k], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&xst_ns[k], t1 - t0, memory_order_relaxed);
+    /* throttled check: reporting is never on the hot path itself (trylock, one clock read) */
+    if ((atomic_fetch_add_explicit(&xst_ticks, 1, memory_order_relaxed) & 1023u) == 0) xst_report(t1);
+}
+
+static void xst_init(void) {
+    char v[96] = "", w[96] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.xlate_stats", v);
+    __system_property_get("debug.nvhal.xlate_stats.window", w);
+#else
+    const char *e = getenv("NVHAL_XLATE_STATS");
+    if (e) snprintf(v, sizeof v, "%s", e);
+    const char *we = getenv("NVHAL_XLATE_STATS_WINDOW");
+    if (we) snprintf(w, sizeof w, "%s", we);
+#endif
+    int lvl = atoi(v);
+    if (lvl <= 0) {
+        atomic_store_explicit(&xst_state, 1, memory_order_release);
+        return;
+    }
+    lvl = lvl == 2 ? 3 : 2; /* 2 = counts only; 1 or anything else positive = counts + per-call timing */
+    double ws = w[0] ? atof(w) : 1.0;
+    xst_window_ns = (uint64_t)((ws > 0.1 ? ws : 1.0) * 1e9);
+    xst_prev.wall_ns = xst_now();
+    xst_prev.cpu_ns = xst_clock(CLOCK_PROCESS_CPUTIME_ID);
+    if (lvl == 2) { /* what this tier's own measurement costs, measured here in the guest, not assumed */
+        uint64_t c0 = xst_now();
+        for (int i = 0; i < 1000; i++) (void)xst_now();
+        xst_clk_ns = (double)(xst_now() - c0) / 1000.0;
+    }
+    atomic_store_explicit(&xst_last_report, xst_prev.wall_ns, memory_order_relaxed);
+    atomic_store_explicit(&xst_state, lvl, memory_order_release);
+    NVHAL_WARN("xlate: statistics ON (tier %s, window %.2f s; NVHAL_XLATE_STATS / debug.nvhal.xlate_stats): one "
+               "line per window with the per-frame call counts%s",
+               lvl == 2 ? "counts+timing" : "counts only", xst_window_ns / 1e9,
+               lvl == 2 ? ", the clock_gettime cost of the translators and its share of the process CPU time"
+                        : " (no per-call clock reads)");
+    if (lvl == 2) NVHAL_WARN("xlate: this tier pays two clock_gettime per translator entry: %.1f ns each here, "
+                             "so the 'meas~' field of each line is its own per-frame overhead", xst_clk_ns);
+}
+
+/* the tier of this process: 0 = off, 2 = counts + timing, 3 = counts only */
+static inline int xst_level(void) {
+    /* acquire: a thread that sees the state written by xst_init must also see the window and the snapshot
+     * xst_init filled in (the off value needs no other state, but publishing it costs nothing here) */
+    int s = atomic_load_explicit(&xst_state, memory_order_acquire);
+    if (__builtin_expect(s == 0, 0)) { /* first call in the process: read the env/property once */
+        pthread_once(&xst_once, xst_init);
+        s = atomic_load_explicit(&xst_state, memory_order_acquire);
+    }
+    return s <= 1 ? 0 : s;
+}
+
+static void xst_report(uint64_t now) {
+    if (pthread_mutex_trylock(&xst_mu) != 0) return; /* another thread is reporting or just did */
+    int lvl = atomic_load_explicit(&xst_state, memory_order_relaxed);
+    struct xst_snap s;
+    for (int i = 0; i < XST_NK; i++) {
+        s.n[i] = atomic_load_explicit(&xst_n[i], memory_order_relaxed);
+        s.xlated[i] = atomic_load_explicit(&xst_xlated[i], memory_order_relaxed);
+        s.ns[i] = atomic_load_explicit(&xst_ns[i], memory_order_relaxed);
+    }
+    s.frames = atomic_load_explicit(&xst_frames, memory_order_relaxed);
+    s.el = atomic_load_explicit(&xst_arr_el, memory_order_relaxed);
+    s.cpu_ns = xst_clock(CLOCK_PROCESS_CPUTIME_ID);
+    s.wall_ns = now;
+    double win = (double)(s.wall_ns - xst_prev.wall_ns) / 1e9;
+    if ((double)(s.wall_ns - xst_prev.wall_ns) < (double)xst_window_ns) { /* a second thread asked too early */
+        pthread_mutex_unlock(&xst_mu);
+        return;
+    }
+    uint64_t dn[XST_NK], dx[XST_NK], dns[XST_NK], dframes = s.frames - xst_prev.frames, del = s.el - xst_prev.el;
+    for (int i = 0; i < XST_NK; i++) {
+        dn[i] = s.n[i] - xst_prev.n[i];
+        dx[i] = s.xlated[i] - xst_prev.xlated[i];
+        dns[i] = s.ns[i] - xst_prev.ns[i];
+    }
+    double cpu = (double)(s.cpu_ns - xst_prev.cpu_ns);
+    double total = (double)(dns[XST_IMG] + dns[XST_OBJ]);
+    double frames = (double)dframes;
+    if (lvl == 2) {
+        NVHAL_WARN("xlate stats[timing]: %.2fs frames=%" PRIu64 " (%.1f fps) cpu=%.1fms | "
+                   "img calls=%" PRIu64 " xlated=%" PRIu64 " (%.2f%%) %.3fms %.0fns/call | "
+                   "arr calls=%" PRIu64 " copies=%" PRIu64 " els=%" PRIu64 " %.3fms | "
+                   "obj calls=%" PRIu64 " xlated=%" PRIu64 " | "
+                   "total %.3fms = %.2f%% of cpu, %.1fus/frame, %.1f calls/frame | clk=%.1fns meas~%.0fus/frame",
+                   win, dframes, frames > 0 ? frames / win : 0.0, cpu / 1e6,
+                   dn[XST_IMG], dx[XST_IMG],
+                   dn[XST_IMG] ? 100.0 * (double)dx[XST_IMG] / (double)dn[XST_IMG] : 0.0,
+                   (double)dns[XST_IMG] / 1e6, dn[XST_IMG] ? (double)dns[XST_IMG] / (double)dn[XST_IMG] : 0.0,
+                   dn[XST_ARR], dx[XST_ARR], del, (double)dns[XST_ARR] / 1e6,
+                   dn[XST_OBJ], dx[XST_OBJ],
+                   total / 1e6, cpu > 0.0 ? 100.0 * total / cpu : 0.0,
+                   frames > 0 ? total / frames / 1e3 : 0.0,
+                   frames > 0 ? (double)(dn[XST_IMG] + dn[XST_OBJ]) / frames : 0.0,
+                   xst_clk_ns,
+                   frames > 0 ? (double)(dn[XST_IMG] + dn[XST_OBJ]) * 2.0 * xst_clk_ns / frames / 1e3 : 0.0);
+    } else {
+        NVHAL_WARN("xlate stats[counts]: %.2fs frames=%" PRIu64 " (%.1f fps) cpu=%.1fms | "
+                   "img calls=%" PRIu64 " xlated=%" PRIu64 " (%.2f%%) | "
+                   "arr calls=%" PRIu64 " copies=%" PRIu64 " els=%" PRIu64 " | "
+                   "obj calls=%" PRIu64 " xlated=%" PRIu64 " | "
+                   "%.1f calls/frame (no per-call timing in this tier)",
+                   win, dframes, frames > 0 ? frames / win : 0.0, cpu / 1e6,
+                   dn[XST_IMG], dx[XST_IMG],
+                   dn[XST_IMG] ? 100.0 * (double)dx[XST_IMG] / (double)dn[XST_IMG] : 0.0,
+                   dn[XST_ARR], dx[XST_ARR], del,
+                   dn[XST_OBJ], dx[XST_OBJ],
+                   frames > 0 ? (double)(dn[XST_IMG] + dn[XST_OBJ]) / frames : 0.0);
+    }
+    xst_prev = s;
+    atomic_store_explicit(&xst_last_report, s.wall_ns, memory_order_relaxed);
+    pthread_mutex_unlock(&xst_mu);
+}
+
+/* one presented frame (anb.c, the present path): counted, and the report deadline is checked here too so
+ * that a run whose image commands stop still gets its last window. No-op unless the statistics are on. */
+void nvhal_xst_frame(void) {
+    if (__builtin_expect(xst_level() == 0, 1)) return;
+    atomic_fetch_add_explicit(&xst_frames, 1, memory_order_relaxed);
+    uint64_t now = xst_now();
+    if (now - atomic_load_explicit(&xst_last_report, memory_order_relaxed) >= xst_window_ns) xst_report(now);
+}
+
 /* ------------------------------------------------------------------ helpers */
 
 #define DEV(fn)                                                                                     \
@@ -124,15 +304,19 @@ static VKAPI_ATTR void VKAPI_CALL xl_DestroyCommandPool(VkDevice device, VkComma
         return;                                                                                     \
     }
 
-/* translate one image in place; *bad when it is a wrapper without memory */
+/* translate one image in place; *bad when it is a wrapper without memory. With the statistics on this is
+ * the per-image-reference entry: one "img call" per invocation, one "xlated" when a wrapper was found. */
 static inline bool xl1(VkImage *img, bool *bad, const char *what) {
     if (nvhal_no_wrappers() || *img == VK_NULL_HANDLE) return false;
+    int st = xst_level();
+    uint64_t t0 = st == 2 ? xst_now() : 0;
     bool hit = false;
     VkImage r = nvhal_image_xl(*img, &hit, what);
     if (hit) {
         if (r == VK_NULL_HANDLE) *bad = true;
         *img = r;
     }
+    if (__builtin_expect(st != 0, 0)) xst_note(XST_IMG, hit, t0, st == 2 ? xst_now() : 0);
     return hit;
 }
 
@@ -141,11 +325,15 @@ static inline bool xl1(VkImage *img, bool *bad, const char *what) {
 static void *xl_arr(const void *src, uint32_t n, size_t size, size_t off, void *stack, size_t stack_bytes, bool *bad,
                     const char *what) {
     if (!src || !n || nvhal_no_wrappers()) return (void *)src;
+    int st = xst_level();
+    uint64_t t0 = st == 2 ? xst_now() : 0;
+    uint32_t nxl = 0; /* elements translated; each of them is also counted by xl1 as one img call */
     unsigned char *dst = NULL;
     for (uint32_t i = 0; i < n; i++) {
         VkImage img;
         memcpy(&img, (const unsigned char *)src + i * size + off, sizeof img);
         if (!xl1(&img, bad, what)) continue;
+        nxl++;
         if (!dst) {
             dst = (size_t)n * size <= stack_bytes ? stack : malloc((size_t)n * size);
             if (!dst) {
@@ -156,6 +344,10 @@ static void *xl_arr(const void *src, uint32_t n, size_t size, size_t off, void *
             memcpy(dst, src, (size_t)n * size);
         }
         memcpy(dst + i * size + off, &img, sizeof img);
+    }
+    if (__builtin_expect(st != 0, 0)) {
+        atomic_fetch_add_explicit(&xst_arr_el, n, memory_order_relaxed);
+        xst_note(XST_ARR, nxl != 0, t0, st == 2 ? xst_now() : 0);
     }
     return dst ? dst : (void *)src;
 }
@@ -422,9 +614,12 @@ static bool image_obj(VkObjectType t, uint64_t h) { return t == VK_OBJECT_TYPE_I
 
 static uint64_t real_handle(uint64_t h, bool *unrealised, const char *what) {
     (void)what; /* naming / private data before the image has memory is valid: no log */
+    int st = xst_level();
+    uint64_t t0 = st == 2 ? xst_now() : 0;
     bool hit = false;
     VkImage r = nvhal_image_xl(NVHAL_U64_ND(VkImage, h), &hit, NULL);
     *unrealised = hit && r == VK_NULL_HANDLE;
+    if (__builtin_expect(st != 0, 0)) xst_note(XST_OBJ, hit, t0, st == 2 ? xst_now() : 0);
     return NVHAL_ND_U64(r);
 }
 

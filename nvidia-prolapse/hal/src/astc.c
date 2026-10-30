@@ -14,7 +14,11 @@
  *    VkImageViewUsageCreateInfo with the app's own usage;
  *  - beside it the HAL keeps the compressed data: one "block image" per mip level (one texel per block, every
  *    layer: R32G32B32A32_UINT for 128-bit blocks, R32G32_UINT for 64-bit ones), bound into the app's memory behind
- *    the decoded image; the memory requirements the app sees cover all of them;
+ *    the decoded image; the memory requirements the app sees cover all of them. NVHAL_ASTC_BLOCKS_HOST /
+ *    debug.nvhal.astc_blocks_host (task-17) moves the block images to one HAL-owned HOST_VISIBLE allocation per
+ *    image, so the app's requirements cover the decoded image alone and the card's VRAM only holds those; every other
+ *    rule here - barriers, upload/decode, readback, mip/layer layout, refusals - is unchanged, sparse images and any
+ *    allocation/bind failure keep the combined path;
  *  - uploads (vkCmdCopyBufferToImage[2], vkCmdCopyImage[2] into it) copy the blocks into the block image and then
  *    run the decoder in the app's command buffer from the block image into an unsigned-integer storage view of the
  *    decoded image, between barriers: Mesa's astc_decoder.glsl (unorm8 mode) for ASTC, src/etc2_decoder.comp for
@@ -34,6 +38,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 #define ASTC_FIRST VK_FORMAT_ASTC_4x4_UNORM_BLOCK
 #define ASTC_LAST VK_FORMAT_ASTC_12x12_SRGB_BLOCK
@@ -620,7 +628,8 @@ VkResult nvhal_astc_device_init(struct nvhal_device *d) {
     return VK_SUCCESS;
 }
 
-static VkDeviceSize align_up(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) / a * a; }
+/* defined next to combine(), inside the block test/astc-blocks-host.c extracts */
+static VkDeviceSize align_up(VkDeviceSize v, VkDeviceSize a);
 
 static int32_t mem_type(const struct nvhal_device *d, uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < d->mem_props.memoryTypeCount; i++)
@@ -846,9 +855,15 @@ struct nvhal_astc_image {
     uint32_t mips, layers;
     VkImageUsageFlags usage; /* the app's */
     VkImage block[MAX_MIPS];
-    VkDeviceSize off[1 + MAX_MIPS]; /* binding offsets: [0] RGBA image, [1 + m] block image of mip m */
+    VkDeviceSize off[1 + MAX_MIPS]; /* binding offsets: [0] RGBA image, [1 + m] block image of mip m; the block
+                                       entries are 0 when the HAL owns their memory (they are already bound) */
     VkDeviceSize size[1 + MAX_MIPS]; /* each part's own memory size */
     bool sparse;                    /* SPARSE_BINDING: bound with vkQueueBindSparse */
+    bool blocks_host;               /* task-17: the block images live in blocks_mem, not in the app's memory */
+    bool counted;                   /* bh_live_add() ran: the summary's live figures include this image */
+    VkDeviceMemory blocks_mem;      /* the HAL's own HOST_VISIBLE allocation behind the block images */
+    VkDeviceSize blocks_size;       /* its size (blocks_host only) */
+    uint32_t blocks_type;           /* its memoryTypeIndex (blocks_host only) */
     VkMemoryRequirements req;       /* what the app is told */
     struct astc_slot *slots;        /* d->astc->lock */
     uint32_t nslots, cap;
@@ -958,6 +973,11 @@ static VkResult build_cis(const struct nvhal_astc_pd *p, const VkImageCreateInfo
     return VK_SUCCESS;
 }
 
+/* NVHAL_ASTC_BLOCK_HOST_BEGIN: 'make astc-blocks-host' copies everything from this line to the matching END line into
+ * out/gen/astc_blocks_host.inc, which test/astc-blocks-host.c compiles and runs on a host with no GPU (the same trick
+ * as the task-12 memory-type mirror test). The block must therefore stay free of HAL globals and of logging. */
+static VkDeviceSize align_up(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) / a * a; }
+
 /* lay the parts out one after another in one allocation; false when no memory type fits all of them. sparse:
  * every part starts on the largest alignment (the app's sparse block size), so a bind range the app aligns to it
  * maps onto whole sparse blocks of each part */
@@ -979,6 +999,70 @@ static bool combine(const VkMemoryRequirements *parts, uint32_t n, bool sparse, 
     return bits != 0;
 }
 
+/* ------------------------------------- compressed blocks in HAL-owned host memory (task-17) ----------------------
+ *
+ * Normally the block images are bound behind the decoded image inside the app's allocation, so the memory
+ * requirements the app is given cover both (4 B + block bytes per texel). That is what makes this Pascal card run
+ * out: 588 ASTC textures of 3DMark Steel Nomad Light want 5.90 GiB decoded + 1.22 GiB of blocks, DEVICE_LOCAL
+ * allocations fail 119 times and 1.35 GiB spill into host memory. NVHAL_ASTC_BLOCKS_HOST / debug.nvhal.astc_blocks_host
+ * = 1 keeps the block images in one HAL-owned allocation per image instead, in HOST_VISIBLE system memory, and tells
+ * the app only what its decoded image needs. Everything else stays: the block images still follow the app image's
+ * barriers, the upload still copies the blocks into them and decodes from them, vkCmdCopyImageToBuffer still reads the
+ * compressed bits back out of them, and every refusal is unchanged. Sparse images and any allocation/bind failure keep
+ * the combined path. */
+#define BH_MAX_TYPES 32u /* VK_MAX_MEMORY_TYPES */
+
+struct bh_plan {
+    bool host;                      /* the HAL owns the block images' memory */
+    uint32_t type;                  /* that memory's type index */
+    VkDeviceSize size;              /* its size in bytes */
+    VkDeviceSize off[1 + MAX_MIPS]; /* [1 + m]: block image m's offset in it; [0] stays 0 */
+};
+
+/* the memory type for the block images: HOST_VISIBLE|HOST_COHERENT first and, within that, one that is *not*
+ * DEVICE_LOCAL (system RAM; on this driver the VRAM type is HOST_VISIBLE|HOST_COHERENT too, and a block image in it
+ * would save nothing), then any HOST_VISIBLE|HOST_COHERENT, then any HOST_VISIBLE; -1 when memoryTypeBits offers
+ * none (the caller keeps the combined path) */
+static int32_t bh_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t bits) {
+    static const VkMemoryPropertyFlags want[3] = {
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT};
+    for (unsigned k = 0; k < 3; k++)
+        for (uint32_t i = 0; i < mp->memoryTypeCount && i < BH_MAX_TYPES; i++) {
+            const VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
+            if (!(bits & (1u << i)) || (f & want[k]) != want[k]) continue;
+            if (k == 0 && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
+            return (int32_t)i;
+        }
+    return -1;
+}
+
+/* what the app is told: the decoded image alone in host mode, every part combined otherwise. off[0] is where the
+ * decoded image starts in the app's memory; the block images' off[] entries stay 0 in host mode (they are already
+ * bound there, so nothing binds them again). */
+static bool bh_requirements(const VkMemoryRequirements *parts, uint32_t n, bool host, bool sparse, VkDeviceSize *off,
+                            VkMemoryRequirements *out) {
+    return combine(parts, host ? 1u : n, host ? false : sparse, off, out);
+}
+
+/* decide once per image, before anything is allocated or bound: host mode when the switch is on, the image is not
+ * sparse, and one HOST_VISIBLE memory type fits every block image (packed exactly as combine() packs the parts) */
+static bool bh_plan_make(bool on, bool sparse, const VkMemoryRequirements *parts, uint32_t n,
+                         const VkPhysicalDeviceMemoryProperties *mp, struct bh_plan *pl) {
+    *pl = (struct bh_plan){0};
+    if (!on || sparse || n < 2) return false;
+    VkMemoryRequirements req;
+    if (!combine(parts + 1, n - 1, false, pl->off + 1, &req)) return false; /* no type is common to all block images */
+    const int32_t t = bh_type(mp, req.memoryTypeBits);
+    if (t < 0) return false;
+    pl->host = true;
+    pl->type = (uint32_t)t;
+    pl->size = req.size;
+    return true;
+}
+/* NVHAL_ASTC_BLOCK_HOST_END */
+
 /* f is an emulated compressed format the ICD does not support itself (*e: its description) */
 static bool icd_lacks(const struct nvhal_device *d, VkFormat f, struct efmt *e) {
     return efmt_get(f, e) && (!d->astc_pd || fam_state(d->astc_pd, e) != NVHAL_ASTC_NATIVE);
@@ -990,6 +1074,407 @@ static bool emulating(const struct nvhal_device *d, const struct efmt *e) {
 static const char *unavailable_why(const struct nvhal_device *d, const struct efmt *e) {
     const char *w = !d->astc_pd ? "" : e->fam == FAM_ASTC ? d->astc_pd->why : d->astc_pd->etc2_why;
     return w[0] ? w : "not set up";
+}
+
+/* --------------------------------------------------- the block-host switch (task-17) ----------------------------
+ * debug.nvhal.astc_blocks_host / NVHAL_ASTC_BLOCKS_HOST: 1 = the emulated compressed images' block images live in
+ * HAL-owned HOST_VISIBLE memory instead of behind the decoded image in the app's allocation (the bh_* block above is
+ * the decision). Read once per process, like the other debug switches: set it before the app starts. Off: one acquire
+ * load per emulated vkCreateImage, per vkAllocateMemory/vkFreeMemory, and per vkDestroyDevice. */
+static _Atomic int bh_state; /* 0 unprobed, 1 off, 2 on */
+static pthread_once_t bh_once = PTHREAD_ONCE_INIT;
+
+static void bh_init(void) {
+    char v[32] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.astc_blocks_host", v);
+#else
+    const char *e = getenv("NVHAL_ASTC_BLOCKS_HOST");
+    if (e) snprintf(v, sizeof v, "%s", e);
+#endif
+    const bool on = atoi(v) > 0;
+    atomic_store_explicit(&bh_state, on ? 2 : 1, memory_order_release);
+    if (on)
+        NVHAL_WARN("astc blocks host: ON (NVHAL_ASTC_BLOCKS_HOST / debug.nvhal.astc_blocks_host): each emulated "
+                   "compressed image's block images get a HAL-owned HOST_VISIBLE allocation, so the app's memory "
+                   "requirements cover the decoded image only; one summary line at vkDestroyDevice");
+}
+
+/* read once per process, like the other debug switches */
+static inline bool bh_on(void) {
+    int s = atomic_load_explicit(&bh_state, memory_order_acquire);
+    if (s == 0) {
+        pthread_once(&bh_once, bh_init);
+        s = atomic_load_explicit(&bh_state, memory_order_acquire);
+    }
+    return s == 2;
+}
+
+/* --------------------------------------------------- VkImage emulation byte accounting (opt-in, task-8) --------------
+ * An emulated compressed image costs VRAM twice over: the app's handle IS an ICD image of the decoded format
+ * (RGBA8 UNORM/SRGB or R16[G16], 4/2 bytes per texel) and beside it the HAL keeps one block image per mip level
+ * (one texel per block, 16 B for a 128-bit ASTC block, 8 B for a 64-bit ETC2/EAC block). This counts, for every
+ * image vkCreateImage emulates: how many bytes the app has to allocate (the memory requirements it is given - the
+ * decoded image plus every block image), what the same image in its native compressed format would have taken,
+ * and buckets the images by family and block size. Host: NVHAL_ASTC_BYTES. Guest: debug.nvhal.astc_bytes
+ * (window: NVHAL_ASTC_BYTES_WINDOW / debug.nvhal.astc_bytes.window, seconds, default 1.0, floor 0.1).
+ * Off by default: an emulated vkCreateImage then pays one acquire load and a not-taken branch, and
+ * vkDestroyDevice one acquire load. Independent of NVHAL_XLATE_STATS. */
+#define ABS_ASTC_BLOCK_BYTES 16u /* every ASTC LDR block is 128 bit */
+#define ABS_ETC2_BLOCK_BYTES 8u  /* every ETC2/EAC block is 64 bit */
+#define ABS_BUCKETS (NVHAL_ASTC_NUM_PARTITION_TABLES + ETC2_VARIANTS) /* ASTC block sizes, then ETC2/EAC variants */
+
+struct abs_bucket {
+    uint64_t n, decoded, block, native;
+};
+
+static struct {
+    pthread_mutex_t lock;
+    struct abs_bucket b[ABS_BUCKETS];
+    uint64_t n, refused;                 /* cumulative emulated + refused vkCreateImage */
+    uint64_t decoded, block, native, total; /* cumulative bytes: parts, native compressed, app-visible requ. */
+    uint64_t live, live_bytes;           /* emulated images alive right now and their app-visible bytes */
+    uint64_t printed;                    /* images + refusals at the last line, to skip idle windows */
+    uint64_t last_ns, window_ns;
+} abs_ = {.lock = PTHREAD_MUTEX_INITIALIZER, .window_ns = 1000000000ull};
+
+static _Atomic int abs_state; /* 0 unprobed, 1 off, 2 on */
+static pthread_once_t abs_once = PTHREAD_ONCE_INIT;
+
+static uint64_t abs_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+static void abs_init(void) {
+    char v[32] = "", w[32] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.astc_bytes", v);
+    __system_property_get("debug.nvhal.astc_bytes.window", w);
+#else
+    const char *e = getenv("NVHAL_ASTC_BYTES");
+    if (e) snprintf(v, sizeof v, "%s", e);
+    e = getenv("NVHAL_ASTC_BYTES_WINDOW");
+    if (e) snprintf(w, sizeof w, "%s", e);
+#endif
+    if (w[0]) {
+        const double s = atof(w);
+        if (s >= 0.1) abs_.window_ns = (uint64_t)(s * 1e9);
+    }
+    const bool on = atoi(v) > 0;
+    abs_.last_ns = abs_now();
+    atomic_store_explicit(&abs_state, on ? 2 : 1, memory_order_release);
+    if (on)
+        NVHAL_WARN("astc bytes: statistics ON (window %.2f s; NVHAL_ASTC_BYTES / debug.nvhal.astc_bytes): one line per "
+                   "window over the emulated compressed images, and the cumulative line at vkDestroyDevice",
+                   abs_.window_ns / 1e9);
+}
+
+/* read once per process, like the other debug switches: set it before the app starts */
+static inline bool abs_on(void) {
+    int s = atomic_load_explicit(&abs_state, memory_order_acquire);
+    if (s == 0) {
+        pthread_once(&abs_once, abs_init);
+        s = atomic_load_explicit(&abs_state, memory_order_acquire);
+    }
+    return s == 2;
+}
+
+static void abs_human(uint64_t bytes, char *out, size_t n) {
+    if (bytes >= (uint64_t)1 << 30) snprintf(out, n, "%.2f GiB", (double)bytes / (double)((uint64_t)1 << 30));
+    else snprintf(out, n, "%.1f MiB", (double)bytes / (double)(1u << 20));
+}
+
+static double abs_ratio(uint64_t a, uint64_t b) { return b ? (double)a / (double)b : 0.0; }
+
+/* "4x4 x812, 8x8 x30" / "RGBA8 x12"; empty when nothing was created (the caller prints "-") */
+static size_t abs_hist(char *out, size_t n, bool astc) {
+    const unsigned first = astc ? 0 : NVHAL_ASTC_NUM_PARTITION_TABLES;
+    const unsigned count = astc ? NVHAL_ASTC_NUM_PARTITION_TABLES : ETC2_VARIANTS;
+    size_t o = 0;
+    out[0] = 0;
+    for (unsigned i = 0; i < count; i++) {
+        const struct abs_bucket *x = &abs_.b[first + i];
+        if (!x->n) continue;
+        char one[48];
+        if (astc)
+            snprintf(one, sizeof one, "%ux%u x%" PRIu64, (unsigned)block_dims[i][0], (unsigned)block_dims[i][1], x->n);
+        else snprintf(one, sizeof one, "%s x%" PRIu64, etc2_variant_name[i], x->n);
+        const int written = snprintf(out + o, n - o, "%s%s", o ? ", " : "", one);
+        if (written < 0 || (size_t)written >= n - o) break;
+        o += (size_t)written;
+    }
+    return o;
+}
+
+/* one line per window, plus the cumulative one at vkDestroyDevice - reads abs_ under its lock */
+static void abs_report(bool final_) {
+    char ha[352], he[224], lb[32], tb[32], db[32], kb[32], nb[32];
+    pthread_mutex_lock(&abs_.lock);
+    const uint64_t now = abs_now();
+    if (!final_ && now - abs_.last_ns < abs_.window_ns) {
+        pthread_mutex_unlock(&abs_.lock);
+        return;
+    }
+    if (!final_ && abs_.n + abs_.refused == abs_.printed) { /* idle window: nothing to say */
+        pthread_mutex_unlock(&abs_.lock);
+        return;
+    }
+    const uint64_t n = abs_.n, refused = abs_.refused, live = abs_.live, live_bytes = abs_.live_bytes;
+    const uint64_t decoded = abs_.decoded, block = abs_.block, native = abs_.native, total = abs_.total;
+    const uint64_t fresh = n + refused - abs_.printed;
+    abs_.printed = n + refused;
+    abs_.last_ns = now;
+    if (!abs_hist(ha, sizeof ha, true)) snprintf(ha, sizeof ha, "-");
+    if (!abs_hist(he, sizeof he, false)) snprintf(he, sizeof he, "-");
+    pthread_mutex_unlock(&abs_.lock);
+    abs_human(live_bytes, lb, sizeof lb);
+    abs_human(total, tb, sizeof tb);
+    abs_human(decoded, db, sizeof db);
+    abs_human(block, kb, sizeof kb);
+    abs_human(native, nb, sizeof nb);
+    NVHAL_WARN("astc bytes[%s %.2f s]: +%" PRIu64 " emulated/refused image(s) (cumulative %" PRIu64 " emulated, %" PRIu64
+               " refused, %" PRIu64 " alive) | ASTC: %s | ETC2/EAC: %s | app-visible live %" PRIu64 " B (%s), "
+               "cumulative created %" PRIu64 " B (%s) = decoded %" PRIu64 " B (%s) + block images %" PRIu64 " B (%s); "
+               "native compressed %" PRIu64 " B (%s) -> %.1fx inflation (decoded alone %.1fx)",
+               final_ ? "cumulative at vkDestroyDevice" : "window", final_ ? 0.0 : (double)abs_.window_ns / 1e9, fresh, n,
+               refused, live, ha, he, live_bytes, lb, total, tb, decoded, db, block, kb, native, nb,
+               abs_ratio(total, native), abs_ratio(decoded, native));
+}
+
+/* an emulated image exists: ai->size[0] is the decoded image, size[1..mips] the block images (ICD requirements) */
+static void abs_add(const struct nvhal_astc_image *ai) {
+    const struct efmt *e = &ai->e;
+    const uint32_t blk = e->fam == FAM_ASTC ? ABS_ASTC_BLOCK_BYTES : ABS_ETC2_BLOCK_BYTES;
+    uint64_t native = 0, block = 0;
+    for (uint32_t m = 0; m < ai->mips; m++) {
+        const uint64_t bx = div_up(mip_dim(ai->extent.width, m), e->bw), by = div_up(mip_dim(ai->extent.height, m), e->bh);
+        native += bx * by * ai->layers * blk;
+        block += ai->size[1 + m];
+    }
+    pthread_mutex_lock(&abs_.lock);
+    struct abs_bucket *b = &abs_.b[e->cls];
+    b->n++;
+    b->decoded += ai->size[0];
+    b->block += block;
+    b->native += native;
+    abs_.n++;
+    abs_.decoded += ai->size[0];
+    abs_.block += block;
+    abs_.native += native;
+    abs_.total += ai->req.size;
+    abs_.live++;
+    abs_.live_bytes += ai->req.size;
+    pthread_mutex_unlock(&abs_.lock);
+    abs_report(false);
+}
+
+static void abs_del(const struct nvhal_astc_image *ai) {
+    pthread_mutex_lock(&abs_.lock);
+    if (abs_.live) abs_.live--;
+    abs_.live_bytes = abs_.live_bytes >= ai->req.size ? abs_.live_bytes - ai->req.size : 0;
+    pthread_mutex_unlock(&abs_.lock);
+}
+
+static void abs_refuse(void) {
+    pthread_mutex_lock(&abs_.lock);
+    abs_.refused++;
+    pthread_mutex_unlock(&abs_.lock);
+    abs_report(false);
+}
+
+/* the device (and with it every image of it) is gone: print the cumulative line and drop the live figures */
+static void abs_finish(void) {
+    if (!abs_on()) return;
+    abs_report(true);
+    pthread_mutex_lock(&abs_.lock);
+    abs_.live = 0;
+    abs_.live_bytes = 0;
+    pthread_mutex_unlock(&abs_.lock);
+}
+
+/* ---------------------------------------------------- block-host summary (task-17) -------------------------------
+ * With the switch on, one NVHAL_WARN line at vkDestroyDevice says what it changed: which memory type each emulated
+ * image's app memory ended up in (a VkDeviceMemory does not tell, so vkAllocateMemory's type is noted while the switch
+ * is on), how many bytes of block images the HAL holds itself, and the app-visible requirements on the other side.
+ * Off: the two allocation hooks cost one acquire load each. */
+struct bh_mem {
+    VkDeviceMemory mem;
+    uint32_t type;
+};
+
+static struct {
+    pthread_mutex_t lock;
+    struct bh_mem *e;            /* the app's live memories and their types (switch on only) */
+    uint32_t n, cap;
+    uint64_t hist[BH_MAX_TYPES]; /* emulated images per memoryTypeIndex of the memory they were bound to */
+    uint64_t unreported;         /* binds of memory this HAL never allocated */
+    uint64_t created;            /* emulated images created (cumulative) */
+    uint64_t host;               /* of those: with HAL-owned block images (cumulative) */
+    uint64_t fallback;           /* of those: the HAL-owned path failed and the combined one was used */
+    uint64_t app_live, app_total;
+    uint64_t host_live, host_total; /* bytes of HAL-owned block memory */
+} bhs_ = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+/* ahb.c: vkAllocateMemory handed this VkDeviceMemory to the app */
+void nvhal_astc_mem_note(VkDeviceMemory mem, uint32_t type) {
+    if (mem == VK_NULL_HANDLE || type >= BH_MAX_TYPES || !bh_on()) return;
+    pthread_mutex_lock(&bhs_.lock);
+    for (uint32_t i = 0; i < bhs_.n; i++)
+        if (bhs_.e[i].mem == mem) {
+            bhs_.e[i].type = type;
+            pthread_mutex_unlock(&bhs_.lock);
+            return;
+        }
+    if (bhs_.n == bhs_.cap) {
+        const uint32_t cap = bhs_.cap ? bhs_.cap * 2 : 512;
+        struct bh_mem *e = realloc(bhs_.e, cap * sizeof *e);
+        if (!e) { /* diagnostics only: the histogram then counts this memory as unreported */
+            pthread_mutex_unlock(&bhs_.lock);
+            return;
+        }
+        bhs_.e = e;
+        bhs_.cap = cap;
+    }
+    bhs_.e[bhs_.n++] = (struct bh_mem){mem, type};
+    pthread_mutex_unlock(&bhs_.lock);
+}
+
+/* ahb.c: vkFreeMemory */
+void nvhal_astc_mem_forget(VkDeviceMemory mem) {
+    if (mem == VK_NULL_HANDLE || !bh_on()) return;
+    pthread_mutex_lock(&bhs_.lock);
+    for (uint32_t i = 0; i < bhs_.n; i++)
+        if (bhs_.e[i].mem == mem) {
+            bhs_.e[i] = bhs_.e[--bhs_.n];
+            break;
+        }
+    pthread_mutex_unlock(&bhs_.lock);
+}
+
+/* the app bound an emulated image to this memory: one histogram entry */
+static void bh_bound(VkDeviceMemory mem) {
+    pthread_mutex_lock(&bhs_.lock);
+    bool known = false;
+    uint32_t type = 0;
+    for (uint32_t i = 0; i < bhs_.n && !known; i++)
+        if (bhs_.e[i].mem == mem) {
+            type = bhs_.e[i].type;
+            known = true;
+        }
+    if (known) bhs_.hist[type]++;
+    else bhs_.unreported++;
+    pthread_mutex_unlock(&bhs_.lock);
+}
+
+static void bh_live_add(const struct nvhal_astc_image *ai) {
+    pthread_mutex_lock(&bhs_.lock);
+    bhs_.created++;
+    bhs_.app_live += ai->req.size;
+    bhs_.app_total += ai->req.size;
+    if (ai->blocks_host) {
+        bhs_.host++;
+        bhs_.host_live += ai->blocks_size;
+        bhs_.host_total += ai->blocks_size;
+    }
+    pthread_mutex_unlock(&bhs_.lock);
+}
+
+static void bh_live_del(const struct nvhal_astc_image *ai) {
+    pthread_mutex_lock(&bhs_.lock);
+    bhs_.app_live = bhs_.app_live >= ai->req.size ? bhs_.app_live - ai->req.size : 0;
+    if (ai->blocks_host) bhs_.host_live = bhs_.host_live >= ai->blocks_size ? bhs_.host_live - ai->blocks_size : 0;
+    pthread_mutex_unlock(&bhs_.lock);
+}
+
+static void bh_fallback(void) {
+    pthread_mutex_lock(&bhs_.lock);
+    bhs_.fallback++;
+    pthread_mutex_unlock(&bhs_.lock);
+}
+
+/* "type 0 x512, type 3 x3"; empty when nothing was bound. Caller holds bhs_.lock. */
+static size_t bh_hist_str(char *out, size_t n) {
+    size_t o = 0;
+    out[0] = 0;
+    for (uint32_t t = 0; t < BH_MAX_TYPES; t++) {
+        if (!bhs_.hist[t]) continue;
+        const int w = snprintf(out + o, n - o, "%stype %u x%" PRIu64, o ? ", " : "", t, bhs_.hist[t]);
+        if (w < 0 || (size_t)w >= n - o) break;
+        o += (size_t)w;
+    }
+    return o;
+}
+
+/* the one summary line, at vkDestroyDevice; silent when no image was emulated */
+static void bh_report(void) {
+    if (!bh_on()) return;
+    char hist[320], al[32], at[32], hb[32], ht[32];
+    pthread_mutex_lock(&bhs_.lock);
+    if (!bhs_.created) {
+        pthread_mutex_unlock(&bhs_.lock);
+        return;
+    }
+    const uint64_t created = bhs_.created, host = bhs_.host, fallback = bhs_.fallback, unreported = bhs_.unreported;
+    const uint64_t app_live = bhs_.app_live, app_total = bhs_.app_total;
+    const uint64_t host_live = bhs_.host_live, host_total = bhs_.host_total;
+    if (!bh_hist_str(hist, sizeof hist)) snprintf(hist, sizeof hist, "-");
+    pthread_mutex_unlock(&bhs_.lock);
+    abs_human(app_live, al, sizeof al);
+    abs_human(app_total, at, sizeof at);
+    abs_human(host_live, hb, sizeof hb);
+    abs_human(host_total, ht, sizeof ht);
+    NVHAL_WARN("astc blocks host summary at vkDestroyDevice: %" PRIu64 " emulated image(s) created, %" PRIu64 " with "
+               "HAL-owned block images (%" PRIu64 " B (%s) alive, %" PRIu64 " B (%s) cumulative), %" PRIu64 " fell back "
+               "to the combined allocation; app-visible requirements %" PRIu64 " B (%s) alive, %" PRIu64 " B (%s) "
+               "cumulative (decoded images only); bind memoryTypeIndex histogram: %s; %" PRIu64 " bind(s) of memory this "
+               "HAL did not allocate",
+               created, host, host_live, hb, host_total, ht, fallback, app_live, al, app_total, at, hist, unreported);
+}
+
+/* switch=1: bind the block images into one HAL-owned HOST_VISIBLE allocation (bp: layout and type, decided by
+ * bh_plan_make() before anything was allocated). 1 = done; 0 = not usable, the block images have been recreated
+ * unbound so the combined path can bind them (logged); -1 = hard failure, *r set. */
+static int blocks_bind_host(struct nvhal_device *d, struct nvhal_astc_image *ai, const struct bh_plan *bp,
+                            const struct astc_cis *c, const char **step, VkResult *r) {
+    VkDevice dev = d->handle;
+    *step = "vkAllocateMemory(block images in HAL-owned host memory)";
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, bp->size, bp->type};
+    VkResult ar = d->AllocateMemory(dev, &mai, NULL, &ai->blocks_mem);
+    if (ar == VK_SUCCESS) {
+        *step = "vkBindImageMemory(block images in HAL-owned host memory)";
+        for (uint32_t m = 0; m < c->mips; m++) {
+            ar = d->xl.BindImageMemory(dev, ai->block[m], ai->blocks_mem, bp->off[1 + m]);
+            if (ar != VK_SUCCESS) break;
+        }
+    }
+    if (ar == VK_SUCCESS) return 1;
+    NVHAL_ERR("vkCreateImage(compressed-format emulation): the block images could not be placed in HAL-owned host "
+              "memory (%llu B, memoryTypeIndex %u, %u image(s)): %s at %s -> falling back to the combined allocation "
+              "(the app's memory covers the block images again) %s",
+              (unsigned long long)bp->size, bp->type, c->mips, NVHAL_VKR(ar), *step, gap(&c->e));
+    bh_fallback();
+    /* nothing bound now, but a bound image cannot be rebound and a partly bound set cannot be completed: recreate
+     * them all unbound, so the combined path can bind them wherever the app's memory is */
+    if (ai->blocks_mem) {
+        d->FreeMemory(dev, ai->blocks_mem, NULL);
+        ai->blocks_mem = VK_NULL_HANDLE;
+    }
+    for (uint32_t m = 0; m < MAX_MIPS; m++)
+        if (ai->block[m]) {
+            d->DestroyImage(dev, ai->block[m], NULL);
+            ai->block[m] = VK_NULL_HANDLE;
+        }
+    for (uint32_t m = 0; m < c->mips; m++) {
+        *step = "vkCreateImage(block image, after the HAL-owned binding failed)";
+        const VkResult cr = d->CreateImage(dev, &c->block[m], NULL, &ai->block[m]);
+        if (cr != VK_SUCCESS) {
+            *r = cr;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static void destroy_parts(struct nvhal_device *d, struct nvhal_astc_image *ai, const VkAllocationCallbacks *alloc,
@@ -1004,7 +1489,9 @@ static void destroy_parts(struct nvhal_device *d, struct nvhal_astc_image *ai, c
     if (d->astc) pthread_mutex_unlock(&d->astc->lock);
     for (uint32_t m = 0; m < MAX_MIPS; m++)
         if (ai->block[m]) d->DestroyImage(d->handle, ai->block[m], NULL);
+    if (ai->blocks_mem) d->FreeMemory(d->handle, ai->blocks_mem, NULL); /* task-17: the block images' own memory */
     if (app_image && ai->image) d->DestroyImage(d->handle, ai->image, alloc);
+    if (ai->counted) bh_live_del(ai);
     free(ai->slots);
     free(ai);
 }
@@ -1018,12 +1505,16 @@ bool nvhal_astc_CreateImage(struct nvhal_device *d, const VkImageCreateInfo *ci,
         NVHAL_ERR("%s: VkFormat %d is %s, which the ICD does not support, and this device has no %s emulation (%s) %s -> "
                   "VK_ERROR_FORMAT_NOT_SUPPORTED", who, ci->format, fam_name(&e), fam_name(&e), unavailable_why(d, &e),
                   gap(&e));
+        if (__builtin_expect(abs_on(), 0)) abs_refuse();
         *r = VK_ERROR_FORMAT_NOT_SUPPORTED;
         return true;
     }
     struct astc_cis c;
     *r = build_cis(d->astc_pd, ci, &c, who);
-    if (*r != VK_SUCCESS) return true;
+    if (*r != VK_SUCCESS) {
+        if (__builtin_expect(abs_on(), 0)) abs_refuse();
+        return true;
+    }
     struct nvhal_astc_image *ai = calloc(1, sizeof *ai);
     if (!ai) {
         *r = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1047,6 +1538,8 @@ bool nvhal_astc_CreateImage(struct nvhal_device *d, const VkImageCreateInfo *ci,
         *r = d->CreateImage(dev, &c.block[m], NULL, &ai->block[m]);
     }
     VkMemoryRequirements parts[1 + MAX_MIPS];
+    struct bh_plan bp;
+    bool host = false; /* task-17: the block images are in HAL-owned host memory */
     if (*r == VK_SUCCESS) {
         d->xl.GetImageMemoryRequirements(dev, ai->image, &parts[0]);
         for (uint32_t m = 0; m < c.mips; m++) d->xl.GetImageMemoryRequirements(dev, ai->block[m], &parts[1 + m]);
@@ -1067,9 +1560,23 @@ bool nvhal_astc_CreateImage(struct nvhal_device *d, const VkImageCreateInfo *ci,
         }
         ai->sparse = (ci->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0;
         for (uint32_t i = 0; i <= c.mips; i++) ai->size[i] = parts[i].size;
-        if (*r == VK_SUCCESS && !combine(parts, 1 + c.mips, ai->sparse, ai->off, &ai->req)) {
-            step = "memory requirements (no memory type fits the decoded image and the block images)";
-            *r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if (*r == VK_SUCCESS) {
+            /* decided before anything is allocated: on the switch, the image not being sparse, and one HOST_VISIBLE
+             * memory type fitting every block image (bh_plan_make) */
+            host = bh_plan_make(bh_on(), ai->sparse, parts, 1 + c.mips, &d->mem_props, &bp);
+            if (host) {
+                const int hb = blocks_bind_host(d, ai, &bp, &c, &step, r); /* -1: *r is set */
+                host = hb > 0;
+            }
+            if (*r == VK_SUCCESS && !bh_requirements(parts, 1 + c.mips, host, ai->sparse, ai->off, &ai->req)) {
+                step = "memory requirements (no memory type fits the decoded image and the block images)";
+                *r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+            }
+            if (host) {
+                ai->blocks_host = true;
+                ai->blocks_size = bp.size;
+                ai->blocks_type = bp.type;
+            }
         }
     }
     if (*r == VK_SUCCESS && !nvhal_hash_put(&images, NVHAL_ND_U64(ai->image), ai)) {
@@ -1077,16 +1584,24 @@ bool nvhal_astc_CreateImage(struct nvhal_device *d, const VkImageCreateInfo *ci,
         *r = VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     if (*r != VK_SUCCESS) {
+        if (__builtin_expect(abs_on(), 0)) abs_refuse();
         NVHAL_ERR("%s: VkFormat %d %ux%u: %s -> %s %s", who, ci->format, ci->extent.width, ci->extent.height, step,
                   NVHAL_VKR(*r), gap(&c.e));
         destroy_parts(d, ai, alloc, true);
         return true;
     }
     atomic_fetch_add_explicit(&n_images, 1, memory_order_release);
+    if (__builtin_expect(abs_on(), 0)) abs_add(ai); /* opt-in byte accounting (task-8) */
+    if (bh_on()) { /* task-17: the summary line's live figures; off = one acquire load */
+        ai->counted = true;
+        bh_live_add(ai);
+    }
     NVHAL_TRACE("%s: VkImage %p (VkFormat %d) = VkFormat %d %ux%u, %u mip(s), %u layer(s) + %u block image(s); memory "
-                "%llu B (decoded image %llu B), alignment %llu, types 0x%x", who, NVHAL_LOGH(ai->image), ci->format,
-                c.e.decoded, ci->extent.width, ci->extent.height, ai->mips, ai->layers, ai->mips, (unsigned long long)ai->req.size,
-                (unsigned long long)parts[0].size, (unsigned long long)ai->req.alignment, ai->req.memoryTypeBits);
+                "%llu B (decoded image %llu B), alignment %llu, types 0x%x; block images in %s", who,
+                NVHAL_LOGH(ai->image), ci->format, c.e.decoded, ci->extent.width, ci->extent.height, ai->mips, ai->layers,
+                ai->mips, (unsigned long long)ai->req.size, (unsigned long long)parts[0].size,
+                (unsigned long long)ai->req.alignment, ai->req.memoryTypeBits,
+                ai->blocks_host ? "HAL-owned host memory" : "the app's allocation");
     *pImage = ai->image;
     return true;
 }
@@ -1096,6 +1611,7 @@ bool nvhal_astc_DestroyImage(struct nvhal_device *d, VkImage image, const VkAllo
     struct nvhal_astc_image *ai = nvhal_hash_del(&images, NVHAL_ND_U64(image));
     if (!ai) return false;
     atomic_fetch_sub_explicit(&n_images, 1, memory_order_release);
+    if (__builtin_expect(abs_on(), 0)) abs_del(ai);
     destroy_parts(d, ai, alloc, true);
     return true;
 }
@@ -1147,8 +1663,13 @@ bool nvhal_astc_ci_requirements(struct nvhal_device *d, const VkImageCreateInfo 
         f(d->handle, &q, &m2);
         parts[i] = m2.memoryRequirements;
     }
+    /* the same decision vkCreateImage will take (bh_plan_make + bh_requirements), so the requirements an app queries
+     * from a create info match the ones it gets from the image */
+    const bool sparse = (ci->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0;
+    struct bh_plan bp;
+    const bool host = bh_plan_make(bh_on(), sparse, parts, 1 + c.mips, &d->mem_props, &bp);
     VkMemoryRequirements req;
-    if (!combine(parts, 1 + c.mips, (ci->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0, off, &req)) {
+    if (!bh_requirements(parts, 1 + c.mips, host, sparse, off, &req)) {
         NVHAL_ERR("%s: VkFormat %d: no memory type fits the decoded image and the block images %s", who, ci->format,
                   gap(&e));
         return true;
@@ -1162,6 +1683,14 @@ VkResult nvhal_astc_bind1(struct nvhal_device *d, VkImage image, VkDeviceMemory 
     *handled = ai != NULL;
     if (!ai) return VK_SUCCESS;
     VkResult r = d->xl.BindImageMemory(d->handle, image, mem, offset + ai->off[0]);
+    if (r == VK_SUCCESS && bh_on()) bh_bound(mem); /* task-17: the summary's memoryTypeIndex histogram */
+    if (ai->blocks_host) { /* already bound in the HAL's own memory (task-17): only the app's image is left */
+        if (r != VK_SUCCESS)
+            NVHAL_ERR("vkBindImageMemory: emulated compressed image %p at memory %p offset %llu -> %s (its block images "
+                      "are in the HAL's own memory) %s", NVHAL_LOGH(image), NVHAL_LOGH(mem), (unsigned long long)offset,
+                      NVHAL_VKR(r), gap(&ai->e));
+        return r;
+    }
     for (uint32_t m = 0; m < ai->mips && r == VK_SUCCESS; m++)
         r = d->xl.BindImageMemory(d->handle, ai->block[m], mem, offset + ai->off[1 + m]);
     if (r != VK_SUCCESS)
@@ -1174,10 +1703,13 @@ VkResult nvhal_astc_expand_binds(uint32_t n, const VkBindImageMemoryInfo *in, Vk
     *out = (VkBindImageMemoryInfo *)in;
     *nout = n;
     if (nvhal_no_astc()) return VK_SUCCESS;
+    /* task-17: a host-mode image's block images are already bound in the HAL's own memory, so they add nothing here */
+    const bool hist = bh_on();
     uint32_t extra = 0;
     for (uint32_t i = 0; i < n; i++) {
         struct nvhal_astc_image *ai = lookup(in[i].image);
-        if (ai) extra += ai->mips;
+        if (ai) extra += ai->blocks_host ? 0 : ai->mips;
+        if (ai && hist) bh_bound(in[i].memory);
     }
     if (!extra) return VK_SUCCESS;
     VkBindImageMemoryInfo *o = malloc((n + extra) * sizeof *o);
@@ -1186,7 +1718,7 @@ VkResult nvhal_astc_expand_binds(uint32_t n, const VkBindImageMemoryInfo *in, Vk
     for (uint32_t i = 0; i < n; i++) {
         o[k++] = in[i];
         struct nvhal_astc_image *ai = lookup(in[i].image);
-        for (uint32_t m = 0; ai && m < ai->mips; m++)
+        for (uint32_t m = 0; ai && !ai->blocks_host && m < ai->mips; m++)
             o[k++] = (VkBindImageMemoryInfo){VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, NULL, ai->block[m], in[i].memory,
                                              in[i].memoryOffset + ai->off[1 + m]};
     }
@@ -1288,8 +1820,9 @@ VkResult nvhal_astc_bind_sparse(uint32_t n, const VkBindSparseInfo *in, VkBindSp
         for (uint32_t k = 0; k < in[i].imageOpaqueBindCount; k++) {
             const VkSparseImageOpaqueMemoryBindInfo *b = &in[i].pImageOpaqueBinds[k];
             struct nvhal_astc_image *ai = lookup(b->image);
-            ninfo += ai ? 1 + ai->mips : 1;
-            nbind += ai ? (1 + ai->mips) * b->bindCount : 0;
+            const uint32_t nparts = ai && !ai->blocks_host ? 1 + ai->mips : 1; /* task-17: host blocks are bound */
+            ninfo += nparts;
+            nbind += ai ? nparts * b->bindCount : 0;
         }
         if (ninfo == in[i].imageOpaqueBindCount && !nbind) continue;
         VkSparseImageOpaqueMemoryBindInfo *infos = malloc(ninfo * sizeof *infos + nbind * sizeof(VkSparseMemoryBind));
@@ -1310,7 +1843,8 @@ VkResult nvhal_astc_bind_sparse(uint32_t n, const VkBindSparseInfo *in, VkBindSp
                 infos[ni++] = *b;
                 continue;
             }
-            for (uint32_t part = 0; part <= ai->mips; part++) {
+            const uint32_t nparts = ai->blocks_host ? 1u : 1 + ai->mips; /* host blocks are already bound (task-17) */
+            for (uint32_t part = 0; part < nparts; part++) {
                 const VkDeviceSize ps = ai->off[part], pe = ps + ai->size[part];
                 VkSparseImageOpaqueMemoryBindInfo *t = &infos[ni++];
                 *t = (VkSparseImageOpaqueMemoryBindInfo){part ? ai->block[part - 1] : ai->image, 0, binds};
@@ -1735,6 +2269,8 @@ static void leaked_image(void *v) {
 }
 
 void nvhal_astc_device_teardown(struct nvhal_device *d) {
+    abs_finish(); /* the cumulative compressed-format asset line; no-op unless NVHAL_ASTC_BYTES is on */
+    bh_report();  /* task-17: one line when astc_blocks_host is on and something was emulated */
     struct nvhal_astc_dev *a = d->astc;
     if (!a) return;
     nvhal_hash_sweep(&images, of_device, d, leaked_image);

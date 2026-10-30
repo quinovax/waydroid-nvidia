@@ -135,6 +135,7 @@ struct gt_rec {
     uint32_t draws;   /* render pass: draws recorded in it (inline or via secondaries) */
     VkPipeline pipe;  /* draw/dispatch: bound pipeline; render pass: the first pipeline drawn with */
     uint64_t rp;      /* render pass handle (0: dynamic rendering) */
+    uint64_t rpkey;   /* draw/clear: aggregation key of the render pass instance it was recorded in */
     uint8_t ssbo_n, ssbo_sys; /* dispatch: storage buffers in the bound compute sets, and those not in DEVICE_LOCAL memory */
     uint8_t ssbo_type;        /* dispatch: memory type index of the first non-DEVICE_LOCAL storage buffer */
 };
@@ -380,10 +381,21 @@ static uint64_t mix(uint64_t h, uint64_t v) {
     return h;
 }
 
+/* the aggregation key of a render-pass record; the per-draw distribution and stat_add() must agree,
+ * so both come through here */
+static uint64_t rp_key(uint64_t rp, uint32_t w, uint32_t h, VkPipeline pipe, uint8_t op) {
+    uint64_t key = mix(0, GK_RP);
+    key = mix(key, rp);
+    key = mix(key, w);
+    key = mix(key, h);
+    key = mix(key, (uint64_t)pipe);
+    return mix(key, op);
+}
+
 static void stat_add(struct nvhal_gt_dev *g, const struct gt_rec *r, uint64_t ns) {
     uint64_t key = mix(0, r->kind);
     switch (r->kind) {
-    case GK_RP: key = mix(mix(mix(mix(mix(key, r->rp), r->w), r->h), (uint64_t)r->pipe), r->op); break;
+    case GK_RP: key = rp_key(r->rp, r->w, r->h, r->pipe, r->op); break;
     case GK_DRAW: case GK_CLEAR_ATT: case GK_DISPATCH: key = mix(key, (uint64_t)r->pipe); break;
     case GK_XFER: key = mix(key, r->op); break;
     default: break;
@@ -428,6 +440,101 @@ static void emit(FILE *f, const char *fmt, ...) {
     va_end(ap);
     nvhal_log(NVHAL_LVL_INFO, "gputime: %s", buf);
     if (f) fprintf(f, "%s\n", buf);
+}
+
+/* ---- shape of the per-draw costs (gputime level 2) ----
+ * after_draw() writes one bottom-of-pipe timestamp per draw inside an inline render pass; the stat table
+ * below only aggregates those by pipeline (total / count / max). This keeps the actual shape per render
+ * pass instance: min / p50 / p90 / max plus a histogram, so "every draw costs ~168 us" can be told apart
+ * from "a few draws are very expensive". Reset with the rest of the window. */
+#define RPD_TAB 64u
+#define RPD_HB 40u /* 32 linear buckets of 16 us up to 512 us, then 8 logarithmic ones */
+struct rpd_entry {
+    uint64_t key, n, ns_sum, min_ns, max_ns;
+    uint32_t hist[RPD_HB];
+};
+static struct rpd_entry rpd_tab[RPD_TAB];
+static pthread_mutex_t rpd_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t rpd_bucket(uint64_t ns) {
+    uint64_t us = ns / 1000;
+    if (us < 512) return (uint32_t)(us >> 4);
+    if (us < 1024) return 32;
+    if (us < 2048) return 33;
+    if (us < 4096) return 34;
+    if (us < 8192) return 35;
+    if (us < 16384) return 36;
+    if (us < 32768) return 37;
+    if (us < 65536) return 38;
+    return 39;
+}
+static void rpd_label(uint32_t b, char *o, size_t n) {
+    static const unsigned lo[9] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 0};
+    if (b < 32) snprintf(o, n, "%u-%uus", b * 16u, (b + 1u) * 16u);
+    else if (b < 39) snprintf(o, n, "%u-%uus", lo[b - 32], lo[b - 31]);
+    else snprintf(o, n, ">65536us");
+}
+static void rpd_add(uint64_t key, uint64_t ns) {
+    if (!key) key = 1;
+    pthread_mutex_lock(&rpd_mu);
+    uint32_t i = (uint32_t)(key ^ (key >> 29)) & (RPD_TAB - 1);
+    for (uint32_t probe = 0; probe < RPD_TAB; probe++, i = (i + 1) & (RPD_TAB - 1)) {
+        struct rpd_entry *e = &rpd_tab[i];
+        if (e->key != key && e->key) continue;
+        if (!e->key) {
+            memset(e, 0, sizeof *e);
+            e->key = key;
+            e->min_ns = UINT64_MAX;
+        }
+        e->n++;
+        e->ns_sum += ns;
+        if (ns < e->min_ns) e->min_ns = ns;
+        if (ns > e->max_ns) e->max_ns = ns;
+        e->hist[rpd_bucket(ns)]++;
+        break;
+    }
+    pthread_mutex_unlock(&rpd_mu);
+}
+static void rpd_report(FILE *f, double fr) {
+    struct rpd_entry v[16];
+    uint32_t n = 0, dropped = 0;
+    pthread_mutex_lock(&rpd_mu);
+    for (uint32_t i = 0; i < RPD_TAB; i++) {
+        if (!rpd_tab[i].key || !rpd_tab[i].n) continue;
+        if (n < 16) v[n++] = rpd_tab[i];
+        else dropped++;
+    }
+    memset(rpd_tab, 0, sizeof rpd_tab);
+    pthread_mutex_unlock(&rpd_mu);
+    if (!n) return;
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t j = i + 1; j < n; j++)
+            if (v[j].n > v[i].n) { struct rpd_entry t = v[i]; v[i] = v[j]; v[j] = t; }
+    for (uint32_t i = 0; i < n; i++) {
+        const struct rpd_entry *e = &v[i];
+        uint64_t acc = 0, half = e->n / 2, p90 = (e->n * 9) / 10;
+        char p50[28] = "?", p90s[28] = "?", hist[512] = "";
+        uint32_t hn = 0;
+        size_t hl = 0;
+        for (uint32_t b = 0; b < RPD_HB; b++) {
+            if (!e->hist[b]) continue;
+            acc += e->hist[b];
+            if (p50[0] == '?' && acc > half) rpd_label(b, p50, sizeof p50);
+            if (p90s[0] == '?' && acc >= p90) rpd_label(b, p90s, sizeof p90s);
+            if (hn < 10 && hl + 1 < sizeof hist) {
+                char lab[28];
+                int w;
+                rpd_label(b, lab, sizeof lab);
+                w = snprintf(hist + hl, sizeof hist - hl, "%s%s:%u", hn ? " " : "", lab, e->hist[b]);
+                if (w > 0) hl += (size_t)w < sizeof hist - hl ? (size_t)w : sizeof hist - hl - 1;
+                hn++;
+            }
+        }
+        emit(f, "DRAW-DIST rp=%016" PRIx64 " n=%.0f/frame avg=%.1f us min=%.1f p50=%s p90=%s max=%.1f us  hist[%s]",
+             e->key, (double)e->n / fr, (double)e->ns_sum / 1000.0 / (double)e->n, (double)e->min_ns / 1000.0, p50, p90s,
+             (double)e->max_ns / 1000.0, hist);
+    }
+    if (dropped) emit(f, "DRAW-DIST: %u further render pass(es) with draws not shown", dropped);
 }
 
 /* under g->mu */
@@ -496,6 +603,7 @@ static void report(struct nvhal_gt_dev *g, uint64_t t) {
         }
         free(v);
     }
+    rpd_report(f, fr);
     if (f) fclose(f);
     memset(g->tab, 0, GT_TAB * sizeof *g->tab);
     g->ntab = 0;
@@ -547,6 +655,7 @@ static void harvest(struct nvhal_gt_cb *c) {
         const struct gt_rec *r = &c->rec[i];
         if (!AV(r->qs) || !AV(r->qe) || TS(r->qe) < TS(r->qs)) continue;
         stat_add(g, r, TS(r->qe) - TS(r->qs));
+        if (r->kind == GK_DRAW || r->kind == GK_CLEAR_ATT) rpd_add(r->rpkey, TS(r->qe) - TS(r->qs));
     }
     if (hi > lo) {
         if (g->niv == g->capiv) {
@@ -765,6 +874,7 @@ static void after_draw(struct nvhal_gt_cb *c, VkCommandBuffer cb, uint8_t kind) 
     r->qe = qe;
     r->kind = kind;
     r->pipe = kind == GK_DRAW ? c->gfx : VK_NULL_HANDLE;
+    r->rpkey = rp_key(rp->rp, rp->w, rp->h, rp->pipe, rp->op);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL gt_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo *ai,
@@ -1161,36 +1271,313 @@ PFN_vkVoidFunction nvhal_gt_wrap(struct nvhal_device *d, const char *name, PFN_v
 
 /* ------------------------------------------------------------------ EXPERIMENT: host-visible sysmem -> BAR */
 
-/* Diagnostic only, never on unless debug.nvhal.exp.hostvis_to_bar=1 (NVHAL_EXP_HOSTVIS_TO_BAR=1 on the host) when the
- * device is created: a plain vkAllocateMemory (no import/export) of a type that is HOST_VISIBLE, not HOST_CACHED and
- * not DEVICE_LOCAL is made from the type whose flags are the same plus DEVICE_LOCAL, i.e. the resizable-BAR window of
- * VRAM. The app still sees the type it asked for. It exists to prove (A/B) that a GPU-heavy buffer placed in system
- * memory by the GLES layer is the cost; the fix belongs where the memory type is chosen (ANGLE). */
-void nvhal_exp_mem_init(struct nvhal_device *d) {
-    char v[96] = "";
+/* Diagnostic only, never on unless a switch below is set when the device is created. A plain vkAllocateMemory (no
+ * import/export) of the chosen type is made from another type; the app still sees the type it asked for.
+ *
+ *   debug.nvhal.exp.hostvis_to_bar (host NVHAL_EXP_HOSTVIS_TO_BAR)
+ *     1  the original narrow rule: a type that is HOST_VISIBLE, not HOST_CACHED and not DEVICE_LOCAL is made from
+ *        the type whose flags are the same plus DEVICE_LOCAL, i.e. the resizable-BAR window of VRAM.
+ *     2  every type that lacks DEVICE_LOCAL is made from the closest DEVICE_LOCAL type (flags equal to the app's
+ *        plus DEVICE_LOCAL first, otherwise the most property bits in common). Types whose semantics must not be
+ *        changed - LAZILY_ALLOCATED and PROTECTED - are left alone in both modes. On Pascal the device-local
+ *        window is usually ~256 MiB, so level 2 is expected to run into VK_ERROR_OUT_OF_DEVICE_MEMORY: that is a
+ *        useful answer too, and the default path is untouched either way.
+ *   debug.nvhal.exp.memtypes (host NVHAL_EXP_MEMTYPES)
+ *     only print the memory type/heap table, remap nothing; the same table is printed when hostvis_to_bar is on.
+ *
+ * It exists to prove (A/B) that a GPU-heavy buffer placed in system memory by the GLES layer is the cost; the fix
+ * belongs where the memory type is chosen (ANGLE). This file only fills d->mem_remap[]; the allocation hook that
+ * reads it is nvhal_exp_mem_remap() below, called from ahb.c's vkAllocateMemory. */
+/* The switch's own value, read once per device: 1 = the original narrow rule, 2 = every type that lacks
+ * DEVICE_LOCAL. Anything > 2 is treated as 2. Returns 0 when the experiment is off. */
+static int exp_level(char *out, size_t n) {
 #ifdef __ANDROID__
-    __system_property_get("debug.nvhal.exp.hostvis_to_bar", v);
+    (void)n;
+    __system_property_get("debug.nvhal.exp.hostvis_to_bar", out);
 #else
     const char *e = getenv("NVHAL_EXP_HOSTVIS_TO_BAR");
+    if (e) snprintf(out, n, "%s", e);
+#endif
+    int lvl = atoi(out);
+    if (lvl > 2) lvl = 2;
+    return lvl > 0 ? lvl : 0;
+}
+
+/* debug.nvhal.exp.memtypes (host NVHAL_EXP_MEMTYPES): print the memory table and remap nothing. */
+static bool exp_table_wanted(void) {
+    char v[96] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.exp.memtypes", v);
+#else
+    const char *e = getenv("NVHAL_EXP_MEMTYPES");
     if (e) snprintf(v, sizeof v, "%s", e);
 #endif
-    if (atoi(v) <= 0) return;
+    return atoi(v) > 0;
+}
+
+/* debug.nvhal.exp.memtype_target (host NVHAL_EXP_MEMTYPE_TARGET), -1 = off: point every allocation whose type
+ * lacks DEVICE_LOCAL at exactly this type index, so an A/B run can measure one type at a time (task-14). Takes
+ * priority over hostvis_to_bar and hostvis_cached. */
+static int exp_target(void) {
+    char v[64] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.exp.memtype_target", v);
+#else
+    const char *e = getenv("NVHAL_EXP_MEMTYPE_TARGET");
+    if (e) snprintf(v, sizeof v, "%s", e);
+#endif
+    return v[0] ? atoi(v) : -1;
+}
+
+/* debug.nvhal.exp.hostvis_cached (host NVHAL_EXP_HOSTVIS_CACHED): 1 = move HOST_VISIBLE|HOST_COHERENT
+ * allocations (map-able system memory the GPU reads over PCIe) to the HOST_CACHED type of the same heap. */
+static bool exp_cached_wanted(void) {
+    char v[64] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.exp.hostvis_cached", v);
+#else
+    const char *e = getenv("NVHAL_EXP_HOSTVIS_CACHED");
+    if (e) snprintf(v, sizeof v, "%s", e);
+#endif
+    return atoi(v) > 0;
+}
+
+/* The per-allocation src -> dst summary printed at vkDestroyDevice: one entry per remapped source type. */
+#define ER_MAX 32u
+struct er_pair {
+    uint8_t src, dst, mode;
+    uint64_t n, bytes;
+};
+static struct er_pair er_pairs[ER_MAX];
+static uint32_t er_npairs;
+static uint8_t er_mode;
+static pthread_mutex_t er_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *er_mode_name(uint8_t m) {
+    return m == 1 ? "debug.nvhal.exp.memtype_target"
+         : m == 2 ? "debug.nvhal.exp.hostvis_cached"
+                  : "debug.nvhal.exp.hostvis_to_bar";
+}
+
+/* ahb.c calls this from the two vkAllocateMemory paths that can carry a remapped type. Off = one load. */
+void nvhal_exp_mem_remap_note(struct nvhal_device *d, uint32_t app_type, uint64_t bytes, VkResult r) {
+    if (r != VK_SUCCESS || app_type >= VK_MAX_MEMORY_TYPES) return;
+    uint8_t m = d->mem_remap[app_type];
+    if (!m) return;
+    pthread_mutex_lock(&er_mu);
+    struct er_pair *p = NULL;
+    for (uint32_t i = 0; i < er_npairs; i++)
+        if (er_pairs[i].src == app_type) {
+            p = &er_pairs[i];
+            break;
+        }
+    if (!p && er_npairs < ER_MAX) {
+        p = &er_pairs[er_npairs++];
+        p->src = (uint8_t)app_type;
+        p->dst = (uint8_t)(m - 1u);
+        p->mode = er_mode;
+        p->n = 0;
+        p->bytes = 0;
+    }
+    if (p) {
+        p->n++;
+        p->bytes += bytes;
+    }
+    pthread_mutex_unlock(&er_mu);
+}
+
+void nvhal_exp_mem_teardown(struct nvhal_device *d) {
+    (void)d;
+    pthread_mutex_lock(&er_mu);
+    if (!er_npairs) {
+        pthread_mutex_unlock(&er_mu);
+        return;
+    }
+    char b[1024];
+    int o = 0;
+    for (uint32_t i = 0; i < er_npairs; i++) {
+        int w = snprintf(b + o, sizeof b - (size_t)o, "%stype %u -> type %u [%s]: %llu alloc(s) %.1f MiB", i ? "; " : "",
+                         er_pairs[i].src, er_pairs[i].dst, er_mode_name(er_pairs[i].mode),
+                         (unsigned long long)er_pairs[i].n, (double)er_pairs[i].bytes / 1048576.0);
+        if (w < 0 || (size_t)(o + w) >= sizeof b) {
+            o = (int)sizeof b - 1;
+            break;
+        }
+        o += w;
+    }
+    er_npairs = 0;
+    pthread_mutex_unlock(&er_mu);
+    nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT memory remap summary at vkDestroyDevice: %s", b);
+}
+
+static void exp_flag_names(VkMemoryPropertyFlags f, char *out, size_t n) {
+    static const struct {
+        VkMemoryPropertyFlags bit;
+        const char *name;
+    } t[] = {
+        {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "DEVICE_LOCAL"},
+        {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, "HOST_VISIBLE"},
+        {VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, "HOST_COHERENT"},
+        {VK_MEMORY_PROPERTY_HOST_CACHED_BIT, "HOST_CACHED"},
+        {VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT, "LAZILY_ALLOCATED"},
+        {VK_MEMORY_PROPERTY_PROTECTED_BIT, "PROTECTED"},
+    };
+    size_t o = 0;
+    out[0] = 0;
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
+        if (f & t[i].bit)
+            o += (size_t)snprintf(out + o, o < n ? n - o : 0, "%s%s", o ? "|" : "", t[i].name);
+    if (!o && n) snprintf(out, n, "none");
+}
+
+/* bounded appender: once the buffer is full every later call is a no-op, so the line stays valid UTF-8/ASCII */
+static int exp_buf(char *b, int n, size_t cap, const char *fmt, ...) {
+    if (n < 0 || (size_t)n >= cap) return (int)cap;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(b + n, cap - (size_t)n, fmt, ap);
+    va_end(ap);
+    if (w < 0) return n;
+    return n + w <= (int)cap ? n + w : (int)cap;
+}
+
+/* One line (logcat privileges a line over several): memoryTypeCount/heapCount, every type with its flags
+ * spelled out and its heap, every heap with its size/flags, and the total the ICD reported. */
+static void exp_print_mem_table(const struct nvhal_device *d) {
     const VkPhysicalDeviceMemoryProperties *mp = &d->mem_props;
+    char b[2048];
+    char nm[96];
+    int n = 0;
+    n = exp_buf(b, n, sizeof b, "memoryTypeCount=%u heapCount=%u;", mp->memoryTypeCount, mp->memoryHeapCount);
+    for (uint32_t i = 0; i < mp->memoryTypeCount; i++) {
+        exp_flag_names(mp->memoryTypes[i].propertyFlags, nm, sizeof nm);
+        n = exp_buf(b, n, sizeof b, " type[%u]=%s 0x%x heap=%u;", i, nm, mp->memoryTypes[i].propertyFlags,
+                    mp->memoryTypes[i].heapIndex);
+    }
+    for (uint32_t j = 0; j < mp->memoryHeapCount; j++) {
+        exp_flag_names(mp->memoryHeaps[j].flags, nm, sizeof nm);
+        n = exp_buf(b, n, sizeof b, " heap[%u]=%s 0x%x %llu MiB;", j, nm, mp->memoryHeaps[j].flags,
+                    (unsigned long long)(mp->memoryHeaps[j].size >> 20));
+    }
+    uint64_t total = 0;
+    for (uint32_t j = 0; j < mp->memoryHeapCount; j++) total += mp->memoryHeaps[j].size;
+    n = exp_buf(b, n, sizeof b, " total=%llu MiB", (unsigned long long)(total >> 20));
+    if ((size_t)n >= sizeof b) snprintf(b + sizeof b - 24, 24, " ...(truncated)");
+    nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT memory table: %s", b);
+}
+
+/* level 2 destination: the DEVICE_LOCAL type whose flags are the app's plus DEVICE_LOCAL if one exists, else the
+ * DEVICE_LOCAL type sharing the most property bits with them (lowest index wins a tie). -1 = no candidate. */
+static int exp_pick_dl(const VkPhysicalDeviceMemoryProperties *mp, VkMemoryPropertyFlags f) {
+    const VkMemoryPropertyFlags DL = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    int best = -1;
+    unsigned best_same = 0;
+    for (uint32_t j = 0; j < mp->memoryTypeCount; j++) {
+        VkMemoryPropertyFlags g = mp->memoryTypes[j].propertyFlags;
+        if (!(g & DL)) continue;
+        if (g == (f | DL)) return (int)j;
+        unsigned same = (unsigned)__builtin_popcount((unsigned)(g & f));
+        if (best < 0 || same > best_same) {
+            best = (int)j;
+            best_same = same;
+        }
+    }
+    return best;
+}
+
+void nvhal_exp_mem_init(struct nvhal_device *d) {
+    char v[96] = "";
+    int lvl = exp_level(v, sizeof v);
+    int target = exp_target();
+    bool cached = exp_cached_wanted();
+    const VkPhysicalDeviceMemoryProperties *mp = &d->mem_props;
+    if (target >= (int)mp->memoryTypeCount) {
+        nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT debug.nvhal.exp.memtype_target=%d is not a memory type of this device "
+                  "(memoryTypeCount=%u); ignoring it", target, mp->memoryTypeCount);
+        target = -1;
+    }
+    /* priority: an explicit target beats the cached preference, which beats hostvis_to_bar */
+    int mode = target >= 0 ? 1 : cached ? 2 : lvl ? 3 : 0;
+    if (mode || exp_table_wanted()) exp_print_mem_table(d);
+    if (!mode) return;
+    er_mode = (uint8_t)mode;
+    pthread_mutex_lock(&er_mu);
+    er_npairs = 0;
+    pthread_mutex_unlock(&er_mu);
     const VkMemoryPropertyFlags HV = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, HC = VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                                DL = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                                CO = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                DL = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                SPECIAL = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT;
+    bool seen[VK_MAX_MEMORY_HEAPS] = {false};
+    uint32_t mapped = 0;
+    uint64_t heap_bytes = 0;
     for (uint32_t i = 0; i < mp->memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
-        if (!(f & HV) || (f & (HC | DL))) continue;
-        for (uint32_t j = 0; j < mp->memoryTypeCount; j++)
-            if (mp->memoryTypes[j].propertyFlags == (f | DL)) {
-                d->mem_remap[i] = (uint8_t)(j + 1);
-                nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT debug.nvhal.exp.hostvis_to_bar: memory type %u (flags 0x%x, heap %u) is "
-                          "allocated from type %u (flags 0x%x, heap %u, %llu MiB)", i, f, mp->memoryTypes[i].heapIndex, j,
-                          mp->memoryTypes[j].propertyFlags, mp->memoryTypes[j].heapIndex,
-                          (unsigned long long)(mp->memoryHeaps[mp->memoryTypes[j].heapIndex].size >> 20));
-                break;
+        if (f & (DL | SPECIAL)) continue; /* already VRAM, or the type's semantics must not be changed */
+        int j = -1;
+        if (mode == 1) {
+            j = target;
+        } else if (mode == 2) {
+            if (!(f & HV) || !(f & CO) || (f & HC)) continue;
+            for (uint32_t k = 0; k < mp->memoryTypeCount; k++) {
+                VkMemoryPropertyFlags g = mp->memoryTypes[k].propertyFlags;
+                if ((g & (HV | HC)) == (HV | HC) && mp->memoryTypes[k].heapIndex == mp->memoryTypes[i].heapIndex) {
+                    j = (int)k;
+                    break;
+                }
             }
+        } else if (lvl == 1) {
+            if (!(f & HV) || (f & HC)) continue;
+            for (uint32_t k = 0; k < mp->memoryTypeCount; k++)
+                if (mp->memoryTypes[k].propertyFlags == (f | DL)) {
+                    j = (int)k;
+                    break;
+                }
+        } else {
+            j = exp_pick_dl(mp, f);
+        }
+        if (j < 0) {
+            if (mode == 2)
+                nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT debug.nvhal.exp.hostvis_cached=1: memory type %u has no "
+                          "HOST_VISIBLE|HOST_CACHED type in heap %u; it keeps the app's type", i,
+                          mp->memoryTypes[i].heapIndex);
+            continue;
+        }
+        if ((uint32_t)j == i) {
+            nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT %s=%d: memory type %u is the target itself and lacks DEVICE_LOCAL; it "
+                      "keeps the app's type", er_mode_name((uint8_t)mode), mode == 1 ? target : 1, i);
+            continue;
+        }
+        d->mem_remap[i] = (uint8_t)(j + 1);
+        char fn[96], gn[96];
+        exp_flag_names(f, fn, sizeof fn);
+        exp_flag_names(mp->memoryTypes[j].propertyFlags, gn, sizeof gn);
+        nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT %s=%d: memory type %u (%s 0x%x heap %u) is allocated from type %u "
+                  "(%s 0x%x heap %u, heap %llu MiB)", er_mode_name((uint8_t)mode), mode == 1 ? target : mode == 2 ? 1 : lvl,
+                  i, fn, f, mp->memoryTypes[i].heapIndex, j, gn, mp->memoryTypes[j].propertyFlags,
+                  mp->memoryTypes[j].heapIndex,
+                  (unsigned long long)(mp->memoryHeaps[mp->memoryTypes[j].heapIndex].size >> 20));
+        mapped++;
+        uint32_t hi = mp->memoryTypes[j].heapIndex;
+        if (hi < VK_MAX_MEMORY_HEAPS && !seen[hi]) {
+            seen[hi] = true;
+            heap_bytes += mp->memoryHeaps[hi].size;
+        }
     }
+    if (!mapped) return;
+    if (mode == 3 && lvl == 2)
+        nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT debug.nvhal.exp.hostvis_to_bar=2: %u non-device-local type(s) now point at "
+                  "VRAM type(s), covering %llu MiB of heap; on Pascal the device-local window is usually ~256 MiB, so "
+                  "allocations that big fail with VK_ERROR_OUT_OF_DEVICE_MEMORY", mapped,
+                  (unsigned long long)(heap_bytes >> 20));
+    else if (mode == 1)
+        nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT debug.nvhal.exp.memtype_target=%d: %u non-device-local type(s) now point at "
+                  "type %d, covering %llu MiB of heap; the per-allocation src->dst count/bytes summary follows at "
+                  "vkDestroyDevice", target, mapped, target, (unsigned long long)(heap_bytes >> 20));
+    else if (mode == 2)
+        nvhal_log(NVHAL_LVL_WARN, "EXPERIMENT debug.nvhal.exp.hostvis_cached=1: %u host-visible type(s) now use a "
+                  "HOST_CACHED type of the same heap (%llu MiB of heap); still map-able, GPU reads go through the cache",
+                  mapped, (unsigned long long)(heap_bytes >> 20));
 }
 
 const VkMemoryAllocateInfo *nvhal_exp_mem_remap(struct nvhal_device *d, const VkMemoryAllocateInfo *ai,
@@ -1210,3 +1597,175 @@ const VkMemoryAllocateInfo *nvhal_exp_mem_remap(struct nvhal_device *d, const Vk
     storage->memoryTypeIndex = d->mem_remap[ai->memoryTypeIndex] - 1u;
     return storage;
 }
+
+/* ------------------------------------------------------------------ allocation census
+ * Opt-in census of what the app asks this HAL for through vkAllocateMemory: how many allocations succeeded
+ * per memory type and how many bytes they were, how many failed with OUT_OF_DEVICE_MEMORY / OUT_OF_HOST_MEMORY
+ * (the direct evidence for "the type is exhausted"), each split into "before the first present" and "after it"
+ * so the preload phase (the DLC unpacking into VRAM) can be told apart from the render phase.
+ * The same body is printed twice: on the present path, throttled to at most one line per window (default 5 s,
+ * "alloc census @present #<n> t=<s>: ...") so a benchmark that never destroys its VkDevice still leaves a
+ * timeline, and once at vkDestroyDevice marked "@final" when the app really does destroy it. Off (the default)
+ * it costs one acquire load per allocation and one per present. */
+#define MS_PHASES 2u
+struct ms_slot {
+    uint64_t ok_n, ok_bytes, fail_oodm, fail_oohm;
+};
+static struct {
+    pthread_mutex_t mu;
+    struct ms_slot s[MS_PHASES][VK_MAX_MEMORY_TYPES];
+    int present_seen;
+} ms_ = {.mu = PTHREAD_MUTEX_INITIALIZER};
+/* flat statics, not fields inside a struct: on i686 a struct holding _Atomic uint64_t has an alignment GCC
+ * notes as ABI-relevant, and this build is -Werror clean without the noise (same reasoning as imgxlate.c) */
+/* plain uint64_t, not _Atomic: clang rejects __atomic_* builtins on an _Atomic-qualified object, and the
+ * builtins themselves are what provide the atomicity (the same form the HAL already uses in ahb.c) */
+static uint64_t ms_present_n;     /* presents since the first probe: the "#<n>" timeline marker */
+static uint64_t ms_last_print_ns; /* CLOCK_MONOTONIC of the last @present line: the throttle gate */
+static uint64_t ms_window_ns = 5000000000ull; /* 5 s default; debug.nvhal.exp.memstats.window overrides it */
+static uint64_t ms_t0_ns;                     /* CLOCK_MONOTONIC at the first probe: "t=" is measured from here */
+
+static int ms_state; /* 0: not probed yet, 1: off, 2: on */
+static pthread_once_t ms_once = PTHREAD_ONCE_INIT;
+
+static uint64_t ms_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+static void ms_init(void) {
+    char v[64] = "";
+    char w[64] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.exp.memstats", v);
+    __system_property_get("debug.nvhal.exp.memstats.window", w);
+#else
+    const char *e = getenv("NVHAL_EXP_MEMSTATS");
+    if (e) snprintf(v, sizeof v, "%s", e);
+    e = getenv("NVHAL_EXP_MEMSTATS_WINDOW");
+    if (e) snprintf(w, sizeof w, "%s", e);
+#endif
+    double secs = atof(w);
+    if (secs > 0) ms_window_ns = (uint64_t)((secs < 0.1 ? 0.1 : secs) * 1e9); /* never faster than 10 lines/s */
+    ms_t0_ns = ms_now();
+    int on = atoi(v) > 0;
+    __atomic_store_n(&ms_state, on ? 2 : 1, __ATOMIC_RELEASE);
+    if (on)
+        nvhal_log(NVHAL_LVL_WARN, "alloc census (debug.nvhal.exp.memstats): statistics ON (window %.2f s: at most one "
+                  "@present line per window, plus one @final line if the app destroys its VkDevice)",
+                  (double)ms_window_ns / 1e9);
+}
+static bool ms_on(void) {
+    int s = __atomic_load_n(&ms_state, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(s == 0, 0)) {
+        pthread_once(&ms_once, ms_init);
+        s = __atomic_load_n(&ms_state, __ATOMIC_ACQUIRE);
+    }
+    return s == 2;
+}
+/* the census itself, under the mutex; clear=1 empties it for a new device so its preload phase starts fresh */
+static void ms_snapshot(struct ms_slot (*s)[VK_MAX_MEMORY_TYPES], int *seen, bool clear) {
+    pthread_mutex_lock(&ms_.mu);
+    memcpy(s, ms_.s, sizeof(struct ms_slot) * MS_PHASES * VK_MAX_MEMORY_TYPES);
+    if (seen) *seen = ms_.present_seen;
+    if (clear) {
+        memset(ms_.s, 0, sizeof ms_.s);
+        __atomic_store_n(&ms_.present_seen, 0, __ATOMIC_RELEASE); /* a new device starts a new preload phase */
+    }
+    pthread_mutex_unlock(&ms_.mu);
+}
+
+static void ms_mib(char *o, size_t n, uint64_t b) { snprintf(o, n, "%.1f MiB", (double)b / 1048576.0); }
+
+/* the single body both lines share: totals, then one clause per memory type that saw any traffic */
+static void ms_body(char *b, size_t cap, struct ms_slot s[MS_PHASES][VK_MAX_MEMORY_TYPES]) {
+    uint64_t pre_n = 0, pre_b = 0, pre_d = 0, pre_h = 0, post_n = 0, post_b = 0, post_d = 0, post_h = 0;
+    for (uint32_t t = 0; t < VK_MAX_MEMORY_TYPES; t++) {
+        pre_n += s[0][t].ok_n;
+        pre_b += s[0][t].ok_bytes;
+        pre_d += s[0][t].fail_oodm;
+        pre_h += s[0][t].fail_oohm;
+        post_n += s[1][t].ok_n;
+        post_b += s[1][t].ok_bytes;
+        post_d += s[1][t].fail_oodm;
+        post_h += s[1][t].fail_oohm;
+    }
+    char h[3][24];
+    int n = 0;
+    ms_mib(h[0], sizeof h[0], pre_b + post_b);
+    ms_mib(h[1], sizeof h[1], pre_b);
+    ms_mib(h[2], sizeof h[2], post_b);
+    n = exp_buf(b, n, cap,
+                "%llu ok (%s: %s before the first present, %s after), OUT_OF_DEVICE_MEMORY %llu, "
+                "OUT_OF_HOST_MEMORY %llu;",
+                (unsigned long long)(pre_n + post_n), h[0], h[1], h[2], (unsigned long long)(pre_d + post_d),
+                (unsigned long long)(pre_h + post_h));
+    for (uint32_t t = 0; t < VK_MAX_MEMORY_TYPES; t++) {
+        const struct ms_slot *a = &s[0][t], *c = &s[1][t];
+        if (!a->ok_n && !a->ok_bytes && !a->fail_oodm && !a->fail_oohm && !c->ok_n && !c->ok_bytes && !c->fail_oodm &&
+            !c->fail_oohm)
+            continue;
+        ms_mib(h[1], sizeof h[1], a->ok_bytes);
+        ms_mib(h[2], sizeof h[2], c->ok_bytes);
+        n = exp_buf(b, n, cap,
+                    " type %u: pre %llu ok %s (OODM %llu OOHM %llu), post %llu ok %s (OODM %llu OOHM %llu);", t,
+                    (unsigned long long)a->ok_n, h[1], (unsigned long long)a->fail_oodm,
+                    (unsigned long long)a->fail_oohm, (unsigned long long)c->ok_n, h[2],
+                    (unsigned long long)c->fail_oodm, (unsigned long long)c->fail_oohm);
+    }
+}
+
+/* one presented image (anb.c): ends the preload phase, bumps the marker and maybe prints the throttled line */
+void nvhal_exp_memstats_present(struct nvhal_device *d) {
+    (void)d;
+    if (!ms_on()) return; /* off: one acquire load and nothing else */
+    __atomic_store_n(&ms_.present_seen, 1, __ATOMIC_RELEASE);
+    uint64_t n = 1 + __atomic_fetch_add(&ms_present_n, 1, __ATOMIC_RELAXED);
+    uint64_t now = ms_now();
+    uint64_t last = __atomic_load_n(&ms_last_print_ns, __ATOMIC_RELAXED);
+    if (now - last < ms_window_ns) return; /* throttle: at most one line per window, without taking the lock */
+    if (!__atomic_compare_exchange_n(&ms_last_print_ns, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return; /* another thread already printed the line for this window */
+    struct ms_slot s[MS_PHASES][VK_MAX_MEMORY_TYPES];
+    int seen = 0;
+    ms_snapshot(s, &seen, false);
+    char b[1400];
+    ms_body(b, sizeof b, s);
+    nvhal_log(NVHAL_LVL_WARN, "alloc census @present #%llu t=%.1f s: %s first present seen: %s",
+              (unsigned long long)n, (double)(now - ms_t0_ns) / 1e9, b, seen ? "yes" : "no");
+}
+void nvhal_exp_memstats_alloc(uint32_t type, uint64_t bytes, VkResult r) {
+    if (!ms_on()) return;
+    if (type >= VK_MAX_MEMORY_TYPES) return; /* the app's own bug; the ICD rejects it too */
+    bool ok = r == VK_SUCCESS;
+    if (!ok && r != VK_ERROR_OUT_OF_DEVICE_MEMORY && r != VK_ERROR_OUT_OF_HOST_MEMORY) return;
+    uint32_t ph = __atomic_load_n(&ms_.present_seen, __ATOMIC_ACQUIRE) ? 1u : 0u;
+    pthread_mutex_lock(&ms_.mu);
+    struct ms_slot *s = &ms_.s[ph][type];
+    if (ok) {
+        s->ok_n++;
+        s->ok_bytes += bytes;
+    } else if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        s->fail_oodm++;
+    } else {
+        s->fail_oohm++;
+    }
+    pthread_mutex_unlock(&ms_.mu);
+}
+/* a HAL-level rejection (ahb.c) or bookkeeping failure: the app sees this result, the ICD never hears about it */
+void nvhal_exp_memstats_fail(uint32_t type, VkResult r) { nvhal_exp_memstats_alloc(type, 0, r); }
+
+/* the app destroyed its VkDevice: print the same body once, marked final (3DMark often never gets here) */
+void nvhal_exp_memstats_teardown(struct nvhal_device *d) {
+    (void)d;
+    if (!ms_on()) return;
+    struct ms_slot s[MS_PHASES][VK_MAX_MEMORY_TYPES];
+    int seen = 0;
+    ms_snapshot(s, &seen, true);
+    char b[1400];
+    ms_body(b, sizeof b, s);
+    nvhal_log(NVHAL_LVL_WARN, "alloc census @final (vkDestroyDevice): %s first present seen: %s", b,
+              seen ? "yes" : "no");
+}
+

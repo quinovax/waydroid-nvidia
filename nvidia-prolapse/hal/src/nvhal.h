@@ -528,6 +528,12 @@ struct nvhal_xl_entry { const char *name; PFN_vkVoidFunction fn; int kind; };
 extern const struct nvhal_xl_entry nvhal_xl_entries[];
 extern const struct nvhal_xl_entry nvhal_cs_entries[];
 
+/* ---- opt-in VkImage translation cost statistics (imgxlate.c) ---- */
+/* One presented frame (called by anb.c on the present path). No-op unless NVHAL_XLATE_STATS (host) /
+ * debug.nvhal.xlate_stats (guest) turned the counters on; the module comment in imgxlate.c says what the
+ * report line contains and how the two classes of count are defined. */
+void nvhal_xst_frame(void);
+
 /* ---- loader-object private data (imgxlate.c): freed by vkDestroyDevice ---- */
 void nvhal_loader_pd_teardown(struct nvhal_device *d);
 
@@ -553,9 +559,25 @@ void nvhal_gt_device_init(struct nvhal_device *d);     /* vkCreateDevice: reads 
 void nvhal_gt_device_teardown(struct nvhal_device *d);
 void nvhal_gt_cb_free(struct nvhal_gt_cb *c);           /* NULL ok */
 void nvhal_gt_frame(struct nvhal_device *d);            /* one presented image (d->gt non-NULL) */
-void nvhal_exp_mem_init(struct nvhal_device *d);        /* the memory-type experiment (fills d->mem_remap) */
+void nvhal_exp_mem_init(struct nvhal_device *d);        /* memory-type experiment: prints the type/heap table and
+                                                         * fills d->mem_remap. debug.nvhal.exp.memtype_target
+                                                         * (>=0: every type without DEVICE_LOCAL -> that index) and
+                                                         * debug.nvhal.exp.hostvis_cached (1: HV|HC -> same-heap
+                                                         * HV|HOST_CACHED) take priority over
+                                                         * debug.nvhal.exp.hostvis_to_bar (1 = HV|!HC|!DL -> +DL,
+                                                         * 2 = any !DL -> closest DEVICE_LOCAL) */
 const VkMemoryAllocateInfo *nvhal_exp_mem_remap(struct nvhal_device *d, const VkMemoryAllocateInfo *ai,
                                                 VkMemoryAllocateInfo *storage);
+void nvhal_exp_mem_remap_note(struct nvhal_device *d, uint32_t app_type, uint64_t bytes, VkResult r); /* one remapped
+                                                                        * allocation actually handed to the ICD */
+void nvhal_exp_mem_teardown(struct nvhal_device *d);  /* vkDestroyDevice: the src->dst count/bytes summary (1 line) */
+void nvhal_exp_memstats_alloc(uint32_t type, uint64_t bytes, VkResult r); /* allocation census: one per allocation
+                                                                          * handed to the ICD (off = 1 load) */
+void nvhal_exp_memstats_fail(uint32_t type, VkResult r);      /* a HAL-level reject, before the ICD is called */
+void nvhal_exp_memstats_present(struct nvhal_device *d);      /* one presented image: ends the preload phase and
+                                                               * prints "alloc census @present #<n> t=<s>", throttled
+                                                               * to one line per window (default 5 s) */
+void nvhal_exp_memstats_teardown(struct nvhal_device *d);     /* vkDestroyDevice: the same line, marked "@final" */
 /* vkGetDeviceProcAddr: the timing wrapper of name chaining to fn, or fn itself */
 PFN_vkVoidFunction nvhal_gt_wrap(struct nvhal_device *d, const char *name, PFN_vkVoidFunction fn);
 
@@ -606,6 +628,11 @@ bool nvhal_astc_is_image(VkImage image);
 VkResult nvhal_astc_bind1(struct nvhal_device *d, VkImage image, VkDeviceMemory mem, VkDeviceSize offset, bool *handled);
 /* vkBindImageMemory2: *out = in, or a malloc'd array with the emulation's own binds added */
 VkResult nvhal_astc_expand_binds(uint32_t n, const VkBindImageMemoryInfo *in, VkBindImageMemoryInfo **out, uint32_t *nout);
+/* vkAllocateMemory / vkFreeMemory (ahb.c): while debug.nvhal.astc_blocks_host / NVHAL_ASTC_BLOCKS_HOST is on, remember
+ * which memory type the app's memory got - a VkDeviceMemory does not tell, and the block-host summary line reports the
+ * memoryTypeIndex histogram of the emulated images' bindings (astc.c). Off: one acquire load each. */
+void nvhal_astc_mem_note(VkDeviceMemory mem, uint32_t type);
+void nvhal_astc_mem_forget(VkDeviceMemory mem);
 bool nvhal_astc_CreateImageView(struct nvhal_device *d, VkDevice device, const VkImageViewCreateInfo *ci,
                                 const VkAllocationCallbacks *alloc, VkImageView *view, VkResult *r);
 /* vkAllocateMemory: a dedicated allocation naming an emulated image is made non-dedicated (the image's memory

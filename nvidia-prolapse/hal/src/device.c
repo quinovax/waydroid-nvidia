@@ -765,6 +765,8 @@ VkResult VKAPI_CALL nvhal_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreate
     if (!ok) {
         nvhal_astc_device_teardown(d);
         nvhal_gt_device_teardown(d);
+        nvhal_exp_memstats_teardown(d);
+    nvhal_exp_mem_teardown(d);
         if (destroy) destroy(dev, alloc);
         free(d);
         return missing ? VK_ERROR_INITIALIZATION_FAILED : astc_r != VK_SUCCESS ? astc_r
@@ -803,6 +805,8 @@ void VKAPI_CALL nvhal_DestroyDevice(VkDevice device, const VkAllocationCallbacks
     nvhal_loader_pd_teardown(d);
     nvhal_cmd_device_forget(d);
     nvhal_gt_device_teardown(d);
+    nvhal_exp_memstats_teardown(d);
+    nvhal_exp_mem_teardown(d);
     d->DestroyDevice(device, alloc);
     free(d);
 }
