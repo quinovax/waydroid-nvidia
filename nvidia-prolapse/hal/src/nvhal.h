@@ -325,6 +325,10 @@ struct nvhal_device {
     uint32_t api_version; /* min(instance apiVersion, physical device apiVersion) */
     bool anb_enabled;     /* the app (loader) enabled VK_ANDROID_native_buffer */
     bool ahb_enabled;     /* the app enabled VK_ANDROID_external_memory_android_hardware_buffer */
+    /* NVIDIA driver defects with imported SYNC_FD payloads (device.c, acquire_wait_flags): vkAcquireImageANDROID
+     * waits for the native fence on the CPU and imports "already signalled" when it is given a fence
+     * (acquire_wait_fence) or a semaphore (acquire_wait_semaphore) */
+    bool acquire_wait_fence, acquire_wait_semaphore;
     VkPhysicalDeviceMemoryProperties mem_props;
 
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr;

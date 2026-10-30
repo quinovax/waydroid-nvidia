@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -607,6 +608,22 @@ VkResult VKAPI_CALL nvhal_AcquireImageANDROID(VkDevice device, VkImage image, in
     if (!d) {
         if (nativeFenceFd >= 0) close(nativeFenceFd);
         return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    /* NVIDIA driver defects with SYNC_FD payloads (device.c, acquire_wait_flags): wait for the native fence here and
+     * import "already signalled" (-1), so the driver never holds the sync_file */
+    if (nativeFenceFd >= 0 && ((fence != VK_NULL_HANDLE && d->acquire_wait_fence) ||
+                               (semaphore != VK_NULL_HANDLE && d->acquire_wait_semaphore))) {
+        struct pollfd p = {.fd = nativeFenceFd, .events = POLLIN};
+        int n;
+        while ((n = poll(&p, 1, -1)) < 0 && (errno == EINTR || errno == EAGAIN)) {}
+        int e = errno;
+        close(nativeFenceFd);
+        if (n != 1 || (p.revents & (POLLERR | POLLNVAL))) {
+            NVHAL_ERR("vkAcquireImageANDROID: waiting for native fence fd %d failed: poll -> %d, revents 0x%x, %s",
+                      nativeFenceFd, n, p.revents, n < 0 ? strerror(e) : "not a pollable fd");
+            return VK_ERROR_DEVICE_LOST;
+        }
+        nativeFenceFd = -1;
     }
     int sem_fd = -1, fence_fd = -1;
     if (nativeFenceFd >= 0) {

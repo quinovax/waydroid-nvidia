@@ -346,6 +346,23 @@ int main(int argc, char **argv) {
     printf("  device: %s api %u.%u.%u\n", props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion),
            VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion));
     GetPhysicalDeviceMemoryProperties(pd, &memprops);
+    /* NVIDIA driver defects with imported SYNC_FD payloads make the HAL's vkAcquireImageANDROID wait for the native
+     * fence on the CPU (src/device.c, acquire_wait_flags): given a fence on branches 550 to 560, given a semaphore
+     * on 580. The acquired objects are then already signalled when the call returns. */
+    int acquire_wait_fence = 0, acquire_wait_semaphore = 0;
+    if (props.apiVersion >= VK_API_VERSION_1_2) {
+        VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
+        GetPhysicalDeviceProperties2(pd, &p2);
+        uint32_t branch = props.driverVersion >> 22;
+        if (drv.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+            acquire_wait_fence = branch < 565;
+            acquire_wait_semaphore = branch == 580;
+        }
+    }
+    if (acquire_wait_fence || acquire_wait_semaphore)
+        printf("  NVIDIA driver branch %u: vkAcquireImageANDROID waits for the native fence when given a %s\n",
+               props.driverVersion >> 22, acquire_wait_fence ? "fence" : "semaphore");
 
     /* ---- VkPhysicalDevicePresentationPropertiesANDROID ---- */
     {
@@ -1051,14 +1068,22 @@ int main(int argc, char **argv) {
               "AcquireImageANDROID(real pending sync_fd, semaphore, fence)");
         VkResult early = p_GetFenceStatus(dev, af);
         double t1 = now_ms();
+        uint32_t early_marker;
+        memcpy(&early_marker, completion.ptr, 4);
         VkResult wr = VKR(p_WaitForFences(dev, 1, &af, VK_TRUE, 10000000000ull));
         double t2 = now_ms();
         uint32_t marker;
         memcpy(&marker, completion.ptr, 4);
-        check(wr == VK_SUCCESS && (early == VK_NOT_READY || (allow_synchronous_submit && early == VK_SUCCESS)) &&
-              marker == completion_value, "acquire fence: submit %.2f ms, status %d at %.2f ms, "
-              "signalled at %.2f ms, GPU marker 0x%x (%s)", submitted - t0, early, t1 - t0, t2 - t0,
-              marker, allow_synchronous_submit ? "synchronous submit permitted" : "pending required");
+        if (acquire_wait_fence || acquire_wait_semaphore) /* returned after the GPU work: signalled, marker written */
+            check(wr == VK_SUCCESS && early == VK_SUCCESS && early_marker == completion_value &&
+                  marker == completion_value, "acquire fence: submit %.2f ms, status %d at %.2f ms (acquire waited "
+                  "for the native fence), signalled at %.2f ms, GPU marker 0x%x at return", submitted - t0, early,
+                  t1 - t0, t2 - t0, early_marker);
+        else
+            check(wr == VK_SUCCESS && (early == VK_NOT_READY || (allow_synchronous_submit && early == VK_SUCCESS)) &&
+                  marker == completion_value, "acquire fence: submit %.2f ms, status %d at %.2f ms, "
+                  "signalled at %.2f ms, GPU marker 0x%x (%s)", submitted - t0, early, t1 - t0, t2 - t0,
+                  marker, allow_synchronous_submit ? "synchronous submit permitted" : "pending required");
         begin();
         submit_wait("empty submit waiting on the semaphore acquired from the sync_fd", 1, &as, 0, NULL, 0);
         MUST(p_ResetFences(dev, 1, &af));
@@ -1098,12 +1123,14 @@ int main(int argc, char **argv) {
         uint32_t marker;
         memcpy(&marker, completion.ptr, 4);
         check(ar == VK_SUCCESS && rr4 == VK_SUCCESS && sfd >= 0 && pfd4 >= 0 &&
-              (early == 0 || (allow_synchronous_submit && early == 1)) && later == 1 && (pp.revents & POLLIN) &&
+              (early == 0 || ((allow_synchronous_submit || acquire_wait_semaphore) && early == 1)) && later == 1 &&
+              (pp.revents & POLLIN) &&
               marker == completion_value && (src_pending || allow_synchronous_submit),
               "release waiting on a semaphore acquired from a pending sync_fd (source fd %d pending %d): release fd %d, "
               "first poll %d at %.2f ms, final poll %d at %.2f ms, GPU marker 0x%x (%s)", sfd, src_pending, pfd4, early,
               t1 - t0, later, t2 - t0, marker,
-              allow_synchronous_submit ? "synchronous submit permitted" : "pending required");
+              allow_synchronous_submit ? "synchronous submit permitted"
+              : acquire_wait_semaphore ? "acquire waited for the native fence" : "pending required");
         if (pfd4 >= 0) close(pfd4);
         MUST(p_QueueWaitIdle(queue));
         p_DestroySemaphore(dev, as2, NULL);

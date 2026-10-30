@@ -89,7 +89,7 @@ COMMON_CFLAGS := -std=c11 -D_GNU_SOURCE -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_AND
                  -O2 -g $(PREFIX_MAP) -Wall -Wextra -Werror -Isrc -Iinclude/android -Iinclude/minigbm -Iout/gen
 LDFLAGS_SO    := -shared -Wl,-z,defs -Wl,--no-undefined -Wl,-soname,vulkan.nvidia.so
 
-.PHONY: all host android android32 host32 check coverage test test32 driver-check hal-fence-check clean
+.PHONY: all host android android32 host32 check coverage test test32 driver-check syncfd-check hal-fence-check clean
 all: host android android32 host32 check
 host: out/host/vulkan.nvidia.so out/host/anb-roundtrip out/host/ahb-roundtrip out/host/ext-duplicates \
       out/host/ext-duplicates-asan out/host/loader-pd out/host/astc-roundtrip out/host/etc2-roundtrip out/host/ahb-yuv
@@ -160,6 +160,8 @@ out/host/loader-pd: test/loader-pd.c $(wildcard include/android/*/*.h) | out/hos
 	$(HOSTCC) $(TEST_CFLAGS) -o $@ test/loader-pd.c -ldl
 
 # sync_fd export after a first-op import-wait on a fresh queue (Vulkan analogue of egl/ fence-first-wait, D1)
+out/host/syncfd-probe: test/syncfd-probe.c | out/host
+	$(HOSTCC) $(TEST_CFLAGS) -o $@ test/syncfd-probe.c -ldl
 out/host/vk-first-wait: test/vk-first-wait.c $(wildcard include/android/*/*.h) | out/host
 	$(HOSTCC) $(TEST_CFLAGS) -o $@ test/vk-first-wait.c -ldl -lpthread
 
@@ -241,6 +243,11 @@ driver-check: out/host/vk-first-wait
 	@fail=0; for m in $(VKFW_MODES); do \
 	    out=$$(DISPLAY= WAYLAND_DISPLAY= ./out/host/vk-first-wait --icd $(VKFW_ICD) --mode $$m --rounds $(DRIVER_CHECK_ROUNDS) \
 	        --fills 60 --timestamps); rc=$$?; echo "$$out" | tail -1; [ $$rc -eq 0 ] || fail=1; done; exit $$fail
+# syncfd-check: the RAW ICD, nothing of ours. The two driver defects with imported SYNC_FD payloads that make
+# vkAcquireImageANDROID wait for the native fence (src/device.c, acquire_wait_flags); it also says whether the HAL's
+# decision for this branch covers what it measured. Run it after every driver bump.
+syncfd-check: out/host/syncfd-probe
+	DISPLAY= WAYLAND_DISPLAY= ./out/host/syncfd-probe --icd $(VKFW_ICD)
 # hal-fence-check: the same modes through our HAL, which starts every queue's timeline at vkCreateDevice
 # (AHB-CONTRACT.md §8). Must be 0 early in every mode; the two semaphore-only runs exercise the HAL's semaphore start.
 hal-fence-check: out/host/vulkan.nvidia.so out/host/vk-first-wait

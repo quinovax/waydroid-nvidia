@@ -529,6 +529,42 @@ static VkResult start_queue_timelines(struct nvhal_device *d, const VkDeviceCrea
     return VK_SUCCESS;
 }
 
+/* Two defects of NVIDIA's proprietary driver with temporarily imported SYNC_FD payloads, both measured with a plain
+ * glibc program on the stock ICD, no HAL in between (test/syncfd-probe.c, `make syncfd-check`), the payload coming
+ * from vkGetFenceFdKHR:
+ *  - branches 550 to 560: vkWaitForFences on a fence whose payload has not signalled yet reads through a NULL
+ *    pointer: libnvidia-eglcore.so.550.163.01 builds the pollfd array for poll() from a list whose entry for that
+ *    payload is NULL (SIGSEGV at ELF 0x9f6276, `mov (%rdx),%edx`). Measured on 550.163.01, 555.58.02 and 560.35.03;
+ *    565.77 and every later branch measured wait correctly. vkGetFenceStatus returns VK_NOT_READY; a semaphore import
+ *    of the same pending fd waited by a submission works; a fence import after the fd signalled works.
+ *  - branch 580: a binary semaphore given a sync_file that had already signalled at the import never closes it once
+ *    a vkQueueSubmit waits on the semaphore: 3 of every 4 such fds stay open, through vkDestroySemaphore and
+ *    vkDestroyDevice. Measured on 580.178.04; 550.163.01, 555.58.02, 560.35.03, 565.77, 570.211.01, 575.64.05,
+ *    590.48.01, 595.99.02 and 615.78.08 close them. A sync_file still pending at the import (signalled before or
+ *    after the wait is submitted) and an import of fd -1 ("already signalled") leave nothing open. Whether the fd has
+ *    signalled is the driver's view at its import, which a check here cannot pin down, so the HAL does not guess.
+ * Where a defect applies, vkAcquireImageANDROID waits for the native fence on the CPU and imports fd -1 instead, so
+ * the driver never holds the sync_file: the acquire returns only once the buffer's previous user has released it.
+ * Older 550 to 560 and other 580 releases were not measured individually; they are treated like the measured ones.
+ * NVIDIA's driver is told apart from NVK (same vendor ID, Mesa version numbers) by
+ * VkPhysicalDeviceDriverProperties.driverID; its driverVersion carries the branch in bits 31..22. */
+static void acquire_wait_flags(struct nvhal_instance *inst, VkPhysicalDevice pd, const VkPhysicalDeviceProperties *props,
+                               bool *wait_fence, bool *wait_semaphore) {
+    *wait_fence = *wait_semaphore = false;
+    if (props->vendorID != 0x10de || props->apiVersion < VK_API_VERSION_1_2 || !inst->GetPhysicalDeviceProperties2)
+        return;
+    VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
+    inst->GetPhysicalDeviceProperties2(pd, &p2);
+    if (drv.driverID != VK_DRIVER_ID_NVIDIA_PROPRIETARY) return;
+    uint32_t branch = props->driverVersion >> 22;
+    *wait_fence = branch < 565;
+    *wait_semaphore = branch == 580;
+    if (*wait_fence || *wait_semaphore)
+        NVHAL_TRACE("NVIDIA driver branch %u: vkAcquireImageANDROID waits for the native fence before importing it "
+                    "into a %s", branch, *wait_fence ? "fence" : "semaphore");
+}
+
 VkResult VKAPI_CALL nvhal_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci,
                                        const VkAllocationCallbacks *alloc, VkDevice *pDevice) {
     struct nvhal_instance *inst = nvhal_physdev_instance(pd);
@@ -679,6 +715,7 @@ VkResult VKAPI_CALL nvhal_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreate
     d->inst = inst;
     d->api_version = api;
     d->anb_enabled = anb;
+    acquire_wait_flags(inst, pd, &props, &d->acquire_wait_fence, &d->acquire_wait_semaphore);
     d->ahb_enabled = ahb_ext;
     inst->GetPhysicalDeviceMemoryProperties(pd, &d->mem_props);
     const char *missing = NULL;
