@@ -1019,10 +1019,16 @@ struct bh_plan {
     VkDeviceSize off[1 + MAX_MIPS]; /* [1 + m]: block image m's offset in it; [0] stays 0 */
 };
 
-/* the memory type for the block images: HOST_VISIBLE|HOST_COHERENT first and, within that, one that is *not*
- * DEVICE_LOCAL (system RAM; on this driver the VRAM type is HOST_VISIBLE|HOST_COHERENT too, and a block image in it
- * would save nothing), then any HOST_VISIBLE|HOST_COHERENT, then any HOST_VISIBLE; -1 when memoryTypeBits offers
- * none (the caller keeps the combined path) */
+/* the memory type for the block images. Order of preference:
+ *  1. HOST_VISIBLE|HOST_COHERENT and *not* DEVICE_LOCAL: system RAM (on this driver the VRAM type is
+ *     HOST_VISIBLE|HOST_COHERENT too, and a block image in it would save nothing);
+ *  2. any HOST_VISIBLE|HOST_COHERENT, 3. any HOST_VISIBLE;
+ *  4. any *system* type (not DEVICE_LOCAL). This tier matters: a block image is an R32G32B32A32_UINT /
+ *     R32G32_UINT OPTIMAL image, and NVIDIA's ICD reports typeBits 0x82 for those, i.e. only type 1 and type 7.
+ *     Type 1 is heap 1 (host memory) with flags 0x0 -- it has no HOST_VISIBLE bit because the driver never intends
+ *     it to be mapped, yet it is host memory and the block image is only ever touched by copies and the decoder
+ *     dispatch, never by the CPU. Without tier 4 the whole switch silently does nothing on this driver.
+ * -1 when memoryTypeBits offers none (the caller keeps the combined path). */
 static int32_t bh_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t bits) {
     static const VkMemoryPropertyFlags want[3] = {
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -1035,6 +1041,13 @@ static int32_t bh_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t bits
             if (k == 0 && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
             return (int32_t)i;
         }
+    /* tier 4: host memory the driver does not mark HOST_VISIBLE (see the comment above) */
+    for (uint32_t i = 0; i < mp->memoryTypeCount && i < BH_MAX_TYPES; i++) {
+        const VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
+        if (!(bits & (1u << i)) || (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
+        if (f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) continue;
+        return (int32_t)i;
+    }
     return -1;
 }
 
