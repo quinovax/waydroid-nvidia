@@ -864,6 +864,8 @@ struct nvhal_astc_image {
     VkDeviceMemory blocks_mem;      /* the HAL's own HOST_VISIBLE allocation behind the block images */
     VkDeviceSize blocks_size;       /* its size (blocks_host only) */
     uint32_t blocks_type;           /* its memoryTypeIndex (blocks_host only) */
+    bool decoded_host;              /* EXPERIMENT: the decoded image lives in decoded_mem (host memory) */
+    VkDeviceMemory decoded_mem;     /* the HAL's own allocation behind the decoded image (decoded_host only) */
     VkMemoryRequirements req;       /* what the app is told */
     struct astc_slot *slots;        /* d->astc->lock */
     uint32_t nslots, cap;
@@ -1452,6 +1454,45 @@ static void bh_report(void) {
                created, host, host_live, hb, host_total, ht, fallback, app_live, al, app_total, at, hist, unreported);
 }
 
+/* EXPERIMENT (docs/astc-bc1-plan.md): put the DECODED image in host memory too, so that an app whose textures
+ * would not fit in VRAM at all can still render. This is not the fix -- BC1 is (0.5 B/texel instead of 4) -- it
+ * measures the upper bound of "textures are the problem" before the BC1 work starts. Off unless
+ * NVHAL_ASTC_DECODED_HOST / debug.nvhal.astc_decoded_host is 1. The decoded image is *sampled* every frame, so
+ * unlike a block image it is read through PCIe by every texture fetch: expect this to be much worse per frame. */
+static int32_t dh_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t bits) {
+    for (uint32_t i = 0; i < mp->memoryTypeCount && i < BH_MAX_TYPES; i++) {
+        const VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
+        if (!(bits & (1u << i))) continue;
+        if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) continue;
+        if (f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) continue;
+        return (int32_t)i;
+    }
+    return -1;
+}
+
+static _Atomic int dh_state; /* 0 unprobed, 1 off, 2 on */
+static pthread_once_t dh_once = PTHREAD_ONCE_INIT;
+
+static void dh_init(void) {
+    char v[32] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.astc_decoded_host", v);
+#else
+    const char *e = getenv("NVHAL_ASTC_DECODED_HOST");
+    if (e) snprintf(v, sizeof v, "%s", e);
+#endif
+    atomic_store_explicit(&dh_state, atoi(v) > 0 ? 2 : 1, memory_order_release);
+}
+
+static bool dh_on(void) {
+    int s = atomic_load_explicit(&dh_state, memory_order_acquire);
+    if (s == 0) {
+        pthread_once(&dh_once, dh_init);
+        s = atomic_load_explicit(&dh_state, memory_order_acquire);
+    }
+    return s == 2;
+}
+
 /* switch=1: bind the block images into one HAL-owned HOST_VISIBLE allocation (bp: layout and type, decided by
  * bh_plan_make() before anything was allocated). 1 = done; 0 = not usable, the block images have been recreated
  * unbound so the combined path can bind them (logged); -1 = hard failure, *r set. */
@@ -1509,6 +1550,7 @@ static void destroy_parts(struct nvhal_device *d, struct nvhal_astc_image *ai, c
     for (uint32_t m = 0; m < MAX_MIPS; m++)
         if (ai->block[m]) d->DestroyImage(d->handle, ai->block[m], NULL);
     if (ai->blocks_mem) d->FreeMemory(d->handle, ai->blocks_mem, NULL); /* task-17: the block images' own memory */
+    if (ai->decoded_mem) d->FreeMemory(d->handle, ai->decoded_mem, NULL); /* the decoded image's own memory */
     if (app_image && ai->image) d->DestroyImage(d->handle, ai->image, alloc);
     if (ai->counted) bh_live_del(ai);
     free(ai->slots);
@@ -1579,6 +1621,23 @@ bool nvhal_astc_CreateImage(struct nvhal_device *d, const VkImageCreateInfo *ci,
         }
         ai->sparse = (ci->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0;
         for (uint32_t i = 0; i <= c.mips; i++) ai->size[i] = parts[i].size;
+        /* EXPERIMENT: put the decoded image in host memory as well (docs/astc-bc1-plan.md); sparse images keep
+         * the app path. On failure fall through to the normal path -- this switch must never fail a create. */
+        if (*r == VK_SUCCESS && !ai->sparse && dh_on()) {
+            const int32_t t = dh_type(&d->mem_props, parts[0].memoryTypeBits);
+            if (t >= 0) {
+                VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, parts[0].size, (uint32_t)t};
+                VkDeviceMemory m = VK_NULL_HANDLE;
+                if (d->AllocateMemory(dev, &mi, NULL, &m) == VK_SUCCESS) {
+                    if (d->xl.BindImageMemory(dev, ai->image, m, 0) == VK_SUCCESS) {
+                        ai->decoded_mem = m;
+                        ai->decoded_host = true;
+                    } else {
+                        d->FreeMemory(dev, m, NULL);
+                    }
+                }
+            }
+        }
         if (*r == VK_SUCCESS) {
             /* decided before anything is allocated: on the switch, the image not being sparse, and one HOST_VISIBLE
              * memory type fitting every block image (bh_plan_make) */
@@ -1587,7 +1646,24 @@ bool nvhal_astc_CreateImage(struct nvhal_device *d, const VkImageCreateInfo *ci,
                 const int hb = blocks_bind_host(d, ai, &bp, &c, &step, r); /* -1: *r is set */
                 host = hb > 0;
             }
-            if (*r == VK_SUCCESS && !bh_requirements(parts, 1 + c.mips, host, ai->sparse, ai->off, &ai->req)) {
+            if (*r == VK_SUCCESS && ai->decoded_host) {
+                /* the decoded image is already bound in HAL-owned host memory: tell the app nothing needs
+                 * binding, and give it the alignment of the parts that still do (the block images) */
+                VkMemoryRequirements rest;
+                if (host) {
+                    memset(&rest, 0, sizeof rest);
+                    rest.alignment = 1;
+                } else if (!bh_requirements(parts, 1 + c.mips, false, ai->sparse, ai->off, &rest)) {
+                    step = "memory requirements (no memory type fits the block images)";
+                    *r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+                }
+                if (*r == VK_SUCCESS) {
+                    ai->req = rest;
+                    ai->req.size = 0;
+                    /* nothing of the decoded image is bound from the app's memory */
+                    if (host) ai->off[0] = 0;
+                }
+            } else if (*r == VK_SUCCESS && !bh_requirements(parts, 1 + c.mips, host, ai->sparse, ai->off, &ai->req)) {
                 step = "memory requirements (no memory type fits the decoded image and the block images)";
                 *r = VK_ERROR_FORMAT_NOT_SUPPORTED;
             }
