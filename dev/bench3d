@@ -1,0 +1,811 @@
+#!/usr/bin/env bash
+# bench3d — run 3DMark Steel Nomad Light and record everything needed to explain
+# the outcome: score, whether the workload produced real frames, GPU telemetry
+# (util / SM / MEM clock / PCIe gen / power), the guest logcat stream for the
+# whole run, window/task geometry, crash + ANR artefacts, and the raw result zip.
+#
+#   dev/bench3d [--mode MODE] [--label NAME] [--seconds N] [--artifacts DIR]
+#               [--recon] [--no-tap] [--no-clean] [--tap X,Y]
+#               [--gputime] [--props "k=v;k=v"] [--no-hotspots]
+#
+# --gputime sets debug.nvhal.gputime=1 + debug.nvhal.gputime.window=2 (HAL already
+# deployed; see gputime.c:467) before the app starts, harvests the
+# "=== window ..." report lines plus /data/data/<pkg>/nvhal-gputime/gputime.txt,
+# and resets the prop afterwards. --props pushes arbitrary guest props before the
+# app starts (xlate_stats etc.). Props are read once per process, so they must be
+# set before "am start".
+#
+# Pass/fail signal: the result zip is 11-13 KB when the workload really rendered
+# (raw_result.json carries a primary_result in fps) and 3.5-6 KB when it aborted
+# (workload status code != 0, no raw_result.json at all, Monitoring.csv FPS
+# column never populated). Score alone does not distinguish the two.
+#
+# --recon stops after the UI dump of the 3DMark launcher: it validates the whole
+# capture pipeline and prints the real coordinates of the run control without
+# starting a benchmark.
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/env.sh"
+
+SMI=/usr/bin/nvidia-smi
+LXC="-P /var/lib/waydroid/lxc -n waydroid"
+PKG=com.futuremark.dmandroid.application
+ACT=$PKG/.MainActivity
+RESULT_DIR=/storage/emulated/0/Android/data/$PKG/files/3DMarkAndroid
+INTERNAL_DIR=/data/user/0/$PKG/files
+NOISE_PKGS="com.tencent.tmgp.yqqskp com.tencent.android.qqdownloader com.google.android.googlequicksearchbox"
+
+MODE=""; LABEL=""; SECONDS_MAX=420; ART=""; RECON=0; NO_TAP=0; NO_CLEAN=0
+GPUTIME=0; PROPS=""
+TAP_X=1844; TAP_Y=376    # pixel-verified centre of the orange run control
+HOTSECS=20               # dev/gpu-hotspots window started right after the tap
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mode)      MODE=$2; shift 2 ;;
+        --label)     LABEL=$2; shift 2 ;;
+        --seconds)   SECONDS_MAX=$2; shift 2 ;;
+        --artifacts) ART=$2; shift 2 ;;
+        --tap)       TAP_X=${2%,*}; TAP_Y=${2#*,}; shift 2 ;;
+        --recon)     RECON=1; shift ;;
+        --no-tap)    NO_TAP=1; shift ;;
+        --no-clean)  NO_CLEAN=1; shift ;;
+        --hotspots)  HOTSECS=$2; shift 2 ;;
+        --no-hotspots) HOTSECS=0; shift ;;
+        --gputime)   GPUTIME=1; shift ;;
+        --props)     PROPS=$2; shift 2 ;;
+        *) die "unknown argument $1" ;;
+    esac
+done
+
+[ -n "$LABEL" ] || LABEL=${MODE:-$(sed -n 's/^nvidia_driver_mode *= *//p' /var/lib/waydroid/waydroid.cfg | head -1)}
+: "${ART:=$REPO/artifacts/bench3d-$(date +%Y%m%dT%H%M%S)-$LABEL}"
+mkdir -p "$ART"
+START_EPOCH=$(date +%s)
+
+# --- guest helpers -----------------------------------------------------------
+# g: one guest command, stdout only (stderr dropped). lxc-attach chowns its std
+# fds to container root (attach.c fix_stdio_permissions), so a redirect target
+# would end up root-owned 600 — everything therefore goes through cat pipes.
+g()  { sudo -n /usr/bin/lxc-attach $LXC --clear-env -v PATH=/system/bin -- /system/bin/sh -c "$1" </dev/null 2>/dev/null; }
+gr() { g "$1" 2>&1 | tr -d '\r'; }
+# stream: guest command -> host file, byte-exact (no CR translation: PNG safe)
+stream() { sudo -n /usr/bin/lxc-attach $LXC --clear-env -v PATH=/system/bin -- /system/bin/sh -c "$2" </dev/null 2>/dev/null | cat > "$1"; }
+shot() { g "screencap -p /data/local/tmp/.shot.png" >/dev/null 2>&1; stream "$ART/$1" "cat /data/local/tmp/.shot.png" || true; }
+uidump() {
+    local i
+    for i in 1 2 3; do
+        g "uiautomator dump /data/local/tmp/.ui.xml >/dev/null 2>&1" >/dev/null 2>&1 || true
+        stream "$ART/$1" "cat /data/local/tmp/.ui.xml" || true
+        if [ -s "$ART/$1" ] && grep -q '<hierarchy' "$ART/$1" 2>/dev/null; then return 0; fi
+        sleep 2
+    done
+    return 1
+}
+focus() { g 'dumpsys window | grep -m1 mCurrentFocus' | tr -d '\r'; }
+# A foreign "X isn't responding" dialog takes focus and swallows injected input
+# (and makes uiautomator dump nothing). Kill whichever package owns it.
+dismiss_anr() {
+    local i f p
+    for i in 1 2 3; do
+        f=$(focus)
+        case "$f" in
+            *"Application Not Responding"*) ;;
+            *) return 0 ;;
+        esac
+        p=$(printf '%s' "$f" | sed -n 's/.*Application Not Responding: \([^ }]*\).*/\1/p')
+        say "ANR dialog steals focus -> force-stop '$p'  ($f)"
+        g "am force-stop $p" >/dev/null 2>&1 || true
+        g 'input keyevent 4' >/dev/null 2>&1 || true
+        sleep 2
+    done
+    return 0
+}
+
+if [ -n "$MODE" ]; then
+    say "switching to $MODE"
+    systemctl --user stop wd-session.service 2>/dev/null || true
+    sleep 2
+    sudo -n systemctl stop waydroid-container.service || true
+    sleep 3
+    case "$MODE" in
+        nvidia-prolapse) pkexec "$REPO/dev/driver-mode" apply nvidia-prolapse --install dev-root ;;
+        *)               pkexec "$REPO/dev/driver-mode" apply "$MODE" ;;
+    esac
+    "$REPO/dev/restart" | tail -2
+fi
+
+wait_boot() {
+    local i
+    for i in $(seq 1 40); do
+        case "$(g 'getprop sys.boot_completed' | tr -d '\r')" in
+            1) return 0 ;;
+        esac
+        sleep 3
+    done
+    die 'container did not finish booting'
+}
+wait_boot
+
+say "artifacts: $ART"
+{
+    echo "label=$LABEL mode=$(sed -n 's/^nvidia_driver_mode *= *//p' /var/lib/waydroid/waydroid.cfg | head -1) start=$(date -Is)"
+    echo "--- guest props ---"
+    gr 'getprop | grep -iE "ro.hardware|waydroid|display_follows|debug.hwui|ro.build.version"'
+    echo "--- wm size/density ---"
+    gr 'wm size; wm density'
+    echo "--- touch axes ---"
+    gr 'getevent -pl 2>/dev/null | sed -n "/Raw Touch Axes/,/^$/p"'
+} > "$ART/00-guest-env.txt" 2>&1 || true
+
+# --- guest debug props (must be set BEFORE the app process starts) -----------
+# The HAL reads debug.nvhal.* once per process, so a prop set after "am start"
+# has no effect on the run we are about to measure.
+if [ "$GPUTIME" -eq 1 ]; then
+    if [ -n "$PROPS" ]; then PROPS="$PROPS;debug.nvhal.gputime=1;debug.nvhal.gputime.window=2"
+    else PROPS="debug.nvhal.gputime=1;debug.nvhal.gputime.window=2"; fi
+fi
+if [ -n "$PROPS" ]; then
+    say "setting guest props before app start: $PROPS"
+    {
+        echo "--- requested debug props ---"
+        printf '%s\n' "$PROPS" | tr ';' '\n' | while read -r kv; do
+            if [ -z "$kv" ]; then continue; fi
+            pk=$(printf '%s' "$kv" | tr -d ' ' | cut -d= -f1)
+            pv=$(printf '%s' "$kv" | tr -d ' ' | cut -d= -f2-)
+            g "setprop $pk $pv" >/dev/null 2>&1 || true
+            printf 'set %s -> %s\n' "$pk=$pv" "$(g "getprop $pk" | tr -d '\r')"
+        done
+        echo "--- effective debug.nvhal.* ---"
+        gr 'getprop | grep -i nvhal'
+    } >> "$ART/00-guest-env.txt" 2>&1 || true
+fi
+
+# --- crash-artefact baseline ------------------------------------------------
+BEFORE_ANR=$(gr 'ls /data/anr 2>/dev/null' | sort)
+BEFORE_DROP=$(gr 'ls /data/system/dropbox 2>/dev/null' | sort)
+
+# --- start the forensic recorders -------------------------------------------
+say "starting logcat + nvidia-smi recorders"
+: > "$ART/logcat.txt"
+stream "$ART/logcat.txt" "logcat -c -b all; exec logcat -v threadtime -b all" &
+LOGCAT_PID=$!
+
+: > "$ART/gpu.csv"
+( while :; do
+      timeout 5 "$SMI" --query-gpu=timestamp,utilization.gpu,utilization.memory,clocks.sm,clocks.mem,power.draw,temperature.gpu,pcie.link.gen.current,pcie.link.width.current,memory.used \
+          --format=csv,noheader,nounits 2>/dev/null || echo 'x, 0, 0, 0, 0, 0, 0, 0, 0, 0'
+      sleep 2
+  done ) >> "$ART/gpu.csv" &
+SMI_PID=$!
+
+# dmon: PCIe read/write throughput (rxpci/txpci) and violations (pviol/tviol).
+# This is the only ready-made counter that shows whether the GPU is pulling
+# resources over PCIe instead of out of VRAM.
+: > "$ART/dmon-t.csv"
+( timeout 1800 "$SMI" dmon -s t -d 1 -c 1800 > "$ART/dmon-t.csv" 2>&1 ) &
+DMON_T_PID=$!
+: > "$ART/dmon-p.csv"
+( timeout 1800 "$SMI" dmon -s pucvmet -d 1 -c 1800 > "$ART/dmon-p.csv" 2>&1 ) &
+DMON_P_PID=$!
+
+# appcpu: CPU seconds burned by the 3DMark process itself (host /proc, 1 Hz).
+# Pair this with the gputime busy/wall numbers: if the app burns <1 core while
+# the GPU is busy ~100% of the wall clock, the bottleneck is GPU-side, not CPU.
+: > "$ART/appcpu.csv"
+( echo "ts,pid,utime_ticks,stime_ticks,cum_cpu_s"
+  while :; do
+      _p=$(pgrep -f '[c]om.futuremark.dmandroid.application' 2>/dev/null | head -1)
+      if [ -n "${_p:-}" ] && [ -r "/proc/$_p/stat" ]; then
+          awk -v ts="$(date +%s)" -v pid="$_p" '{ sub(/^[^)]*\) /,""); n=split($0,f," "); if (n>=13) printf "%s,%s,%d,%d,%.3f\n", ts, pid, f[12], f[13], (f[12]+f[13])/100 }' "/proc/$_p/stat" 2>/dev/null || true
+      else
+          echo "$(date +%s),none,0,0,0"
+      fi
+      sleep 1
+  done ) >> "$ART/appcpu.csv" 2>/dev/null &
+APPSMI_PID=$!
+cleanup() {
+    # The recorder chain is sudo -n -> lxc-attach -> logcat. Killing only the sudo
+    # wrapper leaves the grandchildren alive: they keep writing to the logcat pipe
+    # and have survived several runs as orphaned root processes, which also keeps
+    # our own stdout pipe open so "dev/bench3d | tail" never finishes. Kill every
+    # link, by name for the guest-side logcat (it is reparented to the container).
+    g 'pkill -9 -x logcat' >/dev/null 2>&1 || true
+    pkill -TERM -P $LOGCAT_PID 2>/dev/null || true
+    kill $LOGCAT_PID $SMI_PID ${DMON_T_PID:-} ${DMON_P_PID:-} ${APPSMI_PID:-} 2>/dev/null || true
+    pkill -TERM -P $SMI_PID 2>/dev/null || true
+    pkill -TERM -P "${DMON_T_PID:-0}" 2>/dev/null || true
+    pkill -TERM -P "${DMON_P_PID:-0}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+sleep 3
+shot 01-before.png
+"$SMI" -q -d PERFORMANCE,CLOCK,POWER,MEMORY > "$ART/gpu-before-q.txt" 2>&1 || true
+
+if [ "$NO_CLEAN" -eq 0 ]; then
+    say "force-stopping background noise: $NOISE_PKGS"
+    for p in $NOISE_PKGS; do g "am force-stop $p" >/dev/null 2>&1 || true; done
+    # One GPU, one CPU: every third-party app is a potential CPU thief during the
+    # run, so clear them all (3DMark itself is excluded).
+    say "force-stopping all other third-party apps"
+    g "pm list packages -3 2>/dev/null | sed 's/^package://'" | tr -d '\r' | while read -r p; do
+        [ -n "$p" ] || continue
+        [ "$p" = "$PKG" ] && continue
+        g "am force-stop $p" >/dev/null 2>&1 || true
+    done
+    sleep 2
+fi
+dismiss_anr
+
+say "launching 3DMark"
+g "cmd statusbar collapse >/dev/null 2>&1; am force-stop $PKG; sleep 2" >/dev/null 2>&1 || true
+BEFORE_COUNT=$(g "ls $RESULT_DIR 2>/dev/null | wc -l" | tr -d '\r ')
+g "am start -W -n $ACT" >/dev/null 2>&1 || true
+sleep 12
+
+uidump 02-launcher-ui.xml || say 'note: uiautomator dump unavailable (expected in this container)'
+# The launcher needs several seconds past a cold start before the run control is
+# painted; a shot taken too early only catches the hero artwork (that is what
+# produced false taps at 973,533 / 978,537 / 978,537). Wait for the app's window
+# to be focused and for its first frames to settle before the single shot the
+# detector consumes.
+for _i in $(seq 1 6); do
+    case "$(focus 2>/dev/null)" in *dmandroid*|*futuremark*) break ;; esac
+    sleep 3
+done
+sleep 8
+shot 02-launcher.png
+focus > "$ART/02-focus.txt" 2>&1 || true
+gr 'dumpsys window displays' > "$ART/03-window-displays.txt" 2>&1 || true
+gr 'dumpsys activity activities' > "$ART/03-dumpsys-activity.txt" 2>&1 || true
+gr 'dumpsys SurfaceFlinger --list' > "$ART/03-surfaceflinger-list.txt" 2>&1 || true
+
+# Locate the run control. Primary: the saturated orange disc in the launcher
+# screenshot (pixel-verified at 1844,376 on a 1900x1010 display). Fallback: the
+# UI hierarchy dump (uiautomator is unreliable in this container); last resort:
+# the fixed coordinate.
+COORDS=$(python3 - "$ART/02-launcher.png" "$ART/02-launcher-ui.xml" "$TAP_X" "$TAP_Y" <<'PYEOF'
+import re, sys
+png, xmlp, dx, dy = sys.argv[1:5]
+def give_up(why):
+    print("%s,%s FALLBACK %s" % (dx, dy, why)); raise SystemExit
+im = None
+why_px = "no-PIL"
+try:
+    from PIL import Image
+    im = Image.open(png).convert("RGB")
+except Exception as e:
+    why_px = "no-PIL(%s)" % e
+if im is not None:
+    from collections import Counter
+    w, h = im.size
+    px = im.load()
+    def is_orange(r, g, b):
+        mx = max(r, g, b); mn = min(r, g, b); d = mx - mn
+        if d == 0 or mx < 50: return False
+        if mx == r: hh = 60 * (((g - b) / float(d)) % 6)
+        elif mx == g: hh = 60 * (((b - r) / float(d)) + 2)
+        else: hh = 60 * (((r - g) / float(d)) + 4)
+        return 8 <= hh <= 48 and d / float(mx) >= 0.55
+    pts = {}
+    for y in range(int(h * 0.10), h, 2):
+        for x in range(int(w * 0.50), w, 2):
+            r, g, b = px[x, y]
+            if is_orange(r, g, b):
+                pts[(x, y)] = (r, g, b)
+    # The run control is a solid disc painted in ONE flat colour; the hero
+    # artwork above it is textured (dozens of near-neighbour browns/oranges), so
+    # require both a big blob and a dominant single colour. A plain centroid, and
+    # even a densest-cell heuristic, silently tapped the artwork.
+    best = None; seen = set()
+    for p in pts:
+        if p in seen: continue
+        stack = [p]; seen.add(p); comp = []
+        while stack:
+            cx, cy = stack.pop(); comp.append((cx, cy))
+            for dx in (-2, 0, 2):
+                for dy in (-2, 0, 2):
+                    q = (cx + dx, cy + dy)
+                    if q in pts and q not in seen:
+                        seen.add(q); stack.append(q)
+        xs = [a for a, b in comp]; ys = [b for a, b in comp]
+        sx, sy = max(xs) - min(xs), max(ys) - min(ys)
+        # A fully drawn run control measures n~1000-1060, span~74x72, flat~0.92.
+        # A partially rendered one (screenshot taken too early, after a cold start)
+        # reads n~360-515, span~66-82, flat~0.71-0.80 and its centroid lands in the
+        # hero artwork -- that produced false taps at 973,533 and 978,537.
+        # Require the disc to look like the disc.
+        if len(comp) < 600 or sx > 160 or sy > 160: continue
+        flat = max(Counter(pts[t] for t in comp).values()) / float(len(comp))
+        if flat < 0.85: continue
+        score = len(comp) * flat
+        if best is None or score > best[0]:
+            best = (score, sum(xs) // len(xs), sum(ys) // len(ys), len(comp), sx, sy, flat)
+    if best:
+        print("%d,%d DISC n=%d span=%dx%d flat=%.2f" % (best[1], best[2], best[3], best[4], best[5], best[6]))
+        raise SystemExit
+    why_px = "no-flat-orange-disc matches=%d" % len(pts)
+try:
+    import xml.etree.ElementTree as ET
+    root = ET.parse(xmlp).getroot()
+    hit = None
+    for n in root.iter("node"):
+        t = (n.get("text") or "") + "|" + (n.get("content-desc") or "") + "|" + (n.get("resource-id") or "")
+        if re.search(r"run|play", t, re.I) and n.get("bounds") and n.get("clickable") == "true":
+            hit = (n.get("bounds"), t.strip()[:60]); break
+    if hit:
+        m = re.findall(r"\d+", hit[0])
+        if len(m) == 4:
+            x1, y1, x2, y2 = map(int, m)
+            print("%d,%d NODE bounds=%s text=%r" % ((x1 + x2) // 2, (y1 + y2) // 2, hit[0], hit[1]))
+            raise SystemExit
+    give_up("px:%s no-node" % why_px)
+except SystemExit:
+    raise
+except Exception as e:
+    give_up("px:%s xml:%s" % (why_px, e))
+PYEOF
+)
+PLAY=${COORDS%% *}
+say "run control: $COORDS  -> tap $PLAY"
+echo "$COORDS" >> "$ART/04-tap-decision.txt"
+
+if [ "$RECON" -eq 1 ]; then
+    say "recon only: not tapping, not waiting for a result"
+    sleep 4
+    shot 05-recon.png
+    cleanup; trap - EXIT
+    echo "RECON $LABEL artifacts=$ART"
+    exit 0
+fi
+
+if [ "$NO_TAP" -eq 0 ]; then
+    g "input tap ${PLAY%,*} ${PLAY#*,}" >/dev/null 2>&1 || true
+    sleep 10
+    uidump 04-ui-after-tap1.xml || true
+    shot 04-after-tap1.png
+    # one retry only if the launcher hierarchy is still on screen (a blind
+    # double tap used to race the activity transition)
+    started=0
+    for i in 1 2 3 4 5 6; do
+        if grep -qiE 'INITIALIZATION_STARTED|BeginWorkload|WORKLOAD_STARTED|TestRunStarted|SteelNomadGt1' "$ART/logcat.txt" 2>/dev/null; then started=1; break; fi
+        sleep 2
+    done
+    if grep -qi 'MainActivity' "$ART/04-ui-after-tap1.xml" 2>/dev/null && grep -qi 'steel nomad' "$ART/04-ui-after-tap1.xml" 2>/dev/null; then started=0; fi
+    if [ "$started" -eq 0 ]; then
+        say "no workload start visible after the first tap - tapping again"
+        dismiss_anr
+        g "input tap ${PLAY%,*} ${PLAY#*,}" >/dev/null 2>&1 || true
+        sleep 8
+        uidump 04-ui-after-tap2.xml || true
+        shot 04-after-tap2.png
+        # give the second tap a real chance before committing to the long wait
+        for i in $(seq 1 15); do
+            if grep -qiE 'INITIALIZATION_STARTED|BeginWorkload|WORKLOAD_STARTED|TestRunStarted|SteelNomadGt1' "$ART/logcat.txt" 2>/dev/null; then started=1; break; fi
+            sleep 2
+        done
+    fi
+    if [ "$started" -eq 0 ]; then
+        say "ERROR: neither tap started a workload (tap point $PLAY) - aborting early"
+        echo "RESULT $LABEL tap-failed no-workload tap=$PLAY decision=$(cat "$ART/04-tap-decision.txt") artifacts=$ART"
+        cleanup; trap - EXIT
+        exit 3
+    fi
+fi
+
+if [ "$HOTSECS" -gt 0 ]; then
+    say "starting dev/gpu-hotspots $HOTSECS (CPU/GPU attribution window)"
+    ( "$REPO/dev/gpu-hotspots" "$HOTSECS" "$ART/hotspots" > "$ART/hotspots-console.txt" 2>&1 || true ) &
+    HOT_PID=$!
+else
+    HOT_PID=""
+fi
+
+# --- wait for the result zip, sampling state as we go ------------------------
+elapsed=0; resulted=0; midshot=0
+while [ "$elapsed" -lt "$SECONDS_MAX" ]; do
+    sleep 5
+    elapsed=$((elapsed + 5))
+    now=$(g "ls $RESULT_DIR 2>/dev/null | wc -l" | tr -d '\r ')
+    if [ "$midshot" -eq 0 ] && [ "$elapsed" -ge 25 ]; then
+        shot 05-mid-run.png
+        gr 'dumpsys activity activities | grep -m3 -E "topResumedActivity|ResumedActivity"' > "$ART/05-mid-activity.txt" 2>&1 || true
+        gr 'top -n 1 -b 2>/dev/null | head -14' > "$ART/05-mid-cpu.txt" 2>&1 || true
+        midshot=1
+    fi
+    # Full nvidia-smi text mid-workload: the Processes table is the only place
+    # that attributes VRAM per pid/type (--query-compute-apps misses graphics).
+    for _m in 45 90; do
+        if [ "$elapsed" -ge "$_m" ] && [ ! -f "$ART/.vram-$_m" ]; then
+            { echo "=== t+${_m}s  $(date -u +%FT%TZ) ==="; timeout 25 "$SMI" 2>&1; } >> "$ART/vram-procs.txt" 2>&1 || true
+            : > "$ART/.vram-$_m"
+        fi
+    done
+    if [ "$now" -gt "$BEFORE_COUNT" ]; then resulted=1; break; fi
+done
+
+cleanup; trap - EXIT
+if [ -n "${HOT_PID:-}" ]; then
+    # gpu-hotspots has been seen to wedge inside "pkexec perf report --sort dso"
+    # (0% CPU, forever). Bounded wait, then reap, or it blocks the whole run.
+    for _i in $(seq 1 45); do kill -0 "$HOT_PID" 2>/dev/null || break; sleep 1; done
+    if kill -0 "$HOT_PID" 2>/dev/null; then
+        say "WARN gpu-hotspots alive after 45s -> killing (perf report wedged?)"
+        pkill -TERM -P "$HOT_PID" 2>/dev/null || true
+        kill -TERM "$HOT_PID" 2>/dev/null || true
+        sleep 3
+        pkill -KILL -P "$HOT_PID" 2>/dev/null || true
+        kill -KILL "$HOT_PID" 2>/dev/null || true
+        pkexec pkill -KILL -f 'perf report' 2>/dev/null || true
+    fi
+    wait "$HOT_PID" 2>/dev/null || true
+fi
+shot 99-after.png
+gr 'dumpsys activity activities' > "$ART/99-dumpsys-activity.txt" 2>&1 || true
+gr 'dumpsys window displays' > "$ART/99-window-displays.txt" 2>&1 || true
+"$SMI" -q -d PERFORMANCE,CLOCK,POWER,MEMORY > "$ART/gpu-after-q.txt" 2>&1 || true
+journalctl -k -o short-precise -S "@$START_EPOCH" --no-pager > "$ART/host-kernel.txt" 2>&1 || true
+gr 'logcat -d -v threadtime -b crash' > "$ART/logcat-crash-tail.txt" 2>&1 || true
+
+# --- nvhal instrumentation output (gputime / xlate_stats) --------------------
+if [ "$GPUTIME" -eq 1 ] || [ -n "$PROPS" ]; then
+    INSTR=/data/data/$PKG
+    say "harvesting nvhal instrumentation from $INSTR"
+    mkdir -p "$ART/nvhal"
+    gr "ls -la $INSTR/nvhal-* 2>&1" > "$ART/nvhal/listing.txt" 2>&1 || true
+    for d in nvhal-gputime nvhal-xlate nvhal-logs; do
+        for f in $(g "ls $INSTR/$d 2>/dev/null" | tr -d '\r'); do
+            if [ -z "$f" ]; then continue; fi
+            stream "$ART/nvhal/$d--$f" "cat $INSTR/$d/$f" || true
+        done
+    done
+    grep -aE 'gputime|xlate|=== window|nvhal' "$ART/logcat.txt" > "$ART/nvhal/logcat-nvhal.txt" 2>/dev/null || true
+    say "resetting instrumentation props to 0 (HAL reads them once per process)"
+    {
+        printf 'debug.nvhal.gputime\ndebug.nvhal.gputime.window\ndebug.nvhal.xlate_stats\ndebug.nvhal.xlate_stats.window\n'
+        if [ -n "$PROPS" ]; then printf '%s\n' "$PROPS" | tr ';' '\n' | cut -d= -f1; fi
+    } | tr -d ' ' | sort -u | while read -r pk; do
+        [ -n "$pk" ] || continue
+        g "setprop $pk 0" >/dev/null 2>&1 || true
+    done
+    gr 'getprop | grep -i nvhal' > "$ART/nvhal/props-after-run.txt" 2>&1 || true
+fi
+
+# --- new ANR / dropbox artefacts --------------------------------------------
+mkdir -p "$ART/guest-crash"
+for f in $(gr 'ls /data/anr 2>/dev/null' | sort); do
+    case "$BEFORE_ANR" in *"$f"*) continue ;; esac
+    stream "$ART/guest-crash/anr-$f" "cat /data/anr/$f" || true
+done
+for f in $(gr 'ls /data/system/dropbox 2>/dev/null' | sort); do
+    case "$BEFORE_DROP" in *"$f"*) continue ;; esac
+    stream "$ART/guest-crash/dropbox-$f" "cat /data/system/dropbox/$f" || true
+done
+gr 'ls -l /data/anr /data/system/dropbox 2>&1' > "$ART/guest-crash/listing.txt" 2>&1 || true
+
+if [ "$resulted" -ne 1 ]; then
+    echo "RESULT $LABEL no-result-file after ${elapsed}s artifacts=$ART"
+    exit 1
+fi
+
+sleep 4
+NEWEST=$(gr "ls -t $RESULT_DIR/*.zip 2>/dev/null | head -1")
+SIZE=$(g "stat -c %s '$NEWEST'" | tr -d '\r ')
+stream "$ART/result.zip" "cat '$NEWEST'" || say 'WARN: failed to copy result.zip off the guest'
+UNPACK=/data/local/tmp/bench3d-unpack
+g "rm -rf $UNPACK && mkdir -p $UNPACK && cd $UNPACK && unzip -o -q '$NEWEST'" >/dev/null 2>&1 || true
+g "ls $UNPACK" | tr -d '\r' > "$ART/result-manifest.txt" 2>&1 || true
+mkdir -p "$ART/unpacked"
+for f in $(g "ls $UNPACK" | tr -d '\r'); do
+    [ -n "$f" ] || continue
+    stream "$ART/unpacked/$f" "cat $UNPACK/$f" || true
+done
+g "ls -t $INTERNAL_DIR/*.zip 2>/dev/null | head -40" | tr -d '\r' > "$ART/internal-zips.txt" 2>&1 || true
+
+python3 - "$ART" "$LABEL" "$SIZE" "$elapsed" <<'PYEOF' || true
+import json, os, re, sys, csv
+art, label, size, elapsed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+out = {"label": label, "zip_size": size, "elapsed_s": elapsed, "artifacts": art}
+def rdf(p):
+    try: return open(p, errors="replace").read()
+    except Exception: return ""
+# --- raw_result.json ---
+rpath = os.path.join(art, "unpacked", "raw_result.json")
+out["has_raw_result"] = os.path.exists(rpath)
+if out["has_raw_result"]:
+    txt = rdf(rpath)
+    out["raw_result_bytes"] = len(txt)
+    try:
+        d = json.loads(txt)
+    except Exception as e:
+        d = None; out["raw_parse_error"] = str(e)
+    if d is not None:
+        hits = []
+        def walk(o, path=""):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    p = path + "/" + k
+                    if isinstance(v, (int, float, str)) and re.search(r"score|fps|rate|error|status|result|time|duration|abort", k, re.I):
+                        hits.append((p, v))
+                    walk(v, p)
+            elif isinstance(o, list):
+                for i, v in enumerate(o[:12]): walk(v, path + "/%d" % i)
+        walk(d)
+        out["raw_fields"] = hits[:60]
+        def find_key(o, key):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k.lower() == key and not isinstance(v, (dict, list)):
+                        return v
+                    r = find_key(v, key)
+                    if r is not None: return r
+            elif isinstance(o, list):
+                for v in o:
+                    r = find_key(v, key)
+                    if r is not None: return r
+            return None
+        # the Vulkan device identity is THE pass/fail discriminator
+        for k in ("devicename", "detailedmessage", "swapchainresolution", "resolution", "fps", "primaryresult"):
+            out["rk_" + k] = find_key(d, k)
+# --- Arielle.xml ---
+a = rdf(os.path.join(art, "unpacked", "Arielle.xml"))
+if a:
+    out["arielle_bytes"] = len(a)
+    m = re.search(r"<run_errors[^>]*status=\"([^\"]*)\"", a)
+    out["run_errors_status"] = m.group(1) if m else None
+    m = re.search(r"<execution_state fsm_state=\"([^\"]*)\"", a)
+    out["fsm_state"] = m.group(1) if m else None
+    codes = re.findall(r"<status code=\"([^\"]*)\"", a)
+    out["status_codes"] = codes
+    m = re.search(r"<primary_result[^>]*>([^<]*)</primary_result>", a)
+    out["primary_result"] = m.group(1) if m else None
+    m = re.search(r"<setting>\s*<name>rendering_resolution</name>\s*<value>([^<]*)</value>", a)
+    out["rendering_resolution"] = m.group(1) if m else None
+# --- Result.xml ---
+r = rdf(os.path.join(art, "unpacked", "Result.xml"))
+if r:
+    out["result_xml_scores"] = re.findall(r"<(SteelNomad[A-Za-z0-9]*Score[A-Za-z0-9]*)>([^<]*)</\1>", r)
+# --- Monitoring.csv ---
+mp = os.path.join(art, "unpacked", "Monitoring.csv")
+if os.path.exists(mp):
+    rows = list(csv.reader(open(mp, errors="replace")))
+    out["monitoring_rows"] = len(rows) - 1
+    if rows:
+        hdr = rows[0]
+        try:
+            fi = hdr.index("BM/FramesPerSecond:I1000"); ei = hdr.index("BM/Events:E"); ri = hdr.index("BM/RunTimeSeconds:E")
+            ev = [(rw[ri], rw[ei]) for rw in rows[1:] if len(rw) > ei and rw[ei].strip()]
+            fps = [rw[fi] for rw in rows[1:] if len(rw) > fi and rw[fi].strip()]
+            out["monitoring_events"] = ev
+            out["monitoring_fps_samples"] = len(fps)
+            out["monitoring_run_end_s"] = rows[-1][ri] if len(rows[-1]) > ri else None
+        except ValueError:
+            pass
+# --- gpu.csv ---
+gp = os.path.join(art, "gpu.csv")
+if os.path.exists(gp):
+    U, SM, MEM, PW = [], [], [], []
+    gens = {}
+    for line in open(gp, errors="replace"):
+        p = [x.strip() for x in line.split(",")]
+        if len(p) < 10: continue
+        try:
+            u, um, sm, mem, pw, tg, gen, w, mu = (int(p[1]), int(p[2]), int(p[3]), int(p[4]),
+                                                  float(p[5]), int(p[6]), p[7], p[8], int(p[9]))
+        except ValueError:
+            continue
+        U.append(u); SM.append(sm); MEM.append(mem); PW.append(pw)
+        gens[gen] = gens.get(gen, 0) + 1
+    if U:
+        out["gpu"] = {"samples": len(U), "peak_util": max(U), "mean_util": sum(U) // len(U),
+                      "peak_sm_mhz": max(SM), "peak_mem_mhz": max(MEM), "max_power_w": max(PW),
+                      "pcie_gen_hist": gens}
+# --- logcat signal ---
+lp = os.path.join(art, "logcat.txt")
+if os.path.exists(lp):
+    pats = {"Xid": r"\bXid\b|fallen off the bus|RmInitAdapter failed", "DEVICE_LOST": r"DEVICE_LOST|device lost",
+            "VK_ERROR": r"VK_ERROR", "vulkan": r"vulkan|vkCreate|vkAllocate",
+            "gralloc": r"gralloc", "nvgralloc": r"nvgralloc|NvGralloc",
+            "nvk": r"\bNVK\b|nvkmd|nvidia-prolapse", "virgl_venus": r"virgl|venus",
+            "lowmemorykiller": r"lowmemorykiller|lmkd.*kill|Killing.*to free",
+            "FATAL": r"FATAL EXCEPTION", "ANR": r"ANR in |not responding|Input dispatching timed out",
+            "am_crash": r"am_crash|am_anr|am_proc_died", "tombstone": r"tombstone|SIGSEGV|SIGABRT|signal 11",
+            "workload": r"Disco|Workload|flamenco|FuturemarkError|DLC", "angle_err": r"ANGLE.*(error|fail)|EGL_BAD",
+            "swiftshader": r"swiftshader|SwiftShader", "surfaceflinger_err": r"SurfaceFlinger.*(error|fail|abort)"}
+    txt = open(lp, errors="replace").read()
+    sig = {}
+    for k, pat in pats.items():
+        ms = re.findall(r".*" + pat + r".*", txt, re.I)
+        sig[k] = {"count": len(ms), "sample": [x[:200] for x in ms[:6]]}
+    out["logcat_lines"] = txt.count("\n")
+    out["logcat_signal"] = sig
+# --- nvhal instrumentation: gputime + xlate_stats ---------------------------
+nv = os.path.join(art, "nvhal")
+if os.path.isdir(nv):
+    blob = ""
+    for fn in sorted(os.listdir(nv)):
+        blob += rdf(os.path.join(nv, fn)) + "\n"
+    gp = []
+    pat = r"===\s*window\s+([0-9.]+)\s*ms,\s*(\d+)\s+frames\s*\(([0-9.]+)\s*fps\)[^\n]*?busy\s+([0-9.]+)\s*ms"
+    for m in re.finditer(pat, blob):
+        gp.append({"window_ms": float(m.group(1)), "frames": int(m.group(2)),
+                   "fps": float(m.group(3)), "busy_ms": float(m.group(4))})
+    out["gputime_windows"] = gp
+    if gp:
+        b = sorted(x["busy_ms"] for x in gp)
+        wr = sorted((1000.0 / x["fps"]) if x["fps"] else 0.0 for x in gp)
+        bm = b[len(b) // 2]; wm = wr[len(wr) // 2]
+        out["gputime"] = {"windows": len(gp), "busy_ms_min": b[0], "busy_ms_median": bm,
+                          "busy_ms_max": b[-1], "wall_ms_per_frame_median": wm,
+                          "busy_over_wall_median": (bm / wm) if wm else None}
+    xl = [l for l in blob.splitlines()
+          if ("xlate stats" in l) or ("statistics ON" in l) or ("gputime:" in l) or ("gputime stats" in l)]
+    if xl:
+        out["xlate_lines"] = xl[-14:]
+        pct = [float(x) for x in re.findall(r"([0-9.]+)%\s*of cpu", blob)]
+        if pct:
+            out["xlate_cpu_pct_max"] = max(pct); out["xlate_cpu_pct_tail"] = pct[-10:]
+        usf = [float(x) for x in re.findall(r"([0-9.]+)\s*us/frame", blob)]
+        if usf:
+            out["xlate_us_per_frame_last"] = usf[-1]
+if not out.get("gputime_windows"):
+    out["gputime_windows"] = []
+# --- HAL EXPERIMENT lines (hostvis_to_bar / memtypes / memstats / astc) -----
+# One generic matcher: every debug.nvhal.* experiment prints "EXPERIMENT <prop>:
+# ..." so a new switch never needs another parser.
+expat = re.compile(r"EXPERIMENT[^\n]*")
+for src, tag in ((os.path.join(art, "nvhal", "logcat-nvhal.txt"), "nvhal"),
+                 (os.path.join(art, "logcat.txt"), "logcat")):
+    if not os.path.exists(src):
+        continue
+    lines = expat.findall(rdf(src))
+    if lines:
+        ex = out.setdefault("experiment", {})
+        ex[tag + "_lines"] = len(lines)
+        ex[tag + "_sample"] = lines[:8]
+        ex[tag + "_last"] = lines[-4:]
+        if tag == "nvhal":
+            ex["all"] = lines
+# --- BAR1 / FB memory windows (before + after) ------------------------------
+bars = {}
+for tag in ("before", "after"):
+    qp = os.path.join(art, "gpu-%s-q.txt" % tag)
+    if not os.path.exists(qp):
+        continue
+    qt = rdf(qp)
+    mb = re.search(r"BAR1 Memory Usage\s*\n\s*Total\s*:\s*(\d+)\s*MiB\s*\n\s*Used\s*:\s*(\d+)\s*MiB\s*\n\s*Free\s*:\s*(\d+)\s*MiB", qt)
+    if mb:
+        bars.setdefault(tag, {})["bar1"] = {"total_mib": int(mb.group(1)), "used_mib": int(mb.group(2)), "free_mib": int(mb.group(3))}
+    mf = re.search(r"FB Memory Usage\s*\n\s*Total\s*:\s*(\d+)\s*MiB\s*\n\s*Reserved\s*:\s*(\d+)\s*MiB\s*\n\s*Used\s*:\s*(\d+)\s*MiB\s*\n\s*Free\s*:\s*(\d+)\s*MiB", qt)
+    if mf:
+        bars.setdefault(tag, {})["fb"] = {"total_mib": int(mf.group(1)), "used_mib": int(mf.group(3)), "free_mib": int(mf.group(4))}
+if bars:
+    out["bar1"] = bars
+# --- memory-failure evidence (risk of the hostvis_to_bar A/B) ---------------
+for src, tag in ((os.path.join(art, "logcat.txt"), "logcat"),
+                 (os.path.join(art, "logcat-crash-tail.txt"), "crash")):
+    if not os.path.exists(src):
+        continue
+    hits = re.findall(r".*(?:OUT_OF_DEVICE_MEMORY|OUT_OF_HOST_MEMORY|VK_ERROR_OUT_OF|ERROR_OUT_OF|DEVICE_LOST|device lost|hostvis_to_bar).*", rdf(src), re.I)
+    out["mem_fail_" + tag] = {"count": len(hits), "sample": [h[:220] for h in hits[:8]]}
+# --- dmon: PCIe throughput + violation counters ------------------------------
+dm = {}
+for fn, key in (("dmon-t.csv", "t"), ("dmon-p.csv", "p")):
+    p = os.path.join(art, fn)
+    if not os.path.exists(p):
+        continue
+    hdr = None
+    rows = []
+    for line in rdf(p).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            if hdr is None and not re.match(r"^#\s*Idx", s):
+                hdr = s.lstrip("#").split()
+            continue
+        if hdr:
+            parts = s.split()
+            if len(parts) == len(hdr):
+                rows.append(parts)
+    if not hdr or not rows:
+        continue
+    ent = {"header": hdr, "n": len(rows)}
+    for name in ("rxpci", "txpci", "pviol", "tviol", "sm", "mem", "pwr", "mclk", "fb", "bar1"):
+        if name not in hdr:
+            continue
+        i = hdr.index(name)
+        vals = []
+        for r in rows:
+            try:
+                vals.append(float(r[i]))
+            except ValueError:
+                pass
+        if vals:
+            ent[name] = {"peak": max(vals), "mean": round(sum(vals) / len(vals), 2), "n": len(vals)}
+    dm[key] = ent
+if dm:
+    out["dmon"] = dm
+out["vram_procs"] = os.path.exists(os.path.join(art, "vram-procs.txt"))
+
+# --- appcpu.csv: host-side CPU seconds of the 3DMark process (1 Hz) ----------
+ap = os.path.join(art, "appcpu.csv")
+if os.path.exists(ap):
+    arows = []
+    for ln in open(ap, errors="replace"):
+        p = ln.strip().split(",")
+        if len(p) < 5 or p[1] in ("pid", "none", ""):
+            continue
+        try:
+            arows.append((int(p[0]), p[1], float(p[2]) + float(p[3])))
+        except ValueError:
+            continue
+    cores = []
+    for (t0, p0, c0), (t1, p1, c1) in zip(arows, arows[1:]):
+        if p0 == p1 and t1 > t0 and c1 >= c0:
+            cores.append((c1 - c0) / 100.0 / (t1 - t0))  # CLK_TCK=100
+    if cores:
+        out["appcpu"] = {"n": len(cores), "peak_cores": round(max(cores), 2),
+                         "mean_cores": round(sum(cores) / len(cores), 2)}
+json.dump(out, open(os.path.join(art, "summary.json"), "w"), indent=1)
+g = out.get("gpu", {})
+st = "FAIL"
+if size > 10000: st = "OK"
+print("RESULT %s score=%s size=%dB peak_util=%s%% mean_util=%s%% peak_sm=%sMHz peak_mem=%sMHz max_power=%sW elapsed=%ss %s" % (
+    label, (out.get("result_xml_scores") or [[None, "?"]])[0][1] if out.get("result_xml_scores") else "?",
+    size, g.get("peak_util", "-"), g.get("mean_util", "-"), g.get("peak_sm_mhz", "-"),
+    g.get("peak_mem_mhz", "-"), g.get("max_power_w", "-"), elapsed, st))
+print("raw_result.json present : %s" % out.get("has_raw_result"))
+print("deviceName | detail     : %s | %s" % (out.get("rk_devicename"), str(out.get("rk_detailedmessage"))[:160]))
+print("swapchain | resolution  : %s | %s" % (out.get("rk_swapchainresolution"), out.get("rk_resolution")))
+print("run_errors status       : %s   fsm=%s" % (out.get("run_errors_status"), out.get("fsm_state")))
+print("workload status codes   : %s   primary_result=%s" % (out.get("status_codes"), out.get("primary_result")))
+print("monitoring rows/fps/end : %s / %s / %ss" % (out.get("monitoring_rows"), out.get("monitoring_fps_samples"), out.get("monitoring_run_end_s")))
+print("monitoring events       : %s" % (out.get("monitoring_events"),))
+print("pcie gen histogram      : %s" % (g.get("pcie_gen_hist"),))
+print("rendering_resolution    : %s" % out.get("rendering_resolution"))
+print("result.xml scores       : %s" % (out.get("result_xml_scores"),))
+if out.get("bar1"):
+    print("BAR1/FB memory          : %s" % json.dumps(out["bar1"]))
+if out.get("dmon"):
+    for k, v in out["dmon"].items():
+        line = "dmon[%s] n=%s" % (k, v.get("n"))
+        for name in ("rxpci", "txpci", "pviol", "tviol", "sm", "mem", "pwr", "mclk"):
+            if v.get(name):
+                line += " %s(peak=%s mean=%s)" % (name, v[name]["peak"], v[name]["mean"])
+        print(line)
+print("vram-procs.txt          : %s" % ("present" if out.get("vram_procs") else "MISSING"))
+print("appcpu.csv (host CPU)   : %s" % (json.dumps(out.get("appcpu")) if out.get("appcpu") else "MISSING"))
+if out.get("experiment"):
+    ex = out["experiment"]
+    print("EXPERIMENT lines        : nvhal=%s logcat=%s" % (ex.get("nvhal_lines"), ex.get("logcat_lines")))
+    for ln in (ex.get("all") or ex.get("nvhal_sample") or ex.get("logcat_sample") or [])[:14]:
+        print("    %s" % ln[:240])
+else:
+    print("EXPERIMENT lines        : ABSENT (props off, no matching type, or HAL did not run)")
+for _t in ("logcat", "crash"):
+    mf = out.get("mem_fail_" + _t)
+    if mf and mf["count"]:
+        print("mem-fail[%s] count=%d : %s" % (_t, mf["count"], str(mf["sample"])[:300]))
+if out.get("gputime_windows"):
+    print("--- nvhal gputime (busy = GPU ms/frame, wall = 1000/fps) ---")
+    for x in out["gputime_windows"][-8:]:
+        print("gputime win=%8.0fms frames=%-4d fps=%.2f busy=%.3fms wall/frame=%.1fms busy/wall=%.3f" % (
+            x["window_ms"], x["frames"], x["fps"], x["busy_ms"],
+            (1000.0 / x["fps"]) if x["fps"] else -1.0,
+            (x["busy_ms"] * x["fps"] / 1000.0) if x["fps"] else -1.0))
+    gsum = out.get("gputime", {})
+    print("gputime summary         : %s" % (gsum,))
+else:
+    print("gputime windows         : none found in artifacts/nvhal/*")
+for l in (out.get("xlate_lines") or [])[-4:]:
+    print("nvhal[stat] %s" % (l[:200],))
+if out.get("xlate_cpu_pct_max") is not None:
+    print("xlate cpu pct           : max=%s tail=%s us/frame_last=%s" % (
+        out.get("xlate_cpu_pct_max"), out.get("xlate_cpu_pct_tail"), out.get("xlate_us_per_frame_last")))
+ls = out.get("logcat_signal", {})
+for k in sorted(ls):
+    if ls[k]["count"]:
+        print("logcat[%-16s] n=%-5d %s" % (k, ls[k]["count"], ls[k]["sample"][:2]))
+print("artifacts               : %s" % art)
+PYEOF

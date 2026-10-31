@@ -1090,10 +1090,14 @@ static const char *unavailable_why(const struct nvhal_device *d, const struct ef
 }
 
 /* --------------------------------------------------- the block-host switch (task-17) ----------------------------
- * debug.nvhal.astc_blocks_host / NVHAL_ASTC_BLOCKS_HOST: 1 = the emulated compressed images' block images live in
- * HAL-owned HOST_VISIBLE memory instead of behind the decoded image in the app's allocation (the bh_* block above is
- * the decision). Read once per process, like the other debug switches: set it before the app starts. Off: one acquire
- * load per emulated vkCreateImage, per vkAllocateMemory/vkFreeMemory, and per vkDestroyDevice. */
+ * debug.nvhal.astc_blocks_host / NVHAL_ASTC_BLOCKS_HOST: **ON by default since 2026-10-31**; an explicit 0 turns it
+ * off. When on, the emulated compressed images' block images live in HAL-owned host memory instead of behind the
+ * decoded image in the app's allocation (the bh_* block above is the decision), so the memory requirements the app
+ * is given cover the decoded image only. The value is read once per process: set it before the app starts.
+ * Why on by default: on a Pascal card with 8 GiB this is the difference between the app running out of
+ * DEVICE_LOCAL memory 139 times (1.35 GiB spilling into host memory, every frame crossing PCIe) and 16 times.
+ * Measured 205 -> 754 -> 1267 points on 3DMark Steel Nomad Light (docs/BREAKTHROUGH-blocks-host-3.7x.md).
+ * Off costs one acquire load per emulated vkCreateImage, per AllocateMemory/FreeMemory, per DestroyDevice. */
 static _Atomic int bh_state; /* 0 unprobed, 1 off, 2 on */
 static pthread_once_t bh_once = PTHREAD_ONCE_INIT;
 
@@ -1105,10 +1109,12 @@ static void bh_init(void) {
     const char *e = getenv("NVHAL_ASTC_BLOCKS_HOST");
     if (e) snprintf(v, sizeof v, "%s", e);
 #endif
-    const bool on = atoi(v) > 0;
+    /* on unless explicitly set to 0 (see the block comment above) */
+    const bool on = !(v[0] && atoi(v) <= 0);
     atomic_store_explicit(&bh_state, on ? 2 : 1, memory_order_release);
     if (on)
-        NVHAL_WARN("astc blocks host: ON (NVHAL_ASTC_BLOCKS_HOST / debug.nvhal.astc_blocks_host): each emulated "
+        NVHAL_WARN("astc blocks host: ON by default (set NVHAL_ASTC_BLOCKS_HOST / debug.nvhal.astc_blocks_host "
+                       "to 0 to combine the block images into the app's allocation): each emulated "
                    "compressed image's block images get a HAL-owned HOST_VISIBLE allocation, so the app's memory "
                    "requirements cover the decoded image only; one summary line at vkDestroyDevice");
 }
