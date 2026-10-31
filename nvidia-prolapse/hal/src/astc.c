@@ -554,6 +554,13 @@ struct nvhal_astc_dev {
     VkPipelineLayout pl;
     VkShaderModule sm;
     VkPipeline pipe[NVHAL_ASTC_NUM_PARTITION_TABLES];
+    /* ASTC->BC1 encoder (src/bc1_encode.comp); created lazily, see bc1_encoder() */
+    int bc1_init; /* 0 not tried, 1 ready, -1 failed */
+    VkDescriptorSetLayout bc1_dsl;
+    VkPipelineLayout bc1_pl;
+    VkShaderModule bc1_sm;
+    VkPipeline bc1_pipe;
+    VkDescriptorPool bc1_pool;
     bool pipe_failed[NVHAL_ASTC_NUM_PARTITION_TABLES];
     VkDescriptorPool *pools;
     uint32_t npools;
@@ -729,6 +736,56 @@ static VkResult decoder_init(struct nvhal_device *d) {
                 (unsigned long long)size, (unsigned long long)a->texel_align);
     a->init = 1;
     return VK_SUCCESS;
+}
+
+/* the ASTC->BC1 encoder (src/bc1_encode.comp). Caller holds a->lock.
+ * set 0: binding 0 = the decoder's RGBA8 tmp image (storage), binding 1 = the BC1 block buffer (SSBO);
+ * push constants: block_start, block_end, blocks_per_row. */
+static VkPipeline bc1_encoder(struct nvhal_device *d) {
+    struct nvhal_astc_dev *a = d->astc;
+    if (a->bc1_init) return a->bc1_init > 0 ? a->bc1_pipe : VK_NULL_HANDLE;
+    a->bc1_init = -1;
+    VkDevice dev = d->handle;
+    const char *step = "vkCreateDescriptorSetLayout(BC1 encoder)";
+    VkDescriptorSetLayoutBinding b[2] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+    };
+    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, b};
+    VkResult r = d->cs.CreateDescriptorSetLayout(dev, &dci, NULL, &a->bc1_dsl);
+    if (r == VK_SUCCESS) {
+        step = "vkCreatePipelineLayout(BC1 encoder)";
+        VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 20};
+        VkPipelineLayoutCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &a->bc1_dsl, 1, &pcr};
+        r = d->cs.CreatePipelineLayout(dev, &pci, NULL, &a->bc1_pl);
+    }
+    if (r == VK_SUCCESS) {
+        step = "vkCreateShaderModule(bc1_encode.comp)";
+        VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, nvhal_bc1_encode_spv_size,
+                                        nvhal_bc1_encode_spv};
+        r = d->cs.CreateShaderModule(dev, &smi, NULL, &a->bc1_sm);
+    }
+    if (r == VK_SUCCESS) {
+        step = "vkCreateComputePipelines(BC1 encoder)";
+        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, a->bc1_sm,
+             "main", NULL}, a->bc1_pl, VK_NULL_HANDLE, -1};
+        r = d->cs.CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, &a->bc1_pipe);
+    }
+    if (r == VK_SUCCESS) {
+        step = "vkCreateDescriptorPool(BC1 encoder)";
+        VkDescriptorPoolSize sz[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8}};
+        VkDescriptorPoolCreateInfo pci2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL,
+                                           VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 8, 2, sz};
+        r = d->cs.CreateDescriptorPool(dev, &pci2, NULL, &a->bc1_pool);
+    }
+    if (r != VK_SUCCESS) {
+        NVHAL_ERR("ASTC->BC1: encoder setup failed at %s -> %s; ASTC 4x4 uploads stay RGBA8 %s", step, NVHAL_VKR(r),
+                  R8_TAG);
+        return VK_NULL_HANDLE;
+    }
+    a->bc1_init = 1;
+    return a->bc1_pipe;
 }
 
 /* vk_texcompress_astc.c create_astc_decode_pipeline(): specialization = block size, DECODE_8BIT = true.
@@ -2175,6 +2232,8 @@ struct decode_job {
     VkImageLayout layout; /* the app's layout of the image (and so of the block image) */
 };
 
+static void record_bc1(struct nvhal_device *d, VkCommandBuffer cb, const struct decode_job *j);
+
 /* the cached views + descriptor set for (mip, layers). Caller holds a->lock. */
 static VkResult slot_get(struct nvhal_device *d, struct nvhal_astc_image *ai, uint32_t mip, uint32_t base, uint32_t count,
                          struct astc_slot *out) {
@@ -2198,7 +2257,10 @@ static VkResult slot_get(struct nvhal_device *d, struct nvhal_astc_image *ai, ui
                                 VK_IMAGE_VIEW_TYPE_2D_ARRAY, ai->e.block, id,
                                 {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, base, count}};
     VkImageViewUsageCreateInfo su = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_STORAGE_BIT};
-    VkImageViewCreateInfo dv = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &su, 0, ai->image, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+    /* BC1: the decoder writes into the HAL's own RGBA8 tmp image; the app's BC1 image cannot be a storage
+     * image (BC1 has no STORAGE_IMAGE feature) and is filled by the encoder + a copyBufferToImage afterwards */
+    VkImage dst_img = ai->bc1 ? ai->tmp : ai->image;
+    VkImageViewCreateInfo dv = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &su, 0, dst_img, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
                                 ai->e.store, id, {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, base, count}};
     VkResult r = d->xl.CreateImageView(d->handle, &sv, NULL, &s.src);
     if (r == VK_SUCCESS) r = d->xl.CreateImageView(d->handle, &dv, NULL, &s.dst);
@@ -2231,6 +2293,79 @@ static VkResult slot_get(struct nvhal_device *d, struct nvhal_astc_image *ai, ui
     return VK_SUCCESS;
 }
 
+/* ASTC->BC1: after the decoder has written j's texels into ai->tmp, encode them into BC1 blocks in ai->bc1_buf
+ * and copy those blocks into the app's BC1 image.  Runs inside the app's command buffer, like the decode itself. */
+static void record_bc1(struct nvhal_device *d, VkCommandBuffer cb, const struct decode_job *j) {
+    struct nvhal_astc_image *ai = j->ai;
+    struct nvhal_astc_dev *a = d->astc;
+    VkPipeline pipe = bc1_encoder(d);
+    if (!pipe) return;   /* logged once by bc1_encoder; the RGBA8 texels stay in tmp */
+
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, ai->tmp,
+                                VK_IMAGE_VIEW_TYPE_2D_ARRAY, ai->e.decoded, {VK_COMPONENT_SWIZZLE_IDENTITY,
+                                VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                VK_COMPONENT_SWIZZLE_IDENTITY},
+                                {VK_IMAGE_ASPECT_COLOR_BIT, j->mip, 1, j->base, j->count}};
+    VkImageViewUsageCreateInfo uv = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_STORAGE_BIT};
+    vi.pNext = &uv;
+    VkImageView view = VK_NULL_HANDLE;
+    if (d->xl.CreateImageView(d->handle, &vi, NULL, &view) != VK_SUCCESS) {
+        NVHAL_ERR("ASTC->BC1: cannot view the tmp image for the encoder %s", R8_TAG);
+        return;
+    }
+    VkDescriptorSetAllocateInfo ai2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, a->bc1_pool, 1, &a->bc1_dsl};
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (d->cs.AllocateDescriptorSets(d->handle, &ai2, &set) != VK_SUCCESS) {
+        d->cs.DestroyImageView(d->handle, view, NULL);
+        NVHAL_ERR("ASTC->BC1: out of descriptor sets for the encoder %s", R8_TAG);
+        return;
+    }
+    VkDescriptorImageInfo di = {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorBufferInfo bi = {ai->bc1_buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[2] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &di, NULL, NULL},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL},
+    };
+    d->cs.UpdateDescriptorSets(d->handle, 2, w, 0, NULL);
+
+    /* the decoder wrote tmp (COMPUTE) -> the encoder reads it (COMPUTE) */
+    VkImageMemoryBarrier pre = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ai->tmp,
+                                {VK_IMAGE_ASPECT_COLOR_BIT, j->mip, 1, j->base, j->count}};
+    d->xl.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                             0, NULL, 0, NULL, 1, &pre);
+    d->cs.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    d->cs.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, a->bc1_pl, 0, 1, &set, 0, NULL);
+    const uint32_t rows = div_up(ai->extent.width, 4);
+    const int32_t pc[5] = {(int32_t)div_up(j->x, 4), (int32_t)div_up(j->y, 4),
+                           (int32_t)div_up(j->x + (int32_t)j->w, 4), (int32_t)div_up(j->y + (int32_t)j->h, 4), (int32_t)rows};
+    d->cs.CmdPushConstants(cb, a->bc1_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, pc);
+    d->cs.CmdDispatch(cb, div_up(div_up(j->w, 4), 8), div_up(div_up(j->h, 4), 8), j->count);
+
+    /* encoder writes bc1_buf -> the copy reads it (TRANSFER), and the app's BC1 image takes the blocks */
+    VkBufferMemoryBarrier bb = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                                ai->bc1_buf, 0, VK_WHOLE_SIZE};
+    VkImageMemoryBarrier post = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ai->image,
+                                 {VK_IMAGE_ASPECT_COLOR_BIT, j->mip, 1, j->base, j->count}};
+    d->xl.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, NULL, 1, &bb, 1, &post);
+
+    /* one BC1 block per 4x4 texels; bufferRowLength/ImageHeight are in texels, bufferOffset must be 8 B aligned */
+    VkBufferImageCopy c;
+    memset(&c, 0, sizeof c);
+    c.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, j->mip, j->base, j->count};
+    c.imageOffset = (VkOffset3D){(int32_t)j->x, (int32_t)j->y, 0};
+    c.imageExtent = (VkExtent3D){(uint32_t)j->w, (uint32_t)j->h, 1};
+    d->xl.CmdCopyBufferToImage(cb, ai->bc1_buf, ai->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+
+    d->cs.FreeDescriptorSets(d->handle, a->bc1_pool, 1, &set);
+    d->cs.DestroyImageView(d->handle, view, NULL);
+}
+
 static void record_decode(struct nvhal_device *d, VkCommandBuffer cb, const struct decode_job *j, VkPipeline pipe,
                           const struct astc_slot *s) {
     struct nvhal_astc_image *ai = j->ai;
@@ -2241,7 +2376,8 @@ static void record_decode(struct nvhal_device *d, VkCommandBuffer cb, const stru
          VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ai->block[j->mip],
          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, j->base, j->count}},
         {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-         j->layout, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ai->image,
+         j->layout, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+         ai->bc1 ? ai->tmp : ai->image,
          {VK_IMAGE_ASPECT_COLOR_BIT, j->mip, 1, j->base, j->count}},
     };
     d->xl.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL,
@@ -2255,6 +2391,7 @@ static void record_decode(struct nvhal_device *d, VkCommandBuffer cb, const stru
         d->cs.CmdPushConstants(cb, d->astc->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, PUSH_SIZE, pc);
         /* each workgroup decodes 2x2 blocks (local size = block size x 4) */
         d->cs.CmdDispatch(cb, div_up(div_up(j->w, ai->bw), 2), div_up(div_up(j->h, ai->bh), 2), j->count);
+        if (ai->bc1) record_bc1(d, cb, j);
     } else {
         d->cs.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->astc->etc2_pl, 0, 1, &s->set, 0, NULL);
         /* etc2_decoder.comp: the texel rectangle [start, end); one invocation per texel, 8x8 per workgroup */

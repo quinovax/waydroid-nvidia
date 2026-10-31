@@ -71,13 +71,19 @@ BC1 链：
    - `d->cs.GetBufferMemoryRequirements` / `d->cs.BindBufferMemory` / `d->cs.DestroyBuffer`（在 `NVHAL_ASTC_FNS`，而 `nvhal_cs_fns` 同时展开 CS_FNS + ASTC_FNS）。
    弄混会得到 "has no member named ...; did you mean ..." 一类编译错误。
 
-### 尚未完成（下一段）
+### 已完成（2026-10-31 21:00）
 
-- **解码目标改到 `ai->tmp`**：`record_decode` 与 `slot_get` 里 `ai->image` 作为 storage 目标的写法要改成 BC1 模式下的 `ai->tmp`（descriptor 的 dst view 用 tmp）。
-- **bc1_encode pipeline**：创建 compute pipeline（descriptor set = tmp 的 storage/sampled view + bc1_buf 的 SSBO），在 decoder 之后 dispatch。
-- **copyBufferToImage**：encode 完把 `bc1_buf` 拷进 app 的 BC1 图（`bufferRowLength` 以 texel 计、offset 8 B 对齐）。
-- **view 翻译**：`nvhal_astc_CreateImageView` 要把 app 的 ASTC view 转成 BC1 格式（现在是转 RGBA8）。
-- **销毁**：`destroy_parts` 释放 tmp 图/内存、bc1_buf/内存、pipeline、descriptor。
-- **镜像测试**：开关关时行为不变、4x4 走 BC1 / 6x6 走 RGBA8、BC1 特性缺失时回退。
+- **解码目标改到 `ai->tmp`**：`slot_get` 的 dst view 与 `record_decode` 的发布屏障都按 `ai->bc1` 选择 tmp 或 app 图。
+- **`bc1_encoder()`**：惰性创建 descriptor set layout（binding 0 = tmp 的 storage image，binding 1 = `bc1_buf` 的 SSBO）、pipeline layout（20 B push constants）、shader module（`nvhal_bc1_encode_spv`）、compute pipeline、descriptor pool。失败只记录一次并返回 NULL。
+- **`record_bc1()`**：解码 dispatch 之后依次做 tmp 的 COMPUTE 到 COMPUTE 屏障、bind、allocate descriptor set、update、`CmdDispatch`（每 workgroup 8x8 块）、buffer COMPUTE 到 TRANSFER 与 app 图 UNDEFINED 到 TRANSFER_DST 的屏障、`CmdCopyBufferToImage`、释放 descriptor set 与 view。
+- **构建**：`src/bc1_spv.c` 包裹 `out/gen/bc1_encode_spv.h`（裸数组字面量，与 `etc2_spv.c` 同一写法），`nvhal_astc.h` 声明 `nvhal_bc1_encode_spv` 与 `_size`，Makefile 的 `SRCS` 加入 `src/bc1_spv.c`。
+- **实测**：`out/android` 2500968 B（`astc_bc1` 命中 1）、`out/android32` 2290224 B（命中 1），均为 2026-10-31 21:00 构建，`-Wall -Wextra -Werror` 零告警。
 
-> 到目前为止 **只编译验证了 `out/host`**（2775072 B）。android/android32 产物与实机验证都还没做，开关默认 0，因此**当前部署的 HAL 行为没有变化**。
+### 仍然缺的（诚实）
+
+1. **view 翻译未做**：`nvhal_astc_CreateImageView` 仍把 app 的 ASTC view 转到 `e.decoded`（RGBA8），而 BC1 模式下 app 的图是 BC1。**这一条不补，开启开关会得到错误的采样结果**，所以开关必须保持默认 0。
+2. **销毁路径未补**：`destroy_parts` 还没释放 `tmp`、`tmp_mem`、`bc1_buf`、`bc1_mem` 以及 encoder 对象（会泄漏）。
+3. **未做镜像测试、未实机验证、未部署**。
+4. `out/host` 与 `out/host32` 的 strings 里没有 `astc_bc1`（宿主编译走 `getenv` 且字符串被合并），这是正常的，不是缺陷。
+
+> 结论：BC1 的创建与编码链路已经能编译、能产出 android 产物，但因第 1、2 条未补，**开关仍必须是 0**，当前部署的 HAL 行为不变。

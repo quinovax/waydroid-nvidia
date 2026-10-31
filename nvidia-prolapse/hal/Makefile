@@ -29,7 +29,7 @@ HOST_VKINC ?= /usr/include/vulkan
 NDK_VKINC  := $(TC)/sysroot/usr/include/vulkan
 GEN_HDRS := --header-dir $(HOST_VKINC) --header-dir $(NDK_VKINC)
 
-SRCS := src/hal.c src/device.c src/anb.c src/ahb.c src/imgxlate.c src/util.c src/astc.c src/cmdstate.c src/astc_spv.c \
+SRCS := src/hal.c src/device.c src/anb.c src/ahb.c src/imgxlate.c src/util.c src/astc.c src/cmdstate.c src/astc_spv.c src/bc1_spv.c \
         src/etc2_spv.c src/gputime.c
 GEN  := out/gen/nvhal_gen.c
 HDRS := src/nvhal.h src/nvhal_ahb.h src/nvhal_astc.h $(wildcard include/android/*/*.h) \

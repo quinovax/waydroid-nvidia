@@ -32,4 +32,8 @@ extern const size_t nvhal_astc_spv_size; /* bytes */
 extern const uint32_t nvhal_etc2_spv[];
 extern const size_t nvhal_etc2_spv_size; /* bytes */
 
+/* the ASTC->BC1 encoder (src/bc1_encode.comp, out/gen/bc1_encode_spv.h, src/bc1_spv.c) */
+extern const uint32_t nvhal_bc1_encode_spv[];
+extern const size_t nvhal_bc1_encode_spv_size; /* bytes */
+
 #endif
