@@ -180,6 +180,13 @@ out/gen/astc_sample_spv.h: test/astc-sample.comp | out/gen
 out/host/astc-ref.o: test/astc-ref.cpp $(wildcard test/astc-ref/*.h test/astc-ref/util/*.h) \
                      out/gen/mesa/src/mesa/main/texcompress_astc.cpp | out/host
 	$(HOSTCXX) -std=c++17 -O1 -g $(PREFIX_MAP) -Itest/astc-ref -Iout/gen/mesa/src/mesa/main -c -o $@ test/astc-ref.cpp
+# ASTC->BC1 decision mirror test: extracts the format table and the two decision helpers from the real
+# src/astc.c (the same trick test/astc-blocks-host.c uses) so the test cannot drift from the implementation.
+out/gen/bc1-decide.inc: src/astc.c tools/bc1-decide-extract.py | out/gen
+	$(PYTHON) tools/bc1-decide-extract.py src/astc.c out/gen/bc1-decide.inc
+out/host/bc1-decide: test/bc1-decide.c out/gen/bc1-decide.inc | out/host
+	$(HOSTCC) -std=c11 -O1 -g -Wall -Wextra -Iout/gen -I$(HOST_VKINC) -o $@ test/bc1-decide.c
+
 out/host/astc-roundtrip: test/astc-roundtrip.c out/host/astc-ref.o out/gen/astc_sample_spv.h \
                          $(wildcard include/android/*/*.h) | out/host
 	$(HOSTCC) $(TEST_CFLAGS) -Iout/gen -o $@ test/astc-roundtrip.c out/host/astc-ref.o -ldl -lstdc++

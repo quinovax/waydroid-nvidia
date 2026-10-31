@@ -96,3 +96,22 @@ BC1 链：
 
 > 至此 BC1 的创建、编码、view 翻译、销毁四条链路都已就位并可编译。**仍然没有做过无 GPU 镜像测试与实机验证**，
 > 所以开关继续默认 0；下一步是镜像测试 + 部署跑一次 Run E。
+### 无 GPU 镜像测试（2026-10-31 21:28）
+
+`test/bc1-decide.c` + `tools/bc1-decide-extract.py`：从**真实的 src/astc.c** 抽出 `block_dims` 与整个 `efmt_get()`
+（括号配平提取，不是手抄），再补上决策与块数计算，编译成本机程序跑断言。**18 项全过**：
+
+| 断言 | 结果 |
+|---|---|
+| ASTC 4x4 UNORM/SRGB 有 BC1 目标，且分别映射到 `BC1_RGBA_UNORM` / `BC1_RGBA_SRGB` | ok |
+| 其它 ASTC 块尺寸（5x4 / 6x6 / 8x8 / 12x12）没有 BC1 目标 | ok（4 项） |
+| ETC2 RGB8 与 EAC R11 没有 BC1 目标 | ok |
+| 4x4 的 UNORM/SRGB 双胞胎 cls 都为 0（同一解码类） | ok |
+| `decide(on, 4x4)` 为真 / `decide(off, 4x4)` 为假 / `decide(on, 6x6)` 为假 | ok |
+| `blocks(64x64, 3 mips, 1 layer) = 336`、`blocks(2560x1440, 1 mip, 1 layer) = 230400`、8 B/块 | ok |
+
+跑法：`cd nvidia-prolapse/hal && gcc -std=c11 -O1 -Wall -Wextra -Iout/gen -o /tmp/bc1d test/bc1-decide.c && /tmp/bc1d`
+（make 目标 `out/host/bc1-decide` 也已接好）。
+
+> 判据意义：开关开启后**只有 ASTC 4x4 会走 BC1**，6x6 与 ETC2/EAC 一定留在 RGBA8，
+> 且关掉时行为完全不变——这三点现在有可复现的设备外证据。
