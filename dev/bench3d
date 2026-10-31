@@ -237,6 +237,16 @@ if [ "$NO_CLEAN" -eq 0 ]; then
 fi
 dismiss_anr
 
+# A dim layer owned by uid 1000 sits over the whole display in this container
+# (InputDispatcher: "Untrusted touch due to occlusion by /1000", the window is
+# "Dim Layer for - Task=N" with inputConfig=NO_INPUT_CHANNEL, alpha 0.32).  While it
+# is up Android's clickjacking guard drops EVERY tap in mode=BLOCK_UNTRUSTED and
+# says nothing to the app -- which reads exactly like "the tap was swallowed by an
+# ANR dialog" and sent several earlier sessions chasing taps and coordinates.
+# The image is userdebug, so the filter can be switched off for the run.
+say "disabling the untrusted-touch filter (a uid-1000 dim layer blocks every tap)"
+g "settings put secure untrusted_touch_filter 0" >/dev/null 2>&1 || true
+
 say "launching 3DMark"
 g "cmd statusbar collapse >/dev/null 2>&1; am force-stop $PKG; sleep 2" >/dev/null 2>&1 || true
 BEFORE_COUNT=$(g "ls $RESULT_DIR 2>/dev/null | wc -l" | tr -d '\r ')

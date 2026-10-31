@@ -1,0 +1,115 @@
+#!/bin/bash
+# gebench N -- run Geekbench 7 GPU once and record whether ORB (Feature Matching) passed.
+# Mirrors dev/bench3d's approach: focus-wait, screenshot, pixel-detect the Run button,
+# tap it, wait for the result, then extract the per-workload scores and the validation
+# warning from logcat + the app's history.db.
+#
+#   dev/gebench N [--label NAME]
+set -uo pipefail
+source "$(dirname "$(readlink -f "$0")")/env.sh"
+
+PKG=com.primatelabs.parkdale
+ACT=$PKG/.MainActivity
+N="${1:-1}"
+LABEL="${2:-run$N}"
+ART=${REPO}/artifacts/gebench-$(date +%Y%m%dT%H%M%S)-$LABEL
+mkdir -p "$ART"
+
+g() { sudo -n lxc-attach $LXC --clear-env -v PATH=/system/bin -- /system/bin/sh -c "$*" </dev/null 2>/dev/null | tr -d '\r'; }
+
+echo "== $LABEL: mode=$(sed -n 's/^nvidia_driver_mode *= *//p' /var/lib/waydroid/waydroid.cfg | head -1)"
+echo "== artifacts: $ART"
+
+# ---- quiet the guest, reset logcat ----------------------------------------
+# A dim layer owned by uid 1000 covers the display in this container and makes
+# Android's clickjacking guard drop every tap (InputDispatcher: "Untrusted touch
+# due to occlusion by /1000", BLOCK_UNTRUSTED).  Without this the Run button
+# never sees a click.  The image is userdebug, so the filter can be switched off.
+g 'settings put secure untrusted_touch_filter 0' >/dev/null 2>&1
+g 'pkill -9 -x logcat' >/dev/null 2>&1
+g 'logcat -c -b all' >/dev/null 2>&1
+g "am force-stop $PKG" >/dev/null 2>&1
+for p in com.tencent.tmgp.yqqskp com.tencent.android.qqdownloader com.google.android.googlequicksearchbox; do
+    g "am force-stop $p" >/dev/null 2>&1
+done
+sleep 2
+( g 'exec logcat -v threadtime -b all' > "$ART/logcat-$LABEL.txt" 2>/dev/null & echo $! > "$ART/logcat.pid" )
+sleep 2
+
+# ---- launch and wait for focus --------------------------------------------
+g 'cmd statusbar collapse' >/dev/null 2>&1
+g "am start -W -n $ACT" >/dev/null 2>&1
+for i in $(seq 1 10); do
+    case "$(g 'dumpsys window | grep -m1 mCurrentFocus')" in *parkdale*) break ;; esac
+    sleep 3
+done
+sleep 8   # let the first frames settle (a too-early shot catches partial widgets)
+
+g 'screencap -p /data/local/tmp/gb.png' >/dev/null 2>&1
+sudo -n "$DEPLOY" pull /data/local/tmp/gb.png "$ART/01-launcher.png" >/dev/null 2>&1 || \
+    g 'cat /data/local/tmp/gb.png' | base64 -d > "$ART/01-launcher.png" 2>/dev/null
+g 'dumpsys window displays' > "$ART/03-window-displays.txt" 2>&1
+
+# ---- find the Run button: Geekbench paints it in one flat colour ----------
+# The GPU tab itself has to be selected first; on this container the tab bar is
+# at the top and 'GPU' is the second tab. Coordinates are derived from the
+# screenshot's own size, so a resize does not silently miss.
+eval "$(python3 - "$ART/01-launcher.png" <<'PY'
+import sys
+try:
+    from PIL import Image
+except Exception:
+    print('SHOT_W=0; SHOT_H=0'); raise SystemExit
+im = Image.open(sys.argv[1]).convert('RGB')
+print('SHOT_W=%d; SHOT_H=%d' % im.size)
+PY
+)"
+echo "== screenshot ${SHOT_W:-?}x${SHOT_H:-?}"
+
+# Geekbench 7's own layout, measured on this container's 1900x1010 display
+# (artifacts/2026-10-25-task9-e1/E1-FINDINGS.md): the GPU tab at (1331,210) and
+# the Run button at (1620,835). Scale by the screenshot actually captured so a
+# display resize does not silently miss both taps.
+# Measured on this container's 1900x1010 display by clicking through the remote
+# desktop portal (input tap cannot work here: /dev/input holds only wl_keyboard /
+# wl_pointer / wl_tablet pipes, no touch device).  The GPU tab sits at (1014,173)
+# and the Run button at (1473,580).  Scale by the screenshot actually captured so
+# a display resize does not silently miss both taps.
+REF_W=1900; REF_H=1010
+GPU_X=$(( 1014 * ${SHOT_W:-$REF_W} / REF_W ))
+GPU_Y=$(( 173  * ${SHOT_H:-$REF_H} / REF_H ))
+RUN_X=$(( 1473 * ${SHOT_W:-$REF_W} / REF_W ))
+RUN_Y=$(( 580  * ${SHOT_H:-$REF_H} / REF_H ))
+echo "== tapping GPU tab at $GPU_X,$GPU_Y"
+g "input tap $GPU_X $GPU_Y" >/dev/null 2>&1
+sleep 5
+g 'screencap -p /data/local/tmp/gb2.png' >/dev/null 2>&1
+g 'cat /data/local/tmp/gb2.png' | base64 -d > "$ART/02-gpu-tab.png" 2>/dev/null || true
+
+echo "== tapping Run at $RUN_X,$RUN_Y"
+g "input tap $RUN_X $RUN_Y" >/dev/null 2>&1
+
+# ---- wait for a result page (up to 6 minutes) ------------------------------
+RESULTED=0
+for i in $(seq 1 72); do
+    sleep 5
+    if g 'dumpsys activity activities | grep -m1 topResumedActivity' | grep -qi 'result'; then RESULTED=1; break; fi
+    if g 'dumpsys window | grep -m1 mCurrentFocus' | grep -qi 'result'; then RESULTED=1; break; fi
+    if g 'logcat -d -s geekbench 2>/dev/null | grep -c "failed validation"' | grep -q '^[1-9]'; then RESULTED=1; break; fi
+done
+
+g 'screencap -p /data/local/tmp/gb3.png' >/dev/null 2>&1
+g 'cat /data/local/tmp/gb3.png' | base64 -d > "$ART/03-result.png" 2>/dev/null || true
+sleep 3
+kill "$(cat "$ART/logcat.pid" 2>/dev/null)" 2>/dev/null || true
+g 'pkill -9 -x logcat' >/dev/null 2>&1
+
+# ---- verdict from logcat + history.db --------------------------------------
+ORB=$(grep -a -c 'orb_gpu_workload\|difference is >\|failed validation' "$ART/logcat-$LABEL.txt" 2>/dev/null)
+grep -a -E 'difference is >|failed validation|GPU:[0-9]+, CPU:' "$ART/logcat-$LABEL.txt" > "$ART/orb-grep-$LABEL.txt" 2>/dev/null
+g 'LC_ALL=C grep -a -o -E "(name|score|valid|url|date)[^,{}]{0,50}" /data/data/com.primatelabs.parkdale/files/history.db 2>/dev/null' | tail -40 > "$ART/history-$LABEL.txt" 2>&1
+
+echo "RESULT $LABEL orb_lines=$ORB artifact=$ART"
+echo '--- orb evidence ---'; head -4 "$ART/orb-grep-$LABEL.txt" 2>/dev/null
+echo '--- history tail ---'; tail -8 "$ART/history-$LABEL.txt" 2>/dev/null
+exit 0
