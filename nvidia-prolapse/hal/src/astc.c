@@ -1670,6 +1670,12 @@ static void destroy_parts(struct nvhal_device *d, struct nvhal_astc_image *ai, c
     for (uint32_t m = 0; m < MAX_MIPS; m++)
         if (ai->block[m]) d->DestroyImage(d->handle, ai->block[m], NULL);
     if (ai->blocks_mem) d->FreeMemory(d->handle, ai->blocks_mem, NULL); /* task-17: the block images' own memory */
+    /* ASTC->BC1 private resources */
+    if (ai->tmp_view) d->cs.DestroyImageView(d->handle, ai->tmp_view, NULL);
+    if (ai->tmp) d->DestroyImage(d->handle, ai->tmp, NULL);
+    if (ai->tmp_mem) d->FreeMemory(d->handle, ai->tmp_mem, NULL);
+    if (ai->bc1_buf) d->cs.DestroyBuffer(d->handle, ai->bc1_buf, NULL);
+    if (ai->bc1_mem) d->FreeMemory(d->handle, ai->bc1_mem, NULL);
     if (ai->decoded_mem) d->FreeMemory(d->handle, ai->decoded_mem, NULL); /* the decoded image's own memory */
     if (app_image && ai->image) d->DestroyImage(d->handle, ai->image, alloc);
     if (ai->counted) bh_live_del(ai);
@@ -2025,7 +2031,9 @@ bool nvhal_astc_CreateImageView(struct nvhal_device *d, VkDevice device, const V
         return true;
     }
     VkImageViewCreateInfo t = *ci;
-    t.format = ve.decoded;
+    /* BC1 mode: the app's image is a BC1 image, so its view must be BC1 too.  The UNORM/SRGB twins of one ASTC
+     * block size decode to the same bytes, so both map onto the app image's own BC1 format. */
+    t.format = ai->bc1 ? ai->e.bc1 : ve.decoded;
     bool has_usage = false;
     const void *decode_mode = NULL;
     for (const VkBaseInStructure *s = ci->pNext; s; s = s->pNext) {

@@ -87,3 +87,12 @@ BC1 链：
 4. `out/host` 与 `out/host32` 的 strings 里没有 `astc_bc1`（宿主编译走 `getenv` 且字符串被合并），这是正常的，不是缺陷。
 
 > 结论：BC1 的创建与编码链路已经能编译、能产出 android 产物，但因第 1、2 条未补，**开关仍必须是 0**，当前部署的 HAL 行为不变。
+### 补完 view 翻译与销毁（2026-10-31 21:11）
+
+- `nvhal_astc_CreateImageView`：BC1 模式下把 app 的 view 转到 `ai->e.bc1`（不再转到 `ve.decoded`）。
+  同一个 ASTC 块尺寸的 UNORM/SRGB 双胞胎解码字节相同，因此两者都映射到 app 图自己的 BC1 格式。
+- `destroy_parts`：释放 `tmp_view`（走 `d->cs.DestroyImageView`）、`tmp`、`tmp_mem`、`bc1_buf`（`d->cs.DestroyBuffer`）、`bc1_mem`。
+- 产物：`out/android` 2501256 B、`out/android32` 2290524 B，21:11 构建，`astc_bc1` 命中 1，零告警。
+
+> 至此 BC1 的创建、编码、view 翻译、销毁四条链路都已就位并可编译。**仍然没有做过无 GPU 镜像测试与实机验证**，
+> 所以开关继续默认 0；下一步是镜像测试 + 部署跑一次 Run E。
