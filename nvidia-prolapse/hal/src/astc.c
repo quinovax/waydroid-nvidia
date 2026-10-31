@@ -76,6 +76,8 @@ struct efmt {
     VkFormat decoded; /* the app's image (vk_texcompress_*_emulation_format) */
     VkFormat store;   /* the decoder's unsigned-integer storage view of it */
     VkFormat block;   /* the block images: one texel per block */
+    VkFormat bc1;     /* ASTC 4x4 only: the BC1 image the app gets instead of RGBA8 (VK_FORMAT_UNDEFINED
+                         when this format keeps the decoded image) */
 };
 
 static bool efmt_get(VkFormat f, struct efmt *e) {
@@ -84,7 +86,10 @@ static bool efmt_get(VkFormat f, struct efmt *e) {
         const bool srgb = ((unsigned)(f - ASTC_FIRST) & 1) != 0;
         *e = (struct efmt){FAM_ASTC, block_dims[t][0], block_dims[t][1], (uint8_t)t, 0, srgb,
                            srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT,
-                           VK_FORMAT_R32G32B32A32_UINT};
+                           VK_FORMAT_R32G32B32A32_UINT,
+                           /* BC1 is a 4x4 format, so only ASTC 4x4 can map 1:1 */
+                           t == 0 ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
+                                  : VK_FORMAT_UNDEFINED};
         return true;
     }
     if (f >= ETC2_FIRST && f <= ETC2_LAST) {
@@ -103,7 +108,7 @@ static bool efmt_get(VkFormat f, struct efmt *e) {
         };
         const unsigned i = (unsigned)(f - ETC2_FIRST);
         *e = (struct efmt){FAM_ETC2, 4, 4, (uint8_t)(NVHAL_ASTC_NUM_PARTITION_TABLES + t[i].variant), t[i].variant,
-                           (i & 1) != 0, t[i].decoded, t[i].store, t[i].block};
+                           (i & 1) != 0, t[i].decoded, t[i].store, t[i].block, VK_FORMAT_UNDEFINED};
         return true;
     }
     return false;
@@ -866,6 +871,13 @@ struct nvhal_astc_image {
     uint32_t blocks_type;           /* its memoryTypeIndex (blocks_host only) */
     bool decoded_host;              /* EXPERIMENT: the decoded image lives in decoded_mem (host memory) */
     VkDeviceMemory decoded_mem;     /* the HAL's own allocation behind the decoded image (decoded_host only) */
+    bool bc1;                       /* the app's image is a BC1 image; decode goes through tmp + bc1_buf */
+    VkImage tmp;                    /* RGBA8 storage image the ASTC decoder writes into (bc1 only) */
+    VkDeviceMemory tmp_mem;         /* its memory (HAL-owned, host) */
+    VkImageView tmp_view;           /* storage view of tmp */
+    VkBuffer bc1_buf;               /* the BC1 blocks the encoder writes (bc1 only) */
+    VkDeviceMemory bc1_mem;         /* its memory (HAL-owned, host) */
+    VkDeviceSize bc1_blocks;        /* block count across all mips and layers */
     VkMemoryRequirements req;       /* what the app is told */
     struct astc_slot *slots;        /* d->astc->lock */
     uint32_t nslots, cap;
@@ -883,8 +895,12 @@ static struct nvhal_astc_image *lookup(VkImage image) {
 
 bool nvhal_astc_is_image(VkImage image) { return lookup(image) != NULL; }
 
+static bool bc1_on(void);   /* the switch is defined further down */
+
 struct astc_cis {
+    bool bc1;                     /* the app's image is BC1; rgba2 is the decoder's RGBA8 target */
     VkImageCreateInfo rgba;
+    VkImageCreateInfo rgba2;
     VkImageFormatListCreateInfo list;
     VkFormat list_fmts[3];
     struct efmt e;
@@ -949,11 +965,27 @@ static VkResult build_cis(const struct nvhal_astc_pd *p, const VkImageCreateInfo
                   ci->tiling, ci->samples, ci->usage, ci->flags, why, gap(e));
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
+    /* ASTC 4x4 -> BC1: the app's image is a BC1 image (no storage usage: BC1 cannot be a storage image),
+     * and the decoder writes into a separate HAL-owned RGBA8 storage image instead. */
+    c->bc1 = bc1_on() && e->bc1 != VK_FORMAT_UNDEFINED;
+    c->rgba2 = c->rgba;   /* the decoder's own RGBA8 target (bc1 only) */
     c->rgba = *ci;
     c->rgba.pNext = NULL;
-    c->rgba.format = e->decoded;
-    c->rgba.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-    c->rgba.flags |= RGBA_EXTRA_FLAGS;
+    c->rgba.format = c->bc1 ? e->bc1 : e->decoded;
+    if (c->bc1) {
+        c->rgba.usage = (ci->usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT) & ~VK_IMAGE_USAGE_STORAGE_BIT;
+        c->rgba.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        c->rgba2 = *ci;
+        c->rgba2.pNext = NULL;
+        c->rgba2.format = e->decoded;
+        c->rgba2.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        c->rgba2.flags |= RGBA_EXTRA_FLAGS;
+    } else {
+        c->rgba.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        c->rgba.flags |= RGBA_EXTRA_FLAGS;
+    }
     if (list) { /* the app's view formats, as decoded formats, plus the decoder's storage view */
         struct efmt pe, te;
         uint32_t n = 0;
@@ -1454,6 +1486,37 @@ static void bh_report(void) {
                created, host, host_live, hb, host_total, ht, fallback, app_live, al, app_total, at, hist, unreported);
 }
 
+/* ---- ASTC -> BC1 (docs/astc-bc1-plan.md): the app's image is BC1 instead of RGBA8 ---------------
+ * RGBA8 is 4 B/texel; BC1 is 0.5, and on an 8 GiB card the decoded images alone were 5.90 GiB of the
+ * 7.12 GiB the app was told to allocate (588 ASTC images, measured).  BC1 has no STORAGE_IMAGE feature
+ * (optimalTilingFeatures 0x1d401 is SAMPLED|BLIT_SRC|FILTER_LINEAR|TRANSFER_SRC|TRANSFER_DST), so the
+ * decoder cannot write it directly: the decode goes block image -> HAL-owned RGBA8 tmp -> bc1_encode ->
+ * HAL-owned BC1 block buffer -> vkCmdCopyBufferToImage -> the app's BC1 image.
+ * Only 4x4 ASTC: that is the block size 1:1 with BC1's own 4x4 blocks (378 of the 588 measured images);
+ * every other block size keeps the RGBA8 path.  Default off; any failure falls back to RGBA8. */
+static _Atomic int bc1_state; /* 0 unprobed, 1 off, 2 on */
+static pthread_once_t bc1_once = PTHREAD_ONCE_INIT;
+
+static void bc1_init(void) {
+    char v[32] = "";
+#ifdef __ANDROID__
+    __system_property_get("debug.nvhal.astc_bc1", v);
+#else
+    const char *e = getenv("NVHAL_ASTC_BC1");
+    if (e) snprintf(v, sizeof v, "%s", e);
+#endif
+    atomic_store_explicit(&bc1_state, atoi(v) > 0 ? 2 : 1, memory_order_release);
+}
+
+static bool bc1_on(void) {
+    int st = atomic_load_explicit(&bc1_state, memory_order_acquire);
+    if (st == 0) {
+        pthread_once(&bc1_once, bc1_init);
+        st = atomic_load_explicit(&bc1_state, memory_order_acquire);
+    }
+    return st == 2;
+}
+
 /* EXPERIMENT (docs/astc-bc1-plan.md): put the DECODED image in host memory too, so that an app whose textures
  * would not fit in VRAM at all can still render. This is not the fix -- BC1 is (0.5 B/texel instead of 4) -- it
  * measures the upper bound of "textures are the problem" before the BC1 work starts. Off unless
@@ -1593,15 +1656,22 @@ bool nvhal_astc_CreateImage(struct nvhal_device *d, const VkImageCreateInfo *ci,
     ai->usage = ci->usage;
     VkDevice dev = d->handle;
     const char *step = "vkCreateImage(decoded image)";
+    ai->bc1 = c.bc1;
     *r = d->CreateImage(dev, &c.rgba, alloc, &ai->image);
+    if (*r == VK_SUCCESS && c.bc1) {
+        step = "vkCreateImage(RGBA8 tmp for the BC1 encoder)";
+        *r = d->CreateImage(dev, &c.rgba2, NULL, &ai->tmp);
+    }
     for (uint32_t m = 0; m < c.mips && *r == VK_SUCCESS; m++) {
         step = "vkCreateImage(block image)";
         *r = d->CreateImage(dev, &c.block[m], NULL, &ai->block[m]);
     }
     VkMemoryRequirements parts[1 + MAX_MIPS];
+    VkMemoryRequirements tmp_part = {0, 0, 0};
     struct bh_plan bp;
     bool host = false; /* task-17: the block images are in HAL-owned host memory */
     if (*r == VK_SUCCESS) {
+        if (c.bc1) d->xl.GetImageMemoryRequirements(dev, ai->tmp, &tmp_part);
         d->xl.GetImageMemoryRequirements(dev, ai->image, &parts[0]);
         for (uint32_t m = 0; m < c.mips; m++) d->xl.GetImageMemoryRequirements(dev, ai->block[m], &parts[1 + m]);
         /* a part the ICD wants dedicated cannot share the app's allocation (asked where the core query is valid) */
@@ -1636,6 +1706,68 @@ bool nvhal_astc_CreateImage(struct nvhal_device *d, const VkImageCreateInfo *ci,
                         d->FreeMemory(dev, m, NULL);
                     }
                 }
+            }
+        }
+        if (*r == VK_SUCCESS && ai->bc1) {
+            /* the tmp RGBA8 image and the BC1 block buffer are HAL-private: only the decoder writes tmp and
+             * only the encoder reads it, nothing samples them, so host memory is fine and keeps them out of
+             * the 8 GiB the app is competing for. */
+            step = "HAL-owned memory for the BC1 path (tmp image + block buffer)";
+            uint32_t bytes_per_block = 8u;                     /* BC1 */
+            VkDeviceSize blocks = 0;
+            for (uint32_t m = 0; m < c.mips; m++) {
+                const uint32_t w = mip_dim(ci->extent.width, m), h = mip_dim(ci->extent.height, m);
+                blocks += (VkDeviceSize)div_up(w, 4) * (VkDeviceSize)div_up(h, 4) * ci->arrayLayers;
+            }
+            ai->bc1_blocks = blocks;
+            const int32_t tt = dh_type(&d->mem_props, tmp_part.memoryTypeBits);
+            if (tt < 0) {
+                *r = VK_ERROR_OUT_OF_HOST_MEMORY;
+            } else {
+                VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, tmp_part.size, (uint32_t)tt};
+                if (d->AllocateMemory(dev, &mi, NULL, &ai->tmp_mem) != VK_SUCCESS) {
+                    *r = VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                if (*r == VK_SUCCESS && d->xl.BindImageMemory(dev, ai->tmp, ai->tmp_mem, 0) != VK_SUCCESS) {
+                    d->FreeMemory(dev, ai->tmp_mem, NULL);
+                    ai->tmp_mem = VK_NULL_HANDLE;
+                    *r = VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+            }
+            if (*r == VK_SUCCESS) {
+                VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0,
+                                         blocks * bytes_per_block,
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                         VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+                if (d->xl.CreateBuffer(dev, &bi, NULL, &ai->bc1_buf) != VK_SUCCESS) {
+                    *r = VK_ERROR_OUT_OF_HOST_MEMORY;
+                } else {
+                    VkMemoryRequirements br;
+                    d->cs.GetBufferMemoryRequirements(dev, ai->bc1_buf, &br);
+                    const int32_t bt = dh_type(&d->mem_props, br.memoryTypeBits);
+                    if (bt < 0) {
+                        *r = VK_ERROR_OUT_OF_HOST_MEMORY;
+                    } else {
+                        VkMemoryAllocateInfo bi2 = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, br.size, (uint32_t)bt};
+                        if (d->AllocateMemory(dev, &bi2, NULL, &ai->bc1_mem) != VK_SUCCESS ||
+                            d->cs.BindBufferMemory(dev, ai->bc1_buf, ai->bc1_mem, 0) != VK_SUCCESS) {
+                            *r = VK_ERROR_OUT_OF_HOST_MEMORY;
+                        }
+                    }
+                }
+            }
+            if (*r != VK_SUCCESS) {
+                /* this switch must never fail a create: drop the BC1 path and let the image stay RGBA8 */
+                NVHAL_ERR("vkCreateImage: the BC1 path could not allocate its private memory -> falling back to the "
+                          "RGBA8 decoded image %s", gap(&c.e));
+                if (ai->bc1_mem) d->FreeMemory(dev, ai->bc1_mem, NULL);
+                if (ai->bc1_buf) d->cs.DestroyBuffer(dev, ai->bc1_buf, NULL);
+                if (ai->tmp_mem) d->FreeMemory(dev, ai->tmp_mem, NULL);
+                if (ai->tmp) d->DestroyImage(dev, ai->tmp, NULL);
+                ai->bc1_mem = VK_NULL_HANDLE; ai->bc1_buf = VK_NULL_HANDLE;
+                ai->tmp_mem = VK_NULL_HANDLE; ai->tmp = VK_NULL_HANDLE;
+                ai->bc1 = false;
+                *r = VK_SUCCESS;
             }
         }
         if (*r == VK_SUCCESS) {

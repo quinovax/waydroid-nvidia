@@ -43,7 +43,7 @@ MESA_URL := https://gitlab.freedesktop.org/mesa/mesa.git
 GLSLANG  ?= glslangValidator
 SPIRV_VAL ?= spirv-val
 HOSTCXX  ?= g++
-ASTC_GEN := out/gen/nvhal_astc_luts.c out/gen/astc_spv.h out/gen/etc2_spv.h
+ASTC_GEN := out/gen/nvhal_astc_luts.c out/gen/astc_spv.h out/gen/etc2_spv.h out/gen/bc1_encode_spv.h
 MESA_FILES := src/compiler/glsl/astc_decoder.glsl src/util/texcompress_astc_luts.cpp src/util/texcompress_astc_luts.h \
               src/mesa/main/texcompress_astc.cpp src/mesa/main/texcompress_etc.c src/util/format/texcompress_etc_tmp.h
 # the ETC2/EAC test's reference decoder (test/etc2-ref.c) and its inputs
@@ -73,6 +73,14 @@ out/gen/etc2_spv.h: src/etc2_decoder.comp | out/gen
 	$(SPIRV_VAL) --target-env vulkan1.0 out/gen/etc2.spv
 	$(GLSLANG) -V -S comp -x -o $@ $<
 	$(GLSLANG) --version | head -1 > out/gen/etc2_spv.version
+
+# the BC1 encoder (this tree's source): the second stage of the ASTC->BC1 path
+out/gen/bc1_encode_spv.h: src/bc1_encode.comp | out/gen
+	@command -v $(GLSLANG) >/dev/null || { echo "$(GLSLANG) not found (glslang); it compiles src/bc1_encode.comp" >&2; exit 1; }
+	$(GLSLANG) -V --target-env vulkan1.0 -S comp -o out/gen/bc1_encode.spv $<
+	$(SPIRV_VAL) --target-env vulkan1.0 out/gen/bc1_encode.spv
+	$(GLSLANG) -V --target-env vulkan1.0 -S comp -x -o $@ $<
+	$(GLSLANG) --version | head -1 > out/gen/bc1_encode_spv.version
 
 out/gen/astc-luts-gen: tools/astc-luts-gen.cpp out/gen/mesa/src/util/texcompress_astc_luts.cpp \
                        out/gen/mesa/src/util/texcompress_astc_luts.h | out/gen
