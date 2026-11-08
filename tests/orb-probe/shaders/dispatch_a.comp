@@ -1,0 +1,47 @@
+#version 450
+// orb-probe dispatch A: the producer pass.
+// Replicates the ORB primitive set that is believed to be involved in the
+// Geekbench "Feature Matching" validation race:
+//   * per-invocation atomicAdd into a global counter SSBO
+//   * a shared-memory accumulator reduced by one atomic per workgroup
+//     (this isolates the workgroup barrier / shared-atomic path)
+//   * a candidate-key array written for every invocation
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint n;      // total A invocations (== groups * 64)
+    uint seed;   // key pattern seed (keys[i] = i ^ seed)
+    uint wg;     // workgroup size (must match local_size_x)
+    uint pad;
+} pc;
+
+layout(set = 0, binding = 0, std430) buffer CounterA {
+    uint count_global;   // one atomicAdd per invocation  -> expect n
+    uint count_shared;   // one shared reduction per WG   -> expect n
+} ca;
+
+layout(set = 0, binding = 1, std430) buffer KeysA {
+    uint keys[];
+} ka;
+
+shared uint s_cnt;
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+
+    // shared-memory path (ORB-style workgroup accumulation)
+    if (gl_LocalInvocationIndex == 0u)
+        s_cnt = 0u;
+    barrier();
+    atomicAdd(s_cnt, 1u);
+    barrier();
+    if (gl_LocalInvocationIndex == 0u)
+        atomicAdd(ca.count_shared, s_cnt);
+
+    // global atomic path
+    atomicAdd(ca.count_global, 1u);
+
+    if (gid < pc.n)
+        ka.keys[gid] = gid ^ pc.seed;
+}

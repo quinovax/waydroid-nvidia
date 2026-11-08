@@ -1,0 +1,116 @@
+#!/bin/bash
+# dev/gpu-hotspots -- attribute CPU burn and GPU load during a live benchmark run.
+#
+# Usage:  dev/gpu-hotspots [SECONDS] [OUTDIR]
+#   SECONDS  length of the perf capture window (default 12). The benchmark workload
+#            must already be running; start this script a few seconds after the
+#            orange play button is tapped.
+#   OUTDIR   where to write artifacts (default artifacts/hotspots/<timestamp>)
+#
+# Writes:
+#   nvidia-smi.csv    1 Hz: util, sm/mem clock, power, pcie gen, memory.used
+#   top-cpu.txt       2 Hz host top-10 CPU consumers (ps) -- which process burns the CPU
+#   perf.data         root-owned raw perf samples
+#   perf-by-comm.txt  sample share per process  (the money shot)
+#   perf-by-dso.txt   sample share per shared object / binary
+#   perf-by-symbol.txt      hottest symbols (0.2 % floor)
+#   perf-by-dso-symbol.txt  dso x symbol tree -- attributes a hot symbol to its library
+#   perf-hal.txt      just the Vulkan HAL's own functions: the deployed builds are NOT
+#                     stripped (.symtab + .debug_info), so this names the hot HAL function
+#   SUMMARY.txt       one-screen digest
+#
+# Kernel symbols are unresolved (kptr_restrict) which is fine: every candidate
+# (guest app, HAL, libnvidia-*, surfaceflinger, kernel driver) is userspace or
+# shows up as an unresolved kernel bucket.
+set -uo pipefail
+
+SECS=${1:-12}
+STAMP=$(date +%Y%m%dT%H%M%S)
+OUT=${2:-"artifacts/hotspots/$STAMP"}
+mkdir -p "$OUT" || { echo "cannot create $OUT" >&2; exit 1; }
+OUT=$(cd "$OUT" && pwd)
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+
+echo "[gpu-hotspots] window=${SECS}s out=$OUT"
+command -v nvidia-smi >/dev/null || { echo "nvidia-smi missing" >&2; exit 1; }
+
+# --- 1 Hz GPU sampler -------------------------------------------------------
+(
+  end=$(( $(date +%s) + SECS + 6 ))
+  echo "timestamp,util_pct,sm_mhz,mem_mhz,power_w,pcie_gen,vram_used_mib"
+  while [ "$(date +%s)" -lt "$end" ]; do
+    line=$(nvidia-smi --query-gpu=timestamp,utilization.gpu,clocks.sm,clocks.mem,power.draw,pcie.link.gen.current,memory.used \
+             --format=csv,noheader,nounits 2>/dev/null | head -1)
+    echo "$line"
+    sleep 1
+  done
+) > "$OUT/nvidia-smi.csv" 2>&1 &
+
+# --- 2 Hz host CPU attribution ---------------------------------------------
+(
+  end=$(( $(date +%s) + SECS + 4 ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    echo "=== $(date +%H:%M:%S)"
+    ps -eo pcpu,rss,pid,comm,args --sort=-pcpu 2>/dev/null | head -14 | cut -c1-160
+    sleep 2
+  done
+) > "$OUT/top-cpu.txt" 2>&1 &
+
+# --- perf capture ----------------------------------------------------------
+rm -f "$OUT/perf.data" 2>/dev/null
+pkexec rm -f "$OUT/perf.data" 2>/dev/null
+pkexec /usr/bin/perf record -F 399 -a --proc-map-timeout 5000 \
+    -o "$OUT/perf.data" -- sleep "$SECS" > "$OUT/perf-record.log" 2>&1
+RC=$?
+wait
+if [ ! -s "$OUT/perf.data" ]; then
+  echo "[gpu-hotspots] perf capture FAILED (rc=$RC); see perf-record.log" | tee "$OUT/SUMMARY.txt"
+  exit 1
+fi
+
+for kind in comm dso; do
+  pkexec /usr/bin/perf report --stdio -i "$OUT/perf.data" --sort "$kind" \
+      --no-children --percent-limit 0.5 \
+      > "$OUT/perf-by-$kind.txt" 2>"$OUT/perf-report-$kind.err"
+done
+# 0.2 % floor for symbols: the HAL is one big .so of small static functions, each far
+# below the 0.5 % used for dso/comm, so the default floor would hide all of them.
+pkexec /usr/bin/perf report --stdio -i "$OUT/perf.data" --sort symbol \
+    --no-children --percent-limit 0.2 \
+    > "$OUT/perf-by-symbol.txt" 2>"$OUT/perf-report-symbol.err"
+pkexec /usr/bin/perf report --stdio -i "$OUT/perf.data" --sort dso,symbol \
+    --no-children --percent-limit 0.1 \
+    > "$OUT/perf-by-dso-symbol.txt" 2>"$OUT/perf-report-dso-symbol.err"
+grep -iE 'vulkan[.]nvidia' "$OUT/perf-by-dso-symbol.txt" > "$OUT/perf-hal.txt" 2>/dev/null
+# keep perf.data root-readable but report needs root: leave as-is, root-owned.
+
+{
+  echo "gpu-hotspots $STAMP  window=${SECS}s"
+  echo
+  echo "--- GPU (nvidia-smi.csv): peak / mean util, peak SM clock"
+  awk -F',' 'NR>1 && $2!="" {gsub(/ /,"",$2); gsub(/ /,"",$3); u=$2+0; if(u>pu)pu=u; su+=u; n++;
+       s=$3+0; if(s>ps)ps=s } END { if(n) printf "  util peak=%d%% mean=%.1f%% (n=%d)  sm peak=%dMHz\n", pu, su/n, n, ps }' \
+      "$OUT/nvidia-smi.csv"
+  awk -F',' 'NR>1 && $7!="" {gsub(/ /,"",$7); v=$7+0; if(v>pv)pv=v} END { if(pv) printf "  vram peak=%d MiB\n", pv }' \
+      "$OUT/nvidia-smi.csv"
+  echo
+  echo "--- top CPU consumers seen (unique comm, max pcpu observed)"
+  awk '/^===/{next} NF>=4 {k=$4; v=$1+0; if(v>m[k]) m[k]=v} END {for(k in m) printf "  %6.1f%%  %s\n", m[k], k}' \
+      "$OUT/top-cpu.txt" | sort -rn | head -15
+  echo
+  echo "--- perf: sample share by process (top 12)"
+  grep -vE '^#|^$|^\s*$' "$OUT/perf-by-comm.txt" | head -14
+  echo
+  echo "--- perf: sample share by shared object (top 12)"
+  grep -vE '^#|^$|^\s*$' "$OUT/perf-by-dso.txt" | head -14
+  echo
+  echo "--- perf: the Vulkan HAL's own hot functions (top 18)"
+  grep -vE '^#|N/A' "$OUT/perf-hal.txt" 2>/dev/null | head -18
+  echo
+  echo "--- perf: hottest symbols (top 15)"
+  grep -vE '^#|^$|^\s*$' "$OUT/perf-by-symbol.txt" | head -17
+} > "$OUT/SUMMARY.txt" 2>&1
+
+cat "$OUT/SUMMARY.txt"
+echo
+echo "[gpu-hotspots] artifacts in $OUT"

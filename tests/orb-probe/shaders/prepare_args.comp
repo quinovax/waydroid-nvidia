@@ -1,0 +1,33 @@
+#version 450
+// orb-probe: derives the indirect dispatch arguments on the GPU from the
+// counter that dispatch A produced. This is the "groupCount comes from a GPU
+// counter" shape that the ORB hypothesis points at, and it is deliberately on
+// the other side of the SHADER_STORAGE_WRITE -> SHADER_STORAGE_READ barrier.
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint seed;
+    uint wg;
+    uint pad;
+} pc;
+
+layout(set = 0, binding = 0, std430) readonly buffer CounterA {
+    uint count_global;
+    uint count_shared;
+} ca;
+
+layout(set = 0, binding = 2, std430) writeonly buffer Args {
+    uint gx;
+    uint gy;
+    uint gz;
+} ar;
+
+void main()
+{
+    uint total  = ca.count_global;
+    uint groups = (total + pc.wg - 1u) / pc.wg;
+    ar.gx = groups;
+    ar.gy = 1u;
+    ar.gz = 1u;
+}

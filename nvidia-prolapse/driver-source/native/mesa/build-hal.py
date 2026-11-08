@@ -8,7 +8,7 @@ HAL = ROOT / "nvidia-prolapse/hal"
 # The existing HAL uses Vulkan 1.4 headers supplied by its pinned NDK r30.
 NDK = Path("/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64")
 sources = [f"src/{name}.c" for name in
-           "hal device anb ahb imgxlate util astc cmdstate astc_spv etc2_spv gputime".split()]
+           "hal device anb ahb imgxlate util astc cmdstate astc_spv bc1_spv etc2_spv gputime".split()]
 sources += ["out/gen/nvhal_gen.c", "out/gen/nvhal_astc_luts.c"]
 subprocess.run(["make", "out/gen/nvhal_gen.c", "out/gen/nvhal_astc_luts.c", "out/gen/astc_spv.h", "out/gen/etc2_spv.h"],
                cwd=HAL, check=True)

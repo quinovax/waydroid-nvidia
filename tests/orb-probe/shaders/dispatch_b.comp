@@ -1,0 +1,47 @@
+#version 450
+// orb-probe dispatch B: the consumer pass, launched with vkCmdDispatchIndirect.
+// Two independent invariants are produced:
+//   * seq  : the exact number of B invocations (atomicAdd per invocation)
+//   * slots: values 0..T-1 placed at (slot % n); if and only if T == n every
+//            slot is written exactly once, so slots[] is a permutation of
+//            0..n-1 and sum(slots) == n*(n-1)/2 exactly.
+// It also re-reads dispatch A's keys, so a missing producer->consumer barrier
+// shows up as bad_visibility > 0.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint seed;
+    uint wg;
+    uint pad;
+} pc;
+
+layout(set = 0, binding = 1, std430) readonly buffer KeysA {
+    uint keys[];
+} ka;
+
+layout(set = 0, binding = 3, std430) buffer CounterB {
+    uint seq;
+} cb;
+
+layout(set = 0, binding = 4, std430) buffer KeysB {
+    uint slots[];
+} kb;
+
+layout(set = 0, binding = 5, std430) buffer Errs {
+    uint bad_visibility;
+} er;
+
+void main()
+{
+    uint gid  = gl_GlobalInvocationID.x;
+    uint slot = atomicAdd(cb.seq, 1u);
+
+    if (slot < pc.n) {
+        kb.slots[slot % pc.n] = slot;
+        if (ka.keys[slot] != (slot ^ pc.seed))
+            atomicAdd(er.bad_visibility, 1u);
+    } else {
+        atomicAdd(er.bad_visibility, 1u);
+    }
+}

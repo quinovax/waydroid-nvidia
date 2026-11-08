@@ -4688,6 +4688,12 @@ pub(super) static VERSIONS: &[(&str, &Profile)] = &[
 ("580.167.08", &P17),
 ("580.173.02", &P17),
 ("580.178.04", &P17),
+// 580.196.07 reuses the 580.178.04 wire layout: the three independent public-C
+// probes (host/compute 4422 words, host/graphics 2109 pixels, host/interop 4236
+// cross-device words) pass unchanged against the 580.196.07 kernel module, so the
+// structure sizes/offsets/constants did not move in this branch. See
+// artifacts/prolapse-abi-experiment/RESULTS.md for the measurements.
+("580.196.07", &P17),
 ("580.65.06", &P17),
 ("580.76.05", &P17),
 ("580.82.07", &P17),

@@ -7,9 +7,12 @@
 #   dev/gebench N [--label NAME]
 set -uo pipefail
 source "$(dirname "$(readlink -f "$0")")/env.sh"
+# env.sh enables errexit; this script probes with commands that may fail
+# (pkill when nothing matches, dumpsys greps, optional pulls).
+set +e
 
 PKG=com.primatelabs.parkdale
-ACT=$PKG/.MainActivity
+ACT=$PKG/com.primatelabs.geekbench.HomeActivity
 N="${1:-1}"
 LABEL="${2:-run$N}"
 ART=${REPO}/artifacts/gebench-$(date +%Y%m%dT%H%M%S)-$LABEL

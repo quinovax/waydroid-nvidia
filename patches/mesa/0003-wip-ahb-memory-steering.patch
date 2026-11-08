@@ -262,8 +262,1581 @@ index eaa82bcacf4..1ff47d9e5af 100644
        close(dup_fd);
        return result;
     }
+diff --git a/src/virtio/vulkan/vn_astc_emu.c b/src/virtio/vulkan/vn_astc_emu.c
+new file mode 100644
+index 00000000000..8d69d8cc08e
+--- /dev/null
++++ b/src/virtio/vulkan/vn_astc_emu.c
+@@ -0,0 +1,1110 @@
++/*
++ * Copyright 2026 waydroid-nvidia project
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "vn_astc_emu.h"
++
++#include "vk_format.h"
++#include "vk_texcompress_astc.h"
++
++#include "vn_bc1_encode_spv.h"
++#include "vn_buffer.h"
++#include "vn_command_buffer.h"
++#include "vn_device.h"
++#include "vn_device_memory.h"
++#include "vn_image.h"
++#include "vn_physical_device.h"
++
++#include "venus-protocol/vn_protocol_driver_buffer.h"
++#include "venus-protocol/vn_protocol_driver_command_buffer.h"
++#include "venus-protocol/vn_protocol_driver_descriptor_set.h"
++#include "venus-protocol/vn_protocol_driver_descriptor_set_layout.h"
++#include "venus-protocol/vn_protocol_driver_device_memory.h"
++#include "venus-protocol/vn_protocol_driver_image.h"
++#include "venus-protocol/vn_protocol_driver_image_view.h"
++#include "venus-protocol/vn_protocol_driver_pipeline.h"
++#include "venus-protocol/vn_protocol_driver_pipeline_layout.h"
++#include "venus-protocol/vn_protocol_driver_shader_module.h"
++
++#include "util/os_misc.h"
++
++/* All entrypoints used below are venus' own: they encode into the command
++ * stream / ring exactly like app calls, so the decode pass is transparent to
++ * the host.
++ */
++
++static VkResult
++vn_astc_emu_bc1_init(struct vn_device *dev);
++
++static void
++vn_astc_emu_bc1_fini(struct vn_device *dev);
++
++bool
++vn_astc_emu_format(VkFormat format)
++{
++   return vk_texcompress_astc_emulation_format(format) != VK_FORMAT_UNDEFINED;
++}
++
++/* ASTC 4x4 is the only block geometry BC1 can stand in for: both are 4x4, so
++ * one ASTC block maps onto exactly one BC1 block with no resampling.  Every
++ * other ASTC block size keeps the RGBA8 decode.
++ */
++VkFormat
++vn_astc_emu_bc1_format(VkFormat astc_format)
++{
++   const bool srgb = astc_format == VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
++
++   if (astc_format != VK_FORMAT_ASTC_4x4_UNORM_BLOCK && !srgb)
++      return VK_FORMAT_UNDEFINED;
++
++   return srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
++}
++
++bool
++vn_astc_emu_bc1_enabled(struct vn_device *dev)
++{
++   struct vn_astc_emu *emu = &dev->astc_emu;
++
++   if (likely(emu->bc1_state))
++      return emu->bc1_state == 2;
++
++   simple_mtx_lock(&emu->mutex);
++   if (!emu->bc1_state) {
++      const bool on = debug_get_bool_option("VN_ASTC_BC1", false);
++      emu->bc1_state = on ? 2 : 1;
++      if (on)
++         vn_log(dev->instance,
++                "ASTC emu: 4x4 images decoded to BC1 (debug.mesa.vn.astc.bc1)");
++   }
++   simple_mtx_unlock(&emu->mutex);
++
++   return emu->bc1_state == 2;
++}
++
++/* The format the host image is actually allocated with.  This is what
++ * vn_physical_device / vn_image consult, so it must already know about the
++ * BC1 retarget.
++ */
++VkFormat
++vn_astc_emu_get_rgba_format(VkFormat format)
++{
++   return vk_texcompress_astc_emulation_format(format);
++}
++
++void
++vn_astc_emu_device_init(struct vn_device *dev)
++{
++   simple_mtx_init(&dev->astc_emu.mutex, mtx_plain);
++   dev->astc_emu.texcompress = NULL;
++
++   dev->astc_emu.bc1_state = 0;
++   dev->astc_emu.bc1_dsl = VK_NULL_HANDLE;
++   dev->astc_emu.bc1_pl = VK_NULL_HANDLE;
++   dev->astc_emu.bc1_sm = VK_NULL_HANDLE;
++   dev->astc_emu.bc1_pipe = VK_NULL_HANDLE;
++
++   /* the BC1 encoder is built eagerly when the switch is on: it must be
++    * ready before the first compressed upload, which may arrive mid-frame
++    */
++   if (dev->physical_device->emu_astc_ldr && vn_astc_emu_bc1_enabled(dev) &&
++       vn_astc_emu_bc1_init(dev) != VK_SUCCESS) {
++      vn_log(dev->instance,
++             "ASTC emu: BC1 retarget unavailable, keeping the RGBA8 decode");
++      dev->astc_emu.bc1_state = 1;
++   }
++}
++
++void
++vn_astc_emu_device_fini(struct vn_device *dev)
++{
++   if (dev->astc_emu.texcompress) {
++      vk_texcompress_astc_finish(&dev->base.vk, &dev->base.vk.alloc,
++                                 dev->astc_emu.texcompress);
++      dev->astc_emu.texcompress = NULL;
++   }
++   vn_astc_emu_bc1_fini(dev);
++   simple_mtx_destroy(&dev->astc_emu.mutex);
++}
++
++static struct vk_texcompress_astc_state *
++vn_astc_emu_get_state(struct vn_device *dev)
++{
++   struct vn_astc_emu *emu = &dev->astc_emu;
++
++   if (likely(emu->texcompress))
++      return emu->texcompress;
++
++   simple_mtx_lock(&emu->mutex);
++   if (!emu->texcompress) {
++      struct vk_texcompress_astc_state *state = NULL;
++      VkResult result = vk_texcompress_astc_init(
++         &dev->base.vk, &dev->base.vk.alloc, VK_NULL_HANDLE, &state,
++         (struct vk_texcompress_astc_params){
++            .luts_alignment = 64,
++            .luts_memory_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++         });
++      if (result == VK_SUCCESS)
++         emu->texcompress = state;
++      else
++         vn_log(dev->instance, "ASTC emu: vk_texcompress_astc_init failed");
++   }
++   simple_mtx_unlock(&emu->mutex);
++
++   return emu->texcompress;
++}
++
++static struct vn_astc_emu_temp_obj *
++vn_astc_emu_alloc_temp(struct vn_command_buffer *cmd)
++{
++   const VkAllocationCallbacks *alloc = &cmd->base.vk.pool->alloc;
++   struct vn_astc_emu_temp_obj *temp =
++      vk_zalloc(alloc, sizeof(*temp), VN_DEFAULT_ALIGN,
++                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (!temp)
++      return NULL;
++
++   list_addtail(&temp->head, &cmd->builder.astc_temp_objs);
++   return temp;
++}
++
++void
++vn_astc_emu_cmd_reset(struct vn_command_buffer *cmd)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++   VkDevice dev_handle = vn_device_to_handle(dev);
++   const VkAllocationCallbacks *alloc = &cmd->base.vk.pool->alloc;
++
++   list_for_each_entry_safe(struct vn_astc_emu_temp_obj, temp,
++                            &cmd->builder.astc_temp_objs, head) {
++      if (temp->src_view != VK_NULL_HANDLE)
++         vn_DestroyImageView(dev_handle, temp->src_view, NULL);
++      if (temp->dst_view != VK_NULL_HANDLE)
++         vn_DestroyImageView(dev_handle, temp->dst_view, NULL);
++      if (temp->image != VK_NULL_HANDLE)
++         vn_DestroyImage(dev_handle, temp->image, NULL);
++      if (temp->memory != VK_NULL_HANDLE)
++         vn_FreeMemory(dev_handle, temp->memory, NULL);
++      /* BC1 path transients */
++      if (temp->rgba_view != VK_NULL_HANDLE)
++         vn_DestroyImageView(dev_handle, temp->rgba_view, NULL);
++      if (temp->rgba != VK_NULL_HANDLE)
++         vn_DestroyImage(dev_handle, temp->rgba, NULL);
++      if (temp->rgba_mem != VK_NULL_HANDLE)
++         vn_FreeMemory(dev_handle, temp->rgba_mem, NULL);
++      if (temp->bc1_buf != VK_NULL_HANDLE)
++         vn_DestroyBuffer(dev_handle, temp->bc1_buf, NULL);
++      if (temp->bc1_mem != VK_NULL_HANDLE)
++         vn_FreeMemory(dev_handle, temp->bc1_mem, NULL);
++      list_del(&temp->head);
++      vk_free(alloc, temp);
++   }
++}
++
++static uint32_t
++vn_astc_emu_find_memory_type(struct vn_device *dev,
++                             uint32_t type_bits)
++{
++   const VkPhysicalDeviceMemoryProperties *props =
++      &dev->physical_device->memory_properties;
++
++   /* prefer DEVICE_LOCAL */
++   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++      if ((type_bits & (1u << i)) &&
++          (props->memoryTypes[i].propertyFlags &
++           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++         return i;
++   }
++   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++      if (type_bits & (1u << i))
++         return i;
++   }
++   return 0;
++}
++
++/* Create the transient block image holding raw ASTC blocks for one copy
++ * region: R32G32B32A32_UINT, one texel per block, single mip.
++ */
++static VkResult
++vn_astc_emu_create_block_image(struct vn_command_buffer *cmd,
++                               struct vn_astc_emu_temp_obj *temp,
++                               VkExtent2D block_extent,
++                               uint32_t layer_count)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++   VkDevice dev_handle = vn_device_to_handle(dev);
++   VkResult result;
++
++   const VkImageCreateInfo img_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R32G32B32A32_UINT,
++      .extent = { block_extent.width, block_extent.height, 1 },
++      .mipLevels = 1,
++      .arrayLayers = layer_count,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   result = vn_CreateImage(dev_handle, &img_info, NULL, &temp->image);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkImageMemoryRequirementsInfo2 reqs_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++      .image = temp->image,
++   };
++   VkMemoryRequirements2 reqs = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++   };
++   vn_GetImageMemoryRequirements2(dev_handle, &reqs_info, &reqs);
++
++   const VkMemoryAllocateInfo mem_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.memoryRequirements.size,
++      .memoryTypeIndex = vn_astc_emu_find_memory_type(
++         dev, reqs.memoryRequirements.memoryTypeBits),
++   };
++   result = vn_AllocateMemory(dev_handle, &mem_info, NULL, &temp->memory);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkBindImageMemoryInfo bind_info = {
++      .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
++      .image = temp->image,
++      .memory = temp->memory,
++      .memoryOffset = 0,
++   };
++   /* vn only implements the 2 variant; host-side this is 1.1 core which the
++    * renderer resolves independently of the app's device version */
++   return vn_BindImageMemory2(dev_handle, 1, &bind_info);
++}
++
++static void
++vn_astc_emu_save_compute_state(struct vn_command_buffer *cmd)
++{
++   /* the shadow is maintained by vn_Cmd* hooks; nothing to snapshot */
++}
++
++static void
++vn_astc_emu_restore_compute_state(struct vn_command_buffer *cmd)
++{
++   VkCommandBuffer cmd_handle = vn_command_buffer_to_handle(cmd);
++   const struct vn_astc_emu_saved_compute_state *s =
++      &cmd->builder.astc_saved_compute;
++
++   if (s->pipeline != VK_NULL_HANDLE) {
++      vn_CmdBindPipeline(cmd_handle, VK_PIPELINE_BIND_POINT_COMPUTE,
++                         s->pipeline);
++   }
++   if (s->has_desc_set) {
++      vn_CmdBindDescriptorSets(cmd_handle, VK_PIPELINE_BIND_POINT_COMPUTE,
++                               s->desc_layout, s->desc_first_set, 1,
++                               &s->desc_set, 0, NULL);
++   }
++   if (s->has_push_const) {
++      vn_CmdPushConstants(cmd_handle, s->push_const_layout,
++                          s->push_const_stages, s->push_const_offset,
++                          s->push_const_size, s->push_const_data);
++   }
++}
++
++
++/* ---- ASTC 4x4 -> BC1 retarget ------------------------------------------
++ *
++ * The stock emulation decodes every compressed image to RGBA8 (4 B/texel).
++ * 3DMark's texture set is ~1.2 GiB compressed, so the decode inflates it to
++ * ~5.9 GiB and exhausts the 8 GiB card (measured on glibc-shim: fb.used
++ * 8105 MiB -> OODM/OOHM; on venus the same pressure surfaces as
++ * VK_ERROR_OUT_OF_HOST_MEMORY from vkEndCommandBuffer).
++ *
++ * BC1 is 0.5 B/texel and its 4x4 block geometry matches ASTC 4x4 exactly, so
++ * one ASTC block maps onto one 8-byte BC1 block with no resampling. BC1 has no
++ * STORAGE_IMAGE usage, so the decode cannot write it directly: the decode pass
++ * targets a transient RGBA8 image, a second pass encodes that into a transient
++ * BC1 block buffer, and a plain vkCmdCopyBufferToImage lands the blocks in the
++ * app's BC1 image. Both transients are command-buffer-scoped and never
++ * sampled, so they do not compete with the app for VRAM.
++ *
++ * Lossy, hence the debug.mesa.vn.astc.bc1 opt-in.
++ */
++
++static VkResult
++vn_astc_emu_bc1_init(struct vn_device *dev)
++{
++   struct vn_astc_emu *emu = &dev->astc_emu;
++   VkDevice dev_handle = vn_device_to_handle(dev);
++   const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
++   VkResult result;
++
++   if (emu->bc1_pipe != VK_NULL_HANDLE)
++      return VK_SUCCESS;
++
++   const VkDescriptorSetLayoutBinding bindings[2] = {
++      {
++         .binding = 0,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++         .descriptorCount = 1,
++         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++      },
++      {
++         .binding = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++         .descriptorCount = 1,
++         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++      },
++   };
++   const VkDescriptorSetLayoutCreateInfo dsl_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT,
++      .bindingCount = ARRAY_SIZE(bindings),
++      .pBindings = bindings,
++   };
++   result = vn_CreateDescriptorSetLayout(dev_handle, &dsl_info, NULL,
++                                         &emu->bc1_dsl);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   const VkPushConstantRange pc_range = {
++      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 5,
++   };
++   const VkPipelineLayoutCreateInfo pl_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++      .setLayoutCount = 1,
++      .pSetLayouts = &emu->bc1_dsl,
++      .pushConstantRangeCount = 1,
++      .pPushConstantRanges = &pc_range,
++   };
++   result = vn_CreatePipelineLayout(dev_handle, &pl_info, NULL, &emu->bc1_pl);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   const VkShaderModuleCreateInfo sm_info = {
++      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = vn_bc1_encode_spv_size,
++      .pCode = vn_bc1_encode_spv,
++   };
++   result = vn_CreateShaderModule(dev_handle, &sm_info, NULL, &emu->bc1_sm);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   const VkComputePipelineCreateInfo pipe_info = {
++      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++      .stage = {
++         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++         .module = emu->bc1_sm,
++         .pName = "main",
++      },
++      .layout = emu->bc1_pl,
++   };
++   result = vn_CreateComputePipelines(dev_handle, VK_NULL_HANDLE, 1,
++                                      &pipe_info, NULL, &emu->bc1_pipe);
++   if (result != VK_SUCCESS) {
++      vn_log(dev->instance, "ASTC emu: BC1 encode pipeline creation failed");
++      goto fail;
++   }
++
++   (void)alloc;
++   return VK_SUCCESS;
++
++fail:
++   if (emu->bc1_dsl != VK_NULL_HANDLE) {
++      vn_DestroyDescriptorSetLayout(dev_handle, emu->bc1_dsl, NULL);
++      emu->bc1_dsl = VK_NULL_HANDLE;
++   }
++   if (emu->bc1_pl != VK_NULL_HANDLE) {
++      vn_DestroyPipelineLayout(dev_handle, emu->bc1_pl, NULL);
++      emu->bc1_pl = VK_NULL_HANDLE;
++   }
++   if (emu->bc1_sm != VK_NULL_HANDLE) {
++      vn_DestroyShaderModule(dev_handle, emu->bc1_sm, NULL);
++      emu->bc1_sm = VK_NULL_HANDLE;
++   }
++   return result;
++}
++
++static void
++vn_astc_emu_bc1_fini(struct vn_device *dev)
++{
++   struct vn_astc_emu *emu = &dev->astc_emu;
++   VkDevice dev_handle = vn_device_to_handle(dev);
++
++   if (emu->bc1_pipe != VK_NULL_HANDLE) {
++      vn_DestroyPipeline(dev_handle, emu->bc1_pipe, NULL);
++      emu->bc1_pipe = VK_NULL_HANDLE;
++   }
++   if (emu->bc1_pl != VK_NULL_HANDLE) {
++      vn_DestroyPipelineLayout(dev_handle, emu->bc1_pl, NULL);
++      emu->bc1_pl = VK_NULL_HANDLE;
++   }
++   if (emu->bc1_sm != VK_NULL_HANDLE) {
++      vn_DestroyShaderModule(dev_handle, emu->bc1_sm, NULL);
++      emu->bc1_sm = VK_NULL_HANDLE;
++   }
++   if (emu->bc1_dsl != VK_NULL_HANDLE) {
++      vn_DestroyDescriptorSetLayout(dev_handle, emu->bc1_dsl, NULL);
++      emu->bc1_dsl = VK_NULL_HANDLE;
++   }
++}
++
++/* The decoded-texel image the decode pass writes and the BC1 block buffer the
++ * encode pass fills, both for one copy region at the decoded image's extent so
++ * the two passes share one coordinate space.
++ */
++static VkResult
++vn_astc_emu_create_rgba_target(struct vn_command_buffer *cmd,
++                               struct vn_astc_emu_temp_obj *temp,
++                               VkExtent2D texel_extent,
++                               uint32_t layer_count)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++   VkDevice dev_handle = vn_device_to_handle(dev);
++   VkResult result;
++
++   const VkImageCreateInfo img_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = { texel_extent.width, texel_extent.height, 1 },
++      .mipLevels = 1,
++      .arrayLayers = layer_count,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
++               VK_IMAGE_USAGE_SAMPLED_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   result = vn_CreateImage(dev_handle, &img_info, NULL, &temp->rgba);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkImageMemoryRequirementsInfo2 reqs_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++      .image = temp->rgba,
++   };
++   VkMemoryRequirements2 reqs = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++   };
++   vn_GetImageMemoryRequirements2(dev_handle, &reqs_info, &reqs);
++
++   const VkMemoryAllocateInfo mem_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.memoryRequirements.size,
++      .memoryTypeIndex =
++         vn_astc_emu_find_memory_type(dev, reqs.memoryRequirements.memoryTypeBits),
++   };
++   result = vn_AllocateMemory(dev_handle, &mem_info, NULL, &temp->rgba_mem);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkBindImageMemoryInfo bind_info = {
++      .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
++      .image = temp->rgba,
++      .memory = temp->rgba_mem,
++      .memoryOffset = 0,
++   };
++   result = vn_BindImageMemory2(dev_handle, 1, &bind_info);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = temp->rgba,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
++      .format = VK_FORMAT_R8G8B8A8_UINT,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layer_count },
++   };
++   return vn_CreateImageView(dev_handle, &view_info, NULL, &temp->rgba_view);
++}
++
++static VkResult
++vn_astc_emu_create_bc1_buffer(struct vn_command_buffer *cmd,
++                              struct vn_astc_emu_temp_obj *temp,
++                              uint32_t block_count)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++   VkDevice dev_handle = vn_device_to_handle(dev);
++   VkResult result;
++
++   const VkDeviceSize size = (VkDeviceSize)block_count * 8u;
++   const VkBufferCreateInfo buf_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = size,
++      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++               VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   result = vn_CreateBuffer(dev_handle, &buf_info, NULL, &temp->bc1_buf);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkBufferMemoryRequirementsInfo2 reqs_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
++      .buffer = temp->bc1_buf,
++   };
++   VkMemoryRequirements2 reqs = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++   };
++   vn_GetBufferMemoryRequirements2(dev_handle, &reqs_info, &reqs);
++
++   const VkMemoryAllocateInfo mem_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.memoryRequirements.size,
++      .memoryTypeIndex =
++         vn_astc_emu_find_memory_type(dev, reqs.memoryRequirements.memoryTypeBits),
++   };
++   result = vn_AllocateMemory(dev_handle, &mem_info, NULL, &temp->bc1_mem);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkBindBufferMemoryInfo bind_info = {
++      .sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
++      .buffer = temp->bc1_buf,
++      .memory = temp->bc1_mem,
++      .memoryOffset = 0,
++   };
++   return vn_BindBufferMemory2(dev_handle, 1, &bind_info);
++}
++
++/* Decode one region into temp->rgba, encode those texels into temp->bc1_buf,
++ * then copy the blocks into the app's BC1 image at the region's position.
++ */
++static void
++vn_astc_emu_decode_region_bc1(struct vn_command_buffer *cmd,
++                              struct vn_image *img,
++                              const VkBufferImageCopy2 *region,
++                              VkBuffer src_buffer,
++                              VkImageLayout dst_layout,
++                              struct vn_astc_emu_temp_obj *temp)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++   VkDevice dev_handle = vn_device_to_handle(dev);
++   VkCommandBuffer cmd_handle = vn_command_buffer_to_handle(cmd);
++   VkImage img_handle = vn_image_to_handle(img);
++   const VkFormat astc_format = img->astc_emu_format;
++   const uint32_t bw = vk_format_get_blockwidth(astc_format);
++   const uint32_t bh = vk_format_get_blockheight(astc_format);
++
++   struct vk_texcompress_astc_state *astc = vn_astc_emu_get_state(dev);
++   if (!astc)
++      return;
++   VkPipeline dec_pipeline = vk_texcompress_astc_get_decode_pipeline(
++      &dev->base.vk, (VkAllocationCallbacks *)&dev->base.vk.alloc, astc,
++      VK_NULL_HANDLE, astc_format);
++   if (dec_pipeline == VK_NULL_HANDLE) {
++      vn_log(dev->instance, "ASTC emu: no decode pipeline");
++      return;
++   }
++
++   const uint32_t block_off_x = region->imageOffset.x / bw;
++   const uint32_t block_off_y = region->imageOffset.y / bh;
++   const VkExtent2D region_blocks = {
++      DIV_ROUND_UP(region->imageExtent.width, bw),
++      DIV_ROUND_UP(region->imageExtent.height, bh),
++   };
++   /* texel extent of the decoded scratch image: the decode shader writes at
++    * (block_off + block) * 4, so the scratch must cover the region's final
++    * position, exactly like the RGBA8 path's block image does
++    */
++   const VkExtent2D texel_extent = {
++      (block_off_x + region_blocks.width) * bw,
++      (block_off_y + region_blocks.height) * bh,
++   };
++   const uint32_t layer_count = region->imageSubresource.layerCount;
++
++   if (vn_astc_emu_create_block_image(cmd, temp,
++                                      (VkExtent2D){ block_off_x + region_blocks.width,
++                                                    block_off_y + region_blocks.height },
++                                      layer_count) != VK_SUCCESS)
++      return;
++   if (vn_astc_emu_create_rgba_target(cmd, temp, texel_extent,
++                                      layer_count) != VK_SUCCESS)
++      return;
++   if (vn_astc_emu_create_bc1_buffer(cmd, temp,
++                                     region_blocks.width * region_blocks.height *
++                                        layer_count) != VK_SUCCESS)
++      return;
++
++   /* 1. block image UNDEFINED -> TRANSFER_DST, upload the raw ASTC blocks */
++   const VkImageMemoryBarrier to_xfer = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = 0,
++      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = temp->image,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layer_count },
++   };
++   vn_CmdPipelineBarrier(cmd_handle, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
++                         1, &to_xfer);
++
++   const VkBufferImageCopy block_region = {
++      .bufferOffset = region->bufferOffset,
++      .bufferRowLength = DIV_ROUND_UP(region->bufferRowLength, bw),
++      .bufferImageHeight = DIV_ROUND_UP(region->bufferImageHeight, bh),
++      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layer_count },
++      .imageOffset = { (int32_t)block_off_x, (int32_t)block_off_y, 0 },
++      .imageExtent = { region_blocks.width, region_blocks.height, 1 },
++   };
++   vn_CmdCopyBufferToImage(cmd_handle, src_buffer, temp->image,
++                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                           &block_region);
++
++   /* 2. barriers: block image -> shader read; scratch RGBA -> GENERAL
++    *    (the decode pass writes it, we then read it as the encode source)
++    */
++   const VkImageMemoryBarrier pre_decode[2] = {
++      {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++         .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .image = temp->image,
++         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layer_count },
++      },
++      {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++         .srcAccessMask = 0,
++         .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .image = temp->rgba,
++         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layer_count },
++      },
++   };
++   vn_CmdPipelineBarrier(cmd_handle, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0,
++                         NULL, ARRAY_SIZE(pre_decode), pre_decode);
++
++   /* 3. decoded-texel view over the scratch image (UINT, as the decoder
++    *    writes through a UINT view)
++    */
++   const VkImageViewCreateInfo rgba_uint_view = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = temp->rgba,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
++      .format = VK_FORMAT_R8G8B8A8_UINT,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layer_count },
++   };
++   VkImageView dec_dst_view = temp->rgba_view;
++   if (dec_dst_view == VK_NULL_HANDLE &&
++       vn_CreateImageView(dev_handle, &rgba_uint_view, NULL,
++                          &dec_dst_view) != VK_SUCCESS)
++      return;
++
++   const VkImageViewCreateInfo src_view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = temp->image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
++      .format = VK_FORMAT_R32G32B32A32_UINT,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layer_count },
++   };
++   if (temp->src_view == VK_NULL_HANDLE &&
++       vn_CreateImageView(dev_handle, &src_view_info, NULL,
++                          &temp->src_view) != VK_SUCCESS)
++      return;
++
++   /* 4. run the ASTC decoder into the scratch image */
++   vn_CmdBindPipeline(cmd_handle, VK_PIPELINE_BIND_POINT_COMPUTE, dec_pipeline);
++
++   struct vk_texcompress_astc_write_descriptor_set writes;
++   vk_texcompress_astc_fill_write_descriptor_sets(
++      astc, &writes, temp->src_view, VK_IMAGE_LAYOUT_GENERAL, dec_dst_view,
++      astc_format);
++   vn_CmdPushDescriptorSet(cmd_handle, VK_PIPELINE_BIND_POINT_COMPUTE,
++                           astc->p_layout, 0,
++                           ARRAY_SIZE(writes.descriptor_set),
++                           writes.descriptor_set);
++
++   const uint32_t dec_push_const[] = {
++      block_off_x,
++      block_off_y,
++      region->imageOffset.x + region->imageExtent.width,
++      region->imageOffset.y + region->imageExtent.height,
++      false,
++   };
++   vn_CmdPushConstants(cmd_handle, astc->p_layout,
++                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                       sizeof(dec_push_const), dec_push_const);
++   vn_CmdDispatch(cmd_handle, DIV_ROUND_UP(region_blocks.width, 2),
++                  DIV_ROUND_UP(region_blocks.height, 2), layer_count);
++
++   /* 5. encode the decoded texels into BC1 blocks */
++   const VkImageMemoryBarrier post_decode = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = temp->rgba,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layer_count },
++   };
++   vn_CmdPipelineBarrier(cmd_handle, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0,
++                         NULL, 1, &post_decode);
++
++   vn_CmdBindPipeline(cmd_handle, VK_PIPELINE_BIND_POINT_COMPUTE,
++                      dev->astc_emu.bc1_pipe);
++
++   const VkDescriptorImageInfo bc1_src_info = {
++      .sampler = VK_NULL_HANDLE,
++      .imageView = dec_dst_view,
++      .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
++   };
++   const VkDescriptorBufferInfo bc1_dst_info = {
++      .buffer = temp->bc1_buf,
++      .offset = 0,
++      .range = VK_WHOLE_SIZE,
++   };
++   const VkWriteDescriptorSet bc1_writes[2] = {
++      {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstBinding = 0,
++         .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++         .pImageInfo = &bc1_src_info,
++      },
++      {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstBinding = 1,
++         .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++         .pBufferInfo = &bc1_dst_info,
++      },
++   };
++   vn_CmdPushDescriptorSet(cmd_handle, VK_PIPELINE_BIND_POINT_COMPUTE,
++                           dev->astc_emu.bc1_pl, 0, ARRAY_SIZE(bc1_writes),
++                           bc1_writes);
++
++   const uint32_t enc_push_const[5] = {
++      region_blocks.width, region_blocks.height,
++      region_blocks.width * region_blocks.height, block_off_x, block_off_y,
++   };
++   vn_CmdPushConstants(cmd_handle, dev->astc_emu.bc1_pl,
++                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                       sizeof(enc_push_const), enc_push_const);
++   vn_CmdDispatch(cmd_handle, region_blocks.width, region_blocks.height,
++                  layer_count);
++
++   /* 6. blocks -> the app's BC1 image, then back to the app's layout */
++   const VkMemoryBarrier enc_done = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++   };
++   const VkImageMemoryBarrier to_copy = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = 0,
++      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .oldLayout = dst_layout,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = img_handle,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT,
++                            region->imageSubresource.mipLevel, 1,
++                            region->imageSubresource.baseArrayLayer,
++                            layer_count },
++   };
++   vn_CmdPipelineBarrier(cmd_handle, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &enc_done, 0,
++                         NULL, 1, &to_copy);
++
++   /* BC1 blocks map one-to-one onto the app image's blocks: the encode wrote
++    * region-local blocks, so the destination offset is the region start
++    */
++   const VkBufferImageCopy bc1_copy = {
++      .bufferOffset = 0,
++      .bufferRowLength = 0,
++      .bufferImageHeight = 0,
++      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT,
++                            region->imageSubresource.mipLevel,
++                            region->imageSubresource.baseArrayLayer,
++                            layer_count },
++      .imageOffset = { region->imageOffset.x, region->imageOffset.y, 0 },
++      .imageExtent = { region->imageExtent.width, region->imageExtent.height,
++                       1 },
++   };
++   /* raw: the destination IS the app's emulated image, so the public
++    * entrypoint would recurse straight back into this function
++    */
++   vn_cmd_copy_buffer_to_image_raw(cmd_handle, temp->bc1_buf, img_handle,
++                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                                   &bc1_copy);
++
++   /* 7. app image back to the layout the app expects */
++   const VkImageMemoryBarrier post_copy = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++      .newLayout = dst_layout,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = img_handle,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT,
++                            region->imageSubresource.mipLevel, 1,
++                            region->imageSubresource.baseArrayLayer,
++                            layer_count },
++   };
++   vn_CmdPipelineBarrier(cmd_handle, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
++                         NULL, 1, &post_copy);
++}
++
++static void
++vn_astc_emu_decode_region(struct vn_command_buffer *cmd,
++                          struct vn_image *img,
++                          const VkBufferImageCopy2 *region,
++                          VkBuffer src_buffer,
++                          VkImageLayout dst_layout)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++   VkDevice dev_handle = vn_device_to_handle(dev);
++   VkCommandBuffer cmd_handle = vn_command_buffer_to_handle(cmd);
++   VkImage img_handle = vn_image_to_handle(img);
++   const VkFormat astc_format = img->astc_emu_format;
++   const uint32_t bw = vk_format_get_blockwidth(astc_format);
++   const uint32_t bh = vk_format_get_blockheight(astc_format);
++
++   struct vk_texcompress_astc_state *astc = vn_astc_emu_get_state(dev);
++   if (!astc)
++      return;
++
++   VkPipeline pipeline = vk_texcompress_astc_get_decode_pipeline(
++      &dev->base.vk, (VkAllocationCallbacks *)&dev->base.vk.alloc, astc,
++      VK_NULL_HANDLE, astc_format);
++   if (pipeline == VK_NULL_HANDLE) {
++      vn_log(dev->instance, "ASTC emu: no decode pipeline");
++      return;
++   }
++
++   /* compressed-copy imageOffset is block aligned per spec */
++   const uint32_t block_off_x = region->imageOffset.x / bw;
++   const uint32_t block_off_y = region->imageOffset.y / bh;
++   const VkExtent2D region_blocks = {
++      DIV_ROUND_UP(region->imageExtent.width, bw),
++      DIV_ROUND_UP(region->imageExtent.height, bh),
++   };
++   /* temp image spans [0, offset+extent) blocks so that src and dst share
++    * one coordinate space (the decode shader adds the pushed block offset
++    * to both reads and writes)
++    */
++   const VkExtent2D block_extent = {
++      block_off_x + region_blocks.width,
++      block_off_y + region_blocks.height,
++   };
++   const uint32_t layer_count = region->imageSubresource.layerCount;
++
++   struct vn_astc_emu_temp_obj *temp = vn_astc_emu_alloc_temp(cmd);
++   if (!temp)
++      return;
++
++   if (vn_astc_emu_create_block_image(cmd, temp, block_extent,
++                                      layer_count) != VK_SUCCESS)
++      return;
++
++   /* 1. block image UNDEFINED -> TRANSFER_DST */
++   const VkImageMemoryBarrier to_xfer = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = 0,
++      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = temp->image,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                            layer_count },
++   };
++   vn_CmdPipelineBarrier(cmd_handle, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
++                         1, &to_xfer);
++
++   /* 2. upload raw blocks: buffer layout of ASTC (16B blocks) matches
++    * R32G32B32A32 texels one to one
++    */
++   /* use the 1.0 command: the app's device may predate 1.3 and the host
++    * proc table would have no vkCmdCopyBufferToImage2 for it
++    */
++   const VkBufferImageCopy block_region = {
++      .bufferOffset = region->bufferOffset,
++      .bufferRowLength = DIV_ROUND_UP(region->bufferRowLength, bw),
++      .bufferImageHeight = DIV_ROUND_UP(region->bufferImageHeight, bh),
++      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layer_count },
++      .imageOffset = { (int32_t)block_off_x, (int32_t)block_off_y, 0 },
++      .imageExtent = { region_blocks.width, region_blocks.height, 1 },
++   };
++   /* temp image is not emulated: falls through to the plain encode */
++   vn_CmdCopyBufferToImage(cmd_handle, src_buffer, temp->image,
++                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                           &block_region);
++
++   /* 3. block image -> shader read; dst RGBA region -> GENERAL */
++   const VkImageMemoryBarrier pre_decode[2] = {
++      {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++         .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .image = temp->image,
++         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                               layer_count },
++      },
++      {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++         .oldLayout = dst_layout,
++         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .image = img_handle,
++         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT,
++                               region->imageSubresource.mipLevel, 1,
++                               region->imageSubresource.baseArrayLayer,
++                               layer_count },
++      },
++   };
++   vn_CmdPipelineBarrier(cmd_handle, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0,
++                         NULL, 2, pre_decode);
++
++   /* 4. views */
++   const VkImageViewCreateInfo src_view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = temp->image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
++      .format = VK_FORMAT_R32G32B32A32_UINT,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                            layer_count },
++   };
++   if (vn_CreateImageView(dev_handle, &src_view_info, NULL,
++                          &temp->src_view) != VK_SUCCESS)
++      return;
++
++   const VkImageViewCreateInfo dst_view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .pNext = &(VkImageViewUsageCreateInfo){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
++         .usage = VK_IMAGE_USAGE_STORAGE_BIT,
++      },
++      .image = img_handle,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
++      .format = VK_FORMAT_R8G8B8A8_UINT,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT,
++                            region->imageSubresource.mipLevel, 1,
++                            region->imageSubresource.baseArrayLayer,
++                            layer_count },
++   };
++   if (vn_CreateImageView(dev_handle, &dst_view_info, NULL,
++                          &temp->dst_view) != VK_SUCCESS)
++      return;
++
++   /* 5. bind + push descriptors + push constants + dispatch */
++   vn_CmdBindPipeline(cmd_handle, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
++
++   struct vk_texcompress_astc_write_descriptor_set writes;
++   vk_texcompress_astc_fill_write_descriptor_sets(
++      astc, &writes, temp->src_view, VK_IMAGE_LAYOUT_GENERAL, temp->dst_view,
++      astc_format);
++   vn_CmdPushDescriptorSet(cmd_handle, VK_PIPELINE_BIND_POINT_COMPUTE,
++                           astc->p_layout, 0,
++                           ARRAY_SIZE(writes.descriptor_set),
++                           writes.descriptor_set);
++
++   /* shader convention (see radv_meta_astc_decode.c): block coords of the
++    * copy start, texel coords of the end, is_3d
++    */
++   const uint32_t push_const[] = {
++      block_off_x,
++      block_off_y,
++      region->imageOffset.x + region->imageExtent.width,
++      region->imageOffset.y + region->imageExtent.height,
++      false, /* no 3D (emulation rejects 3D ASTC images) */
++   };
++   vn_CmdPushConstants(cmd_handle, astc->p_layout,
++                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_const),
++                       push_const);
++
++   /* each workgroup handles 2x2 blocks */
++   vn_CmdDispatch(cmd_handle, DIV_ROUND_UP(region_blocks.width, 2),
++                  DIV_ROUND_UP(region_blocks.height, 2), layer_count);
++
++   /* 6. dst RGBA back to the app's layout */
++   const VkImageMemoryBarrier post_decode = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
++                       VK_ACCESS_TRANSFER_READ_BIT |
++                       VK_ACCESS_SHADER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .newLayout = dst_layout,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = img_handle,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT,
++                            region->imageSubresource.mipLevel, 1,
++                            region->imageSubresource.baseArrayLayer,
++                            layer_count },
++   };
++   vn_CmdPipelineBarrier(cmd_handle, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
++                         NULL, 1, &post_decode);
++}
++
++bool
++vn_astc_emu_cmd_copy_buffer_to_image(struct vn_command_buffer *cmd,
++                                     const VkCopyBufferToImageInfo2 *info)
++{
++   struct vn_image *img = vn_image_from_handle(info->dstImage);
++
++   if (likely(!img->astc_emulated))
++      return false;
++
++   vn_astc_emu_save_compute_state(cmd);
++
++   /* BC1 retarget: only 4x4 ASTC can map onto BC1, and only when the app
++    * image was created with the BC1 backing format.
++    */
++   const bool bc1 = img->astc_bc1;
++
++   for (uint32_t i = 0; i < info->regionCount; i++) {
++      if (bc1) {
++         struct vn_astc_emu_temp_obj *temp = vn_astc_emu_alloc_temp(cmd);
++         if (!temp) {
++            vn_astc_emu_decode_region(cmd, img, &info->pRegions[i],
++                                      info->srcBuffer, info->dstImageLayout);
++            continue;
++         }
++         vn_astc_emu_decode_region_bc1(cmd, img, &info->pRegions[i],
++                                       info->srcBuffer, info->dstImageLayout,
++                                       temp);
++      } else {
++         vn_astc_emu_decode_region(cmd, img, &info->pRegions[i],
++                                   info->srcBuffer, info->dstImageLayout);
++      }
++   }
++
++   vn_astc_emu_restore_compute_state(cmd);
++
++   return true;
++}
+diff --git a/src/virtio/vulkan/vn_astc_emu.h b/src/virtio/vulkan/vn_astc_emu.h
+new file mode 100644
+index 00000000000..58cc9aeb9b7
+--- /dev/null
++++ b/src/virtio/vulkan/vn_astc_emu.h
+@@ -0,0 +1,85 @@
++#ifndef VN_ASTC_EMU_H
++#define VN_ASTC_EMU_H
++
++#include "vn_common.h"
++
++struct vk_texcompress_astc_state;
++struct vn_command_buffer;
++struct vn_device;
++struct vn_image;
++
++struct vn_astc_emu {
++   simple_mtx_t mutex;
++   /* lazily initialized on first compressed upload */
++   struct vk_texcompress_astc_state *texcompress;
++
++   /* ---- ASTC 4x4 -> BC1 retarget (see vn_astc_emu.c) ---- */
++   uint32_t bc1_state;      /* 0 unprobed, 1 off, 2 on */
++   VkDescriptorSetLayout bc1_dsl;
++   VkPipelineLayout bc1_pl;
++   VkShaderModule bc1_sm;
++   VkPipeline bc1_pipe;
++   VkDescriptorPool bc1_pool;
++};
++
++/* transient objects recorded into a command buffer; freed at cmd reset */
++struct vn_astc_emu_temp_obj {
++   VkImage image;
++   VkDeviceMemory memory;
++   VkImageView src_view;
++   VkImageView dst_view;
++   struct list_head head;
++
++   /* BC1 path only: the decoded-texel image, its view, the BC1 block buffer
++    * (all transient and command-buffer scoped) */
++   VkImage rgba;
++   VkDeviceMemory rgba_mem;
++   VkImageView rgba_view;
++   VkBuffer bc1_buf;
++   VkDeviceMemory bc1_mem;
++};
++
++/* last-known compute state to restore after injected decode dispatches */
++struct vn_astc_emu_saved_compute_state {
++   VkPipeline pipeline;
++   VkPipelineLayout desc_layout;
++   uint32_t desc_first_set;
++   VkDescriptorSet desc_set;
++   bool has_desc_set;
++   VkPipelineLayout push_const_layout;
++   VkShaderStageFlags push_const_stages;
++   uint32_t push_const_offset;
++   uint32_t push_const_size;
++   uint8_t push_const_data[256];
++   bool has_push_const;
++};
++
++void
++vn_astc_emu_device_init(struct vn_device *dev);
++
++void
++vn_astc_emu_device_fini(struct vn_device *dev);
++
++bool
++vn_astc_emu_format(VkFormat format);
++
++VkFormat
++vn_astc_emu_get_rgba_format(VkFormat format);
++
++/* the app-visible format for a BC1-retargeted ASTC format, or UNDEFINED */
++VkFormat
++vn_astc_emu_bc1_format(VkFormat astc_format);
++
++bool
++vn_astc_emu_bc1_enabled(struct vn_device *dev);
++
++/* returns true if the copy was fully handled by the emulation path */
++bool
++vn_astc_emu_cmd_copy_buffer_to_image(
++   struct vn_command_buffer *cmd,
++   const VkCopyBufferToImageInfo2 *info);
++
++void
++vn_astc_emu_cmd_reset(struct vn_command_buffer *cmd);
++
++#endif /* VN_ASTC_EMU_H */
+diff --git a/src/virtio/vulkan/vn_bc1_encode.comp b/src/virtio/vulkan/vn_bc1_encode.comp
+new file mode 100644
+index 00000000000..b5d6b5757c2
+--- /dev/null
++++ b/src/virtio/vulkan/vn_bc1_encode.comp
+@@ -0,0 +1,113 @@
++// Copyright 2026 waydroid-nvidia project
++// SPDX-License-Identifier: MIT
++//
++// vn_bc1_encode.comp - encode decoded ASTC texels into BC1 blocks.
++//
++// Stage 2 of the ASTC 4x4 -> BC1 retarget in venus.  The stock ASTC emulation
++// decodes every compressed image to RGBA8 (4 B/texel), which inflates 3DMark's
++// texture set from ~1.2 GiB to ~5.9 GiB and exhausts the 8 GiB card (measured:
++// fb.used 8105 MiB, then OODM/OOHM).  BC1 is 0.5 B/texel.
++//
++// Only 4x4 ASTC is retargeted: the block geometry matches BC1 exactly, so one
++// ASTC block maps onto one 8-byte BC1 block with no resampling.  The result is
++// lossy, which is why the retarget stays behind debug.mesa.vn.astc.bc1.
++//
++// The source is read as rgba8ui so the raw decoded bytes are visible for both
++// the UNORM and the SRGB variants (the ASTC decoder writes through a UINT view
++// of the same image); quantising the stored bytes is correct for both because
++// the BC1 target carries the same colour space as the ASTC source.
++//
++// One invocation per 4x4 block; the array layer is the dispatch z index.
++
++#version 450
++
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++
++layout(set = 0, binding = 0, rgba8ui) uniform uimage2DArray src;
++layout(set = 0, binding = 1) buffer BC1 {
++    uint out_blocks[];
++};
++
++layout(push_constant) uniform PC {
++    uvec2 blocks;             // region size in 4x4 blocks
++    uint  blocks_per_layer;   // blocks.x * blocks.y
++    uvec2 block_off;          // region start in the decoded source, in blocks
++} pc;
++
++uint
++pack565(vec3 c)
++{
++    uvec3 q = uvec3(round(clamp(c, 0.0, 1.0) * vec3(31.0, 63.0, 31.0)));
++    return (q.r << 11) | (q.g << 5) | q.b;
++}
++
++vec3
++unpack565(uint c)
++{
++    return vec3(float((c >> 11) & 0x1fu) / 31.0,
++                float((c >>  5) & 0x3fu) / 63.0,
++                float( c        & 0x1fu) / 31.0);
++}
++
++void
++main()
++{
++    uvec3 gid = gl_GlobalInvocationID;
++    if (gid.x >= pc.blocks.x || gid.y >= pc.blocks.y)
++        return;
++
++    const int layer = int(gid.z);
++    /* the decoded source spans [0, block_off + blocks): the decode pass wrote
++     * the region at its final position so src and dst share one coordinate
++     * space; the BC1 buffer holds the region alone, hence the local index.
++     */
++    const ivec2 base = ivec2(gid.xy + pc.block_off) * 4;
++
++    vec3 lo = vec3(1.0);
++    vec3 hi = vec3(0.0);
++    vec3 texel[16];
++    for (int y = 0; y < 4; y++) {
++        for (int x = 0; x < 4; x++) {
++            uvec3 raw = imageLoad(src, ivec3(base + ivec2(x, y), layer)).rgb;
++            vec3 c = vec3(raw) / 255.0;
++            texel[y * 4 + x] = c;
++            lo = min(lo, c);
++            hi = max(hi, c);
++        }
++    }
++
++    // Per-channel bounding box gives the BC1 endpoints.  The 4-colour mode
++    // requires e0 > e1 as unsigned 565, so swap the two when the box inverts.
++    uint e0 = pack565(hi);
++    uint e1 = pack565(lo);
++    if (e0 < e1) {
++        uint t = e0;
++        e0 = e1;
++        e1 = t;
++    }
++
++    vec3 c0 = unpack565(e0);
++    vec3 c1 = unpack565(e1);
++    vec3 c2 = (2.0 * c0 + c1) / 3.0;
++    vec3 c3 = (c0 + 2.0 * c1) / 3.0;
++
++    uint indices = 0u;
++    for (uint i = 0u; i < 16u; i++) {
++        vec3 p = texel[i];
++        float d0 = distance(p, c0);
++        float d1 = distance(p, c1);
++        float d2 = distance(p, c2);
++        float d3 = distance(p, c3);
++        uint best = 0u;
++        float best_d = d0;
++        if (d1 < best_d) { best_d = d1; best = 1u; }
++        if (d2 < best_d) { best_d = d2; best = 2u; }
++        if (d3 < best_d) { best = 3u; }
++        indices |= best << (2u * i);
++    }
++
++    const uint block = gid.z * pc.blocks_per_layer +
++                       gid.y * pc.blocks.x + gid.x;  /* region-local */
++    out_blocks[block * 2u + 0u] = (e0 << 16) | e1;
++    out_blocks[block * 2u + 1u] = indices;
++}
+diff --git a/src/virtio/vulkan/vn_bc1_encode_spv.h b/src/virtio/vulkan/vn_bc1_encode_spv.h
+new file mode 100644
+index 00000000000..7a81148ef45
+--- /dev/null
++++ b/src/virtio/vulkan/vn_bc1_encode_spv.h
+@@ -0,0 +1,241 @@
++/* Generated from vn_bc1_encode.comp (do not edit). */
++#ifndef VN_BC1_ENCODE_SPV_H
++#define VN_BC1_ENCODE_SPV_H
++
++static const uint32_t vn_bc1_encode_spv[] = {
++   0x07230203, 0x00010300, 0x0008000b, 0x0000013f, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++   0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
++   0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x00000049, 0x00060010, 0x00000004,
++   0x00000011, 0x00000008, 0x00000008, 0x00000001, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
++   0x00000004, 0x6e69616d, 0x00000000, 0x00060005, 0x0000000c, 0x6b636170, 0x28353635, 0x3b336676,
++   0x00000000, 0x00030005, 0x0000000b, 0x00000063, 0x00060005, 0x00000011, 0x61706e75, 0x36356b63,
++   0x31752835, 0x0000003b, 0x00030005, 0x00000010, 0x00000063, 0x00030005, 0x00000015, 0x00000071,
++   0x00030005, 0x00000047, 0x00646967, 0x00080005, 0x00000049, 0x475f6c67, 0x61626f6c, 0x766e496c,
++   0x7461636f, 0x496e6f69, 0x00000044, 0x00030005, 0x0000004f, 0x00004350, 0x00050006, 0x0000004f,
++   0x00000000, 0x636f6c62, 0x0000736b, 0x00080006, 0x0000004f, 0x00000001, 0x636f6c62, 0x705f736b,
++   0x6c5f7265, 0x72657961, 0x00000000, 0x00060006, 0x0000004f, 0x00000002, 0x636f6c62, 0x666f5f6b,
++   0x00000066, 0x00030005, 0x00000051, 0x00006370, 0x00040005, 0x00000064, 0x6579616c, 0x00000072,
++   0x00040005, 0x0000006a, 0x65736162, 0x00000000, 0x00030005, 0x00000076, 0x00006f6c, 0x00030005,
++   0x00000078, 0x00006968, 0x00030005, 0x0000007a, 0x00000079, 0x00030005, 0x00000082, 0x00000078,
++   0x00030005, 0x0000008a, 0x00776172, 0x00030005, 0x0000008d, 0x00637273, 0x00030005, 0x0000009c,
++   0x00000063, 0x00040005, 0x000000a5, 0x65786574, 0x0000006c, 0x00030005, 0x000000b7, 0x00003065,
++   0x00040005, 0x000000b8, 0x61726170, 0x0000006d, 0x00030005, 0x000000bb, 0x00003165, 0x00040005,
++   0x000000bc, 0x61726170, 0x0000006d, 0x00030005, 0x000000c4, 0x00000074, 0x00030005, 0x000000c8,
++   0x00003063, 0x00040005, 0x000000c9, 0x61726170, 0x0000006d, 0x00030005, 0x000000cc, 0x00003163,
++   0x00040005, 0x000000cd, 0x61726170, 0x0000006d, 0x00030005, 0x000000d0, 0x00003263, 0x00030005,
++   0x000000d9, 0x00003363, 0x00040005, 0x000000e0, 0x69646e69, 0x00736563, 0x00030005, 0x000000e1,
++   0x00000069, 0x00030005, 0x000000e9, 0x00000070, 0x00030005, 0x000000ee, 0x00003064, 0x00030005,
++   0x000000f2, 0x00003164, 0x00030005, 0x000000f6, 0x00003264, 0x00030005, 0x000000fa, 0x00003364,
++   0x00040005, 0x000000fe, 0x74736562, 0x00000000, 0x00040005, 0x000000ff, 0x74736562, 0x0000645f,
++   0x00040005, 0x0000011b, 0x636f6c62, 0x0000006b, 0x00030005, 0x0000012b, 0x00314342, 0x00060006,
++   0x0000012b, 0x00000000, 0x5f74756f, 0x636f6c62, 0x0000736b, 0x00030005, 0x0000012d, 0x00000000,
++   0x00040047, 0x00000049, 0x0000000b, 0x0000001c, 0x00030047, 0x0000004f, 0x00000002, 0x00050048,
++   0x0000004f, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000004f, 0x00000001, 0x00000023,
++   0x00000008, 0x00050048, 0x0000004f, 0x00000002, 0x00000023, 0x00000010, 0x00040047, 0x0000008d,
++   0x00000021, 0x00000000, 0x00040047, 0x0000008d, 0x00000022, 0x00000000, 0x00040047, 0x0000012a,
++   0x00000006, 0x00000004, 0x00030047, 0x0000012b, 0x00000002, 0x00050048, 0x0000012b, 0x00000000,
++   0x00000023, 0x00000000, 0x00040047, 0x0000012d, 0x00000021, 0x00000001, 0x00040047, 0x0000012d,
++   0x00000022, 0x00000000, 0x00040047, 0x0000013e, 0x0000000b, 0x00000019, 0x00020013, 0x00000002,
++   0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
++   0x00000006, 0x00000003, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040015, 0x00000009,
++   0x00000020, 0x00000000, 0x00040021, 0x0000000a, 0x00000009, 0x00000008, 0x00040020, 0x0000000e,
++   0x00000007, 0x00000009, 0x00040021, 0x0000000f, 0x00000007, 0x0000000e, 0x00040017, 0x00000013,
++   0x00000009, 0x00000003, 0x00040020, 0x00000014, 0x00000007, 0x00000013, 0x0004002b, 0x00000006,
++   0x00000017, 0x00000000, 0x0004002b, 0x00000006, 0x00000018, 0x3f800000, 0x0004002b, 0x00000006,
++   0x0000001c, 0x41f80000, 0x0004002b, 0x00000006, 0x0000001d, 0x427c0000, 0x0006002c, 0x00000007,
++   0x0000001e, 0x0000001c, 0x0000001d, 0x0000001c, 0x0004002b, 0x00000009, 0x00000022, 0x00000000,
++   0x00040015, 0x00000025, 0x00000020, 0x00000001, 0x0004002b, 0x00000025, 0x00000026, 0x0000000b,
++   0x0004002b, 0x00000009, 0x00000028, 0x00000001, 0x0004002b, 0x00000025, 0x0000002b, 0x00000005,
++   0x0004002b, 0x00000009, 0x0000002e, 0x00000002, 0x0004002b, 0x00000009, 0x00000036, 0x0000001f,
++   0x0004002b, 0x00000009, 0x0000003c, 0x0000003f, 0x00040020, 0x00000048, 0x00000001, 0x00000013,
++   0x0004003b, 0x00000048, 0x00000049, 0x00000001, 0x00020014, 0x0000004b, 0x00040017, 0x0000004e,
++   0x00000009, 0x00000002, 0x0005001e, 0x0000004f, 0x0000004e, 0x00000009, 0x0000004e, 0x00040020,
++   0x00000050, 0x00000009, 0x0000004f, 0x0004003b, 0x00000050, 0x00000051, 0x00000009, 0x0004002b,
++   0x00000025, 0x00000052, 0x00000000, 0x00040020, 0x00000053, 0x00000009, 0x00000009, 0x00040020,
++   0x00000063, 0x00000007, 0x00000025, 0x00040017, 0x00000068, 0x00000025, 0x00000002, 0x00040020,
++   0x00000069, 0x00000007, 0x00000068, 0x0004002b, 0x00000025, 0x0000006d, 0x00000002, 0x00040020,
++   0x0000006e, 0x00000009, 0x0000004e, 0x0004002b, 0x00000025, 0x00000073, 0x00000004, 0x0006002c,
++   0x00000007, 0x00000077, 0x00000018, 0x00000018, 0x00000018, 0x0006002c, 0x00000007, 0x00000079,
++   0x00000017, 0x00000017, 0x00000017, 0x00090019, 0x0000008b, 0x00000009, 0x00000001, 0x00000000,
++   0x00000001, 0x00000000, 0x00000002, 0x00000020, 0x00040020, 0x0000008c, 0x00000000, 0x0000008b,
++   0x0004003b, 0x0000008c, 0x0000008d, 0x00000000, 0x00040017, 0x00000095, 0x00000025, 0x00000003,
++   0x00040017, 0x00000099, 0x00000009, 0x00000004, 0x0004002b, 0x00000006, 0x0000009f, 0x437f0000,
++   0x0004002b, 0x00000009, 0x000000a2, 0x00000010, 0x0004001c, 0x000000a3, 0x00000007, 0x000000a2,
++   0x00040020, 0x000000a4, 0x00000007, 0x000000a3, 0x0004002b, 0x00000025, 0x000000b3, 0x00000001,
++   0x0004002b, 0x00000006, 0x000000d1, 0x40000000, 0x0004002b, 0x00000006, 0x000000d6, 0x40400000,
++   0x00040020, 0x000000ed, 0x00000007, 0x00000006, 0x0004002b, 0x00000009, 0x00000112, 0x00000003,
++   0x0003001d, 0x0000012a, 0x00000009, 0x0003001e, 0x0000012b, 0x0000012a, 0x00040020, 0x0000012c,
++   0x0000000c, 0x0000012b, 0x0004003b, 0x0000012c, 0x0000012d, 0x0000000c, 0x0004002b, 0x00000025,
++   0x00000132, 0x00000010, 0x00040020, 0x00000136, 0x0000000c, 0x00000009, 0x0004002b, 0x00000009,
++   0x0000013d, 0x00000008, 0x0006002c, 0x00000013, 0x0000013e, 0x0000013d, 0x0000013d, 0x00000028,
++   0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
++   0x00000014, 0x00000047, 0x00000007, 0x0004003b, 0x00000063, 0x00000064, 0x00000007, 0x0004003b,
++   0x00000069, 0x0000006a, 0x00000007, 0x0004003b, 0x00000008, 0x00000076, 0x00000007, 0x0004003b,
++   0x00000008, 0x00000078, 0x00000007, 0x0004003b, 0x00000063, 0x0000007a, 0x00000007, 0x0004003b,
++   0x00000063, 0x00000082, 0x00000007, 0x0004003b, 0x00000014, 0x0000008a, 0x00000007, 0x0004003b,
++   0x00000008, 0x0000009c, 0x00000007, 0x0004003b, 0x000000a4, 0x000000a5, 0x00000007, 0x0004003b,
++   0x0000000e, 0x000000b7, 0x00000007, 0x0004003b, 0x00000008, 0x000000b8, 0x00000007, 0x0004003b,
++   0x0000000e, 0x000000bb, 0x00000007, 0x0004003b, 0x00000008, 0x000000bc, 0x00000007, 0x0004003b,
++   0x0000000e, 0x000000c4, 0x00000007, 0x0004003b, 0x00000008, 0x000000c8, 0x00000007, 0x0004003b,
++   0x0000000e, 0x000000c9, 0x00000007, 0x0004003b, 0x00000008, 0x000000cc, 0x00000007, 0x0004003b,
++   0x0000000e, 0x000000cd, 0x00000007, 0x0004003b, 0x00000008, 0x000000d0, 0x00000007, 0x0004003b,
++   0x00000008, 0x000000d9, 0x00000007, 0x0004003b, 0x0000000e, 0x000000e0, 0x00000007, 0x0004003b,
++   0x0000000e, 0x000000e1, 0x00000007, 0x0004003b, 0x00000008, 0x000000e9, 0x00000007, 0x0004003b,
++   0x000000ed, 0x000000ee, 0x00000007, 0x0004003b, 0x000000ed, 0x000000f2, 0x00000007, 0x0004003b,
++   0x000000ed, 0x000000f6, 0x00000007, 0x0004003b, 0x000000ed, 0x000000fa, 0x00000007, 0x0004003b,
++   0x0000000e, 0x000000fe, 0x00000007, 0x0004003b, 0x000000ed, 0x000000ff, 0x00000007, 0x0004003b,
++   0x0000000e, 0x0000011b, 0x00000007, 0x0004003d, 0x00000013, 0x0000004a, 0x00000049, 0x0003003e,
++   0x00000047, 0x0000004a, 0x00050041, 0x0000000e, 0x0000004c, 0x00000047, 0x00000022, 0x0004003d,
++   0x00000009, 0x0000004d, 0x0000004c, 0x00060041, 0x00000053, 0x00000054, 0x00000051, 0x00000052,
++   0x00000022, 0x0004003d, 0x00000009, 0x00000055, 0x00000054, 0x000500ae, 0x0000004b, 0x00000056,
++   0x0000004d, 0x00000055, 0x000400a8, 0x0000004b, 0x00000057, 0x00000056, 0x000300f7, 0x00000059,
++   0x00000000, 0x000400fa, 0x00000057, 0x00000058, 0x00000059, 0x000200f8, 0x00000058, 0x00050041,
++   0x0000000e, 0x0000005a, 0x00000047, 0x00000028, 0x0004003d, 0x00000009, 0x0000005b, 0x0000005a,
++   0x00060041, 0x00000053, 0x0000005c, 0x00000051, 0x00000052, 0x00000028, 0x0004003d, 0x00000009,
++   0x0000005d, 0x0000005c, 0x000500ae, 0x0000004b, 0x0000005e, 0x0000005b, 0x0000005d, 0x000200f9,
++   0x00000059, 0x000200f8, 0x00000059, 0x000700f5, 0x0000004b, 0x0000005f, 0x00000056, 0x00000005,
++   0x0000005e, 0x00000058, 0x000300f7, 0x00000061, 0x00000000, 0x000400fa, 0x0000005f, 0x00000060,
++   0x00000061, 0x000200f8, 0x00000060, 0x000100fd, 0x000200f8, 0x00000061, 0x00050041, 0x0000000e,
++   0x00000065, 0x00000047, 0x0000002e, 0x0004003d, 0x00000009, 0x00000066, 0x00000065, 0x0004007c,
++   0x00000025, 0x00000067, 0x00000066, 0x0003003e, 0x00000064, 0x00000067, 0x0004003d, 0x00000013,
++   0x0000006b, 0x00000047, 0x0007004f, 0x0000004e, 0x0000006c, 0x0000006b, 0x0000006b, 0x00000000,
++   0x00000001, 0x00050041, 0x0000006e, 0x0000006f, 0x00000051, 0x0000006d, 0x0004003d, 0x0000004e,
++   0x00000070, 0x0000006f, 0x00050080, 0x0000004e, 0x00000071, 0x0000006c, 0x00000070, 0x0004007c,
++   0x00000068, 0x00000072, 0x00000071, 0x00050050, 0x00000068, 0x00000074, 0x00000073, 0x00000073,
++   0x00050084, 0x00000068, 0x00000075, 0x00000072, 0x00000074, 0x0003003e, 0x0000006a, 0x00000075,
++   0x0003003e, 0x00000076, 0x00000077, 0x0003003e, 0x00000078, 0x00000079, 0x0003003e, 0x0000007a,
++   0x00000052, 0x000200f9, 0x0000007b, 0x000200f8, 0x0000007b, 0x000400f6, 0x0000007d, 0x0000007e,
++   0x00000000, 0x000200f9, 0x0000007f, 0x000200f8, 0x0000007f, 0x0004003d, 0x00000025, 0x00000080,
++   0x0000007a, 0x000500b1, 0x0000004b, 0x00000081, 0x00000080, 0x00000073, 0x000400fa, 0x00000081,
++   0x0000007c, 0x0000007d, 0x000200f8, 0x0000007c, 0x0003003e, 0x00000082, 0x00000052, 0x000200f9,
++   0x00000083, 0x000200f8, 0x00000083, 0x000400f6, 0x00000085, 0x00000086, 0x00000000, 0x000200f9,
++   0x00000087, 0x000200f8, 0x00000087, 0x0004003d, 0x00000025, 0x00000088, 0x00000082, 0x000500b1,
++   0x0000004b, 0x00000089, 0x00000088, 0x00000073, 0x000400fa, 0x00000089, 0x00000084, 0x00000085,
++   0x000200f8, 0x00000084, 0x0004003d, 0x0000008b, 0x0000008e, 0x0000008d, 0x0004003d, 0x00000068,
++   0x0000008f, 0x0000006a, 0x0004003d, 0x00000025, 0x00000090, 0x00000082, 0x0004003d, 0x00000025,
++   0x00000091, 0x0000007a, 0x00050050, 0x00000068, 0x00000092, 0x00000090, 0x00000091, 0x00050080,
++   0x00000068, 0x00000093, 0x0000008f, 0x00000092, 0x0004003d, 0x00000025, 0x00000094, 0x00000064,
++   0x00050051, 0x00000025, 0x00000096, 0x00000093, 0x00000000, 0x00050051, 0x00000025, 0x00000097,
++   0x00000093, 0x00000001, 0x00060050, 0x00000095, 0x00000098, 0x00000096, 0x00000097, 0x00000094,
++   0x00050062, 0x00000099, 0x0000009a, 0x0000008e, 0x00000098, 0x0008004f, 0x00000013, 0x0000009b,
++   0x0000009a, 0x0000009a, 0x00000000, 0x00000001, 0x00000002, 0x0003003e, 0x0000008a, 0x0000009b,
++   0x0004003d, 0x00000013, 0x0000009d, 0x0000008a, 0x00040070, 0x00000007, 0x0000009e, 0x0000009d,
++   0x00060050, 0x00000007, 0x000000a0, 0x0000009f, 0x0000009f, 0x0000009f, 0x00050088, 0x00000007,
++   0x000000a1, 0x0000009e, 0x000000a0, 0x0003003e, 0x0000009c, 0x000000a1, 0x0004003d, 0x00000025,
++   0x000000a6, 0x0000007a, 0x00050084, 0x00000025, 0x000000a7, 0x000000a6, 0x00000073, 0x0004003d,
++   0x00000025, 0x000000a8, 0x00000082, 0x00050080, 0x00000025, 0x000000a9, 0x000000a7, 0x000000a8,
++   0x0004003d, 0x00000007, 0x000000aa, 0x0000009c, 0x00050041, 0x00000008, 0x000000ab, 0x000000a5,
++   0x000000a9, 0x0003003e, 0x000000ab, 0x000000aa, 0x0004003d, 0x00000007, 0x000000ac, 0x00000076,
++   0x0004003d, 0x00000007, 0x000000ad, 0x0000009c, 0x0007000c, 0x00000007, 0x000000ae, 0x00000001,
++   0x00000025, 0x000000ac, 0x000000ad, 0x0003003e, 0x00000076, 0x000000ae, 0x0004003d, 0x00000007,
++   0x000000af, 0x00000078, 0x0004003d, 0x00000007, 0x000000b0, 0x0000009c, 0x0007000c, 0x00000007,
++   0x000000b1, 0x00000001, 0x00000028, 0x000000af, 0x000000b0, 0x0003003e, 0x00000078, 0x000000b1,
++   0x000200f9, 0x00000086, 0x000200f8, 0x00000086, 0x0004003d, 0x00000025, 0x000000b2, 0x00000082,
++   0x00050080, 0x00000025, 0x000000b4, 0x000000b2, 0x000000b3, 0x0003003e, 0x00000082, 0x000000b4,
++   0x000200f9, 0x00000083, 0x000200f8, 0x00000085, 0x000200f9, 0x0000007e, 0x000200f8, 0x0000007e,
++   0x0004003d, 0x00000025, 0x000000b5, 0x0000007a, 0x00050080, 0x00000025, 0x000000b6, 0x000000b5,
++   0x000000b3, 0x0003003e, 0x0000007a, 0x000000b6, 0x000200f9, 0x0000007b, 0x000200f8, 0x0000007d,
++   0x0004003d, 0x00000007, 0x000000b9, 0x00000078, 0x0003003e, 0x000000b8, 0x000000b9, 0x00050039,
++   0x00000009, 0x000000ba, 0x0000000c, 0x000000b8, 0x0003003e, 0x000000b7, 0x000000ba, 0x0004003d,
++   0x00000007, 0x000000bd, 0x00000076, 0x0003003e, 0x000000bc, 0x000000bd, 0x00050039, 0x00000009,
++   0x000000be, 0x0000000c, 0x000000bc, 0x0003003e, 0x000000bb, 0x000000be, 0x0004003d, 0x00000009,
++   0x000000bf, 0x000000b7, 0x0004003d, 0x00000009, 0x000000c0, 0x000000bb, 0x000500b0, 0x0000004b,
++   0x000000c1, 0x000000bf, 0x000000c0, 0x000300f7, 0x000000c3, 0x00000000, 0x000400fa, 0x000000c1,
++   0x000000c2, 0x000000c3, 0x000200f8, 0x000000c2, 0x0004003d, 0x00000009, 0x000000c5, 0x000000b7,
++   0x0003003e, 0x000000c4, 0x000000c5, 0x0004003d, 0x00000009, 0x000000c6, 0x000000bb, 0x0003003e,
++   0x000000b7, 0x000000c6, 0x0004003d, 0x00000009, 0x000000c7, 0x000000c4, 0x0003003e, 0x000000bb,
++   0x000000c7, 0x000200f9, 0x000000c3, 0x000200f8, 0x000000c3, 0x0004003d, 0x00000009, 0x000000ca,
++   0x000000b7, 0x0003003e, 0x000000c9, 0x000000ca, 0x00050039, 0x00000007, 0x000000cb, 0x00000011,
++   0x000000c9, 0x0003003e, 0x000000c8, 0x000000cb, 0x0004003d, 0x00000009, 0x000000ce, 0x000000bb,
++   0x0003003e, 0x000000cd, 0x000000ce, 0x00050039, 0x00000007, 0x000000cf, 0x00000011, 0x000000cd,
++   0x0003003e, 0x000000cc, 0x000000cf, 0x0004003d, 0x00000007, 0x000000d2, 0x000000c8, 0x0005008e,
++   0x00000007, 0x000000d3, 0x000000d2, 0x000000d1, 0x0004003d, 0x00000007, 0x000000d4, 0x000000cc,
++   0x00050081, 0x00000007, 0x000000d5, 0x000000d3, 0x000000d4, 0x00060050, 0x00000007, 0x000000d7,
++   0x000000d6, 0x000000d6, 0x000000d6, 0x00050088, 0x00000007, 0x000000d8, 0x000000d5, 0x000000d7,
++   0x0003003e, 0x000000d0, 0x000000d8, 0x0004003d, 0x00000007, 0x000000da, 0x000000c8, 0x0004003d,
++   0x00000007, 0x000000db, 0x000000cc, 0x0005008e, 0x00000007, 0x000000dc, 0x000000db, 0x000000d1,
++   0x00050081, 0x00000007, 0x000000dd, 0x000000da, 0x000000dc, 0x00060050, 0x00000007, 0x000000de,
++   0x000000d6, 0x000000d6, 0x000000d6, 0x00050088, 0x00000007, 0x000000df, 0x000000dd, 0x000000de,
++   0x0003003e, 0x000000d9, 0x000000df, 0x0003003e, 0x000000e0, 0x00000022, 0x0003003e, 0x000000e1,
++   0x00000022, 0x000200f9, 0x000000e2, 0x000200f8, 0x000000e2, 0x000400f6, 0x000000e4, 0x000000e5,
++   0x00000000, 0x000200f9, 0x000000e6, 0x000200f8, 0x000000e6, 0x0004003d, 0x00000009, 0x000000e7,
++   0x000000e1, 0x000500b0, 0x0000004b, 0x000000e8, 0x000000e7, 0x000000a2, 0x000400fa, 0x000000e8,
++   0x000000e3, 0x000000e4, 0x000200f8, 0x000000e3, 0x0004003d, 0x00000009, 0x000000ea, 0x000000e1,
++   0x00050041, 0x00000008, 0x000000eb, 0x000000a5, 0x000000ea, 0x0004003d, 0x00000007, 0x000000ec,
++   0x000000eb, 0x0003003e, 0x000000e9, 0x000000ec, 0x0004003d, 0x00000007, 0x000000ef, 0x000000e9,
++   0x0004003d, 0x00000007, 0x000000f0, 0x000000c8, 0x0007000c, 0x00000006, 0x000000f1, 0x00000001,
++   0x00000043, 0x000000ef, 0x000000f0, 0x0003003e, 0x000000ee, 0x000000f1, 0x0004003d, 0x00000007,
++   0x000000f3, 0x000000e9, 0x0004003d, 0x00000007, 0x000000f4, 0x000000cc, 0x0007000c, 0x00000006,
++   0x000000f5, 0x00000001, 0x00000043, 0x000000f3, 0x000000f4, 0x0003003e, 0x000000f2, 0x000000f5,
++   0x0004003d, 0x00000007, 0x000000f7, 0x000000e9, 0x0004003d, 0x00000007, 0x000000f8, 0x000000d0,
++   0x0007000c, 0x00000006, 0x000000f9, 0x00000001, 0x00000043, 0x000000f7, 0x000000f8, 0x0003003e,
++   0x000000f6, 0x000000f9, 0x0004003d, 0x00000007, 0x000000fb, 0x000000e9, 0x0004003d, 0x00000007,
++   0x000000fc, 0x000000d9, 0x0007000c, 0x00000006, 0x000000fd, 0x00000001, 0x00000043, 0x000000fb,
++   0x000000fc, 0x0003003e, 0x000000fa, 0x000000fd, 0x0003003e, 0x000000fe, 0x00000022, 0x0004003d,
++   0x00000006, 0x00000100, 0x000000ee, 0x0003003e, 0x000000ff, 0x00000100, 0x0004003d, 0x00000006,
++   0x00000101, 0x000000f2, 0x0004003d, 0x00000006, 0x00000102, 0x000000ff, 0x000500b8, 0x0000004b,
++   0x00000103, 0x00000101, 0x00000102, 0x000300f7, 0x00000105, 0x00000000, 0x000400fa, 0x00000103,
++   0x00000104, 0x00000105, 0x000200f8, 0x00000104, 0x0004003d, 0x00000006, 0x00000106, 0x000000f2,
++   0x0003003e, 0x000000ff, 0x00000106, 0x0003003e, 0x000000fe, 0x00000028, 0x000200f9, 0x00000105,
++   0x000200f8, 0x00000105, 0x0004003d, 0x00000006, 0x00000107, 0x000000f6, 0x0004003d, 0x00000006,
++   0x00000108, 0x000000ff, 0x000500b8, 0x0000004b, 0x00000109, 0x00000107, 0x00000108, 0x000300f7,
++   0x0000010b, 0x00000000, 0x000400fa, 0x00000109, 0x0000010a, 0x0000010b, 0x000200f8, 0x0000010a,
++   0x0004003d, 0x00000006, 0x0000010c, 0x000000f6, 0x0003003e, 0x000000ff, 0x0000010c, 0x0003003e,
++   0x000000fe, 0x0000002e, 0x000200f9, 0x0000010b, 0x000200f8, 0x0000010b, 0x0004003d, 0x00000006,
++   0x0000010d, 0x000000fa, 0x0004003d, 0x00000006, 0x0000010e, 0x000000ff, 0x000500b8, 0x0000004b,
++   0x0000010f, 0x0000010d, 0x0000010e, 0x000300f7, 0x00000111, 0x00000000, 0x000400fa, 0x0000010f,
++   0x00000110, 0x00000111, 0x000200f8, 0x00000110, 0x0003003e, 0x000000fe, 0x00000112, 0x000200f9,
++   0x00000111, 0x000200f8, 0x00000111, 0x0004003d, 0x00000009, 0x00000113, 0x000000fe, 0x0004003d,
++   0x00000009, 0x00000114, 0x000000e1, 0x00050084, 0x00000009, 0x00000115, 0x0000002e, 0x00000114,
++   0x000500c4, 0x00000009, 0x00000116, 0x00000113, 0x00000115, 0x0004003d, 0x00000009, 0x00000117,
++   0x000000e0, 0x000500c5, 0x00000009, 0x00000118, 0x00000117, 0x00000116, 0x0003003e, 0x000000e0,
++   0x00000118, 0x000200f9, 0x000000e5, 0x000200f8, 0x000000e5, 0x0004003d, 0x00000009, 0x00000119,
++   0x000000e1, 0x00050080, 0x00000009, 0x0000011a, 0x00000119, 0x000000b3, 0x0003003e, 0x000000e1,
++   0x0000011a, 0x000200f9, 0x000000e2, 0x000200f8, 0x000000e4, 0x00050041, 0x0000000e, 0x0000011c,
++   0x00000047, 0x0000002e, 0x0004003d, 0x00000009, 0x0000011d, 0x0000011c, 0x00050041, 0x00000053,
++   0x0000011e, 0x00000051, 0x000000b3, 0x0004003d, 0x00000009, 0x0000011f, 0x0000011e, 0x00050084,
++   0x00000009, 0x00000120, 0x0000011d, 0x0000011f, 0x00050041, 0x0000000e, 0x00000121, 0x00000047,
++   0x00000028, 0x0004003d, 0x00000009, 0x00000122, 0x00000121, 0x00060041, 0x00000053, 0x00000123,
++   0x00000051, 0x00000052, 0x00000022, 0x0004003d, 0x00000009, 0x00000124, 0x00000123, 0x00050084,
++   0x00000009, 0x00000125, 0x00000122, 0x00000124, 0x00050080, 0x00000009, 0x00000126, 0x00000120,
++   0x00000125, 0x00050041, 0x0000000e, 0x00000127, 0x00000047, 0x00000022, 0x0004003d, 0x00000009,
++   0x00000128, 0x00000127, 0x00050080, 0x00000009, 0x00000129, 0x00000126, 0x00000128, 0x0003003e,
++   0x0000011b, 0x00000129, 0x0004003d, 0x00000009, 0x0000012e, 0x0000011b, 0x00050084, 0x00000009,
++   0x0000012f, 0x0000012e, 0x0000002e, 0x00050080, 0x00000009, 0x00000130, 0x0000012f, 0x00000022,
++   0x0004003d, 0x00000009, 0x00000131, 0x000000b7, 0x000500c4, 0x00000009, 0x00000133, 0x00000131,
++   0x00000132, 0x0004003d, 0x00000009, 0x00000134, 0x000000bb, 0x000500c5, 0x00000009, 0x00000135,
++   0x00000133, 0x00000134, 0x00060041, 0x00000136, 0x00000137, 0x0000012d, 0x00000052, 0x00000130,
++   0x0003003e, 0x00000137, 0x00000135, 0x0004003d, 0x00000009, 0x00000138, 0x0000011b, 0x00050084,
++   0x00000009, 0x00000139, 0x00000138, 0x0000002e, 0x00050080, 0x00000009, 0x0000013a, 0x00000139,
++   0x00000028, 0x0004003d, 0x00000009, 0x0000013b, 0x000000e0, 0x00060041, 0x00000136, 0x0000013c,
++   0x0000012d, 0x00000052, 0x0000013a, 0x0003003e, 0x0000013c, 0x0000013b, 0x000100fd, 0x00010038,
++   0x00050036, 0x00000009, 0x0000000c, 0x00000000, 0x0000000a, 0x00030037, 0x00000008, 0x0000000b,
++   0x000200f8, 0x0000000d, 0x0004003b, 0x00000014, 0x00000015, 0x00000007, 0x0004003d, 0x00000007,
++   0x00000016, 0x0000000b, 0x00060050, 0x00000007, 0x00000019, 0x00000017, 0x00000017, 0x00000017,
++   0x00060050, 0x00000007, 0x0000001a, 0x00000018, 0x00000018, 0x00000018, 0x0008000c, 0x00000007,
++   0x0000001b, 0x00000001, 0x0000002b, 0x00000016, 0x00000019, 0x0000001a, 0x00050085, 0x00000007,
++   0x0000001f, 0x0000001b, 0x0000001e, 0x0006000c, 0x00000007, 0x00000020, 0x00000001, 0x00000001,
++   0x0000001f, 0x0004006d, 0x00000013, 0x00000021, 0x00000020, 0x0003003e, 0x00000015, 0x00000021,
++   0x00050041, 0x0000000e, 0x00000023, 0x00000015, 0x00000022, 0x0004003d, 0x00000009, 0x00000024,
++   0x00000023, 0x000500c4, 0x00000009, 0x00000027, 0x00000024, 0x00000026, 0x00050041, 0x0000000e,
++   0x00000029, 0x00000015, 0x00000028, 0x0004003d, 0x00000009, 0x0000002a, 0x00000029, 0x000500c4,
++   0x00000009, 0x0000002c, 0x0000002a, 0x0000002b, 0x000500c5, 0x00000009, 0x0000002d, 0x00000027,
++   0x0000002c, 0x00050041, 0x0000000e, 0x0000002f, 0x00000015, 0x0000002e, 0x0004003d, 0x00000009,
++   0x00000030, 0x0000002f, 0x000500c5, 0x00000009, 0x00000031, 0x0000002d, 0x00000030, 0x000200fe,
++   0x00000031, 0x00010038, 0x00050036, 0x00000007, 0x00000011, 0x00000000, 0x0000000f, 0x00030037,
++   0x0000000e, 0x00000010, 0x000200f8, 0x00000012, 0x0004003d, 0x00000009, 0x00000034, 0x00000010,
++   0x000500c2, 0x00000009, 0x00000035, 0x00000034, 0x00000026, 0x000500c7, 0x00000009, 0x00000037,
++   0x00000035, 0x00000036, 0x00040070, 0x00000006, 0x00000038, 0x00000037, 0x00050088, 0x00000006,
++   0x00000039, 0x00000038, 0x0000001c, 0x0004003d, 0x00000009, 0x0000003a, 0x00000010, 0x000500c2,
++   0x00000009, 0x0000003b, 0x0000003a, 0x0000002b, 0x000500c7, 0x00000009, 0x0000003d, 0x0000003b,
++   0x0000003c, 0x00040070, 0x00000006, 0x0000003e, 0x0000003d, 0x00050088, 0x00000006, 0x0000003f,
++   0x0000003e, 0x0000001d, 0x0004003d, 0x00000009, 0x00000040, 0x00000010, 0x000500c7, 0x00000009,
++   0x00000041, 0x00000040, 0x00000036, 0x00040070, 0x00000006, 0x00000042, 0x00000041, 0x00050088,
++   0x00000006, 0x00000043, 0x00000042, 0x0000001c, 0x00060050, 0x00000007, 0x00000044, 0x00000039,
++   0x0000003f, 0x00000043, 0x000200fe, 0x00000044, 0x00010038,
++};
++
++static const unsigned vn_bc1_encode_spv_size =
++   ARRAY_SIZE(vn_bc1_encode_spv) * sizeof(uint32_t);
++
++#endif /* VN_BC1_ENCODE_SPV_H */
 diff --git a/src/virtio/vulkan/vn_command_buffer.c b/src/virtio/vulkan/vn_command_buffer.c
-index e7be2fff5e8..6eebd5e4174 100644
+index e7be2fff5e8..99d26c7f7df 100644
 --- a/src/virtio/vulkan/vn_command_buffer.c
 +++ b/src/virtio/vulkan/vn_command_buffer.c
 @@ -10,6 +10,8 @@
@@ -331,10 +1904,11 @@ index e7be2fff5e8..6eebd5e4174 100644
     VN_CMD_ENQUEUE(vkCmdBindDescriptorSets, commandBuffer, pipelineBindPoint,
                    layout, firstSet, descriptorSetCount, pDescriptorSets,
                    dynamicOffsetCount, pDynamicOffsets);
-@@ -1464,6 +1490,35 @@ vn_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
+@@ -1463,6 +1489,51 @@ vn_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
+                         VkImageLayout dstImageLayout,
                          uint32_t regionCount,
                          const VkBufferImageCopy *pRegions)
- {
++{
 +   struct vn_image *dst_img = vn_image_from_handle(dstImage);
 +   if (unlikely(dst_img->astc_emulated)) {
 +      struct vn_command_buffer *cmd =
@@ -364,10 +1938,25 @@ index e7be2fff5e8..6eebd5e4174 100644
 +      return;
 +   }
 +
++   VN_CMD_ENQUEUE(vkCmdCopyBufferToImage, commandBuffer, srcBuffer, dstImage,
++                  dstImageLayout, regionCount, pRegions);
++}
++
++/* Raw form used by the ASTC emulation to land decoded/encoded blocks in an
++ * emulated image without re-entering the emulation (the public entrypoint
++ * would recurse: see vn_CmdCopyBufferToImage).
++ */
++VKAPI_ATTR void VKAPI_CALL
++vn_cmd_copy_buffer_to_image_raw(VkCommandBuffer commandBuffer,
++                                VkBuffer srcBuffer,
++                                VkImage dstImage,
++                                VkImageLayout dstImageLayout,
++                                uint32_t regionCount,
++                                const VkBufferImageCopy *pRegions)
+ {
     VN_CMD_ENQUEUE(vkCmdCopyBufferToImage, commandBuffer, srcBuffer, dstImage,
                    dstImageLayout, regionCount, pRegions);
- }
-@@ -1473,6 +1528,12 @@ vn_CmdCopyBufferToImage2(
+@@ -1473,6 +1544,12 @@ vn_CmdCopyBufferToImage2(
     VkCommandBuffer commandBuffer,
     const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
  {
@@ -380,7 +1969,7 @@ index e7be2fff5e8..6eebd5e4174 100644
     VN_CMD_ENQUEUE(vkCmdCopyBufferToImage2, commandBuffer,
                    pCopyBufferToImageInfo);
  }
-@@ -1854,6 +1915,19 @@ vn_CmdPushConstants(VkCommandBuffer commandBuffer,
+@@ -1854,6 +1931,19 @@ vn_CmdPushConstants(VkCommandBuffer commandBuffer,
                      uint32_t size,
                      const void *pValues)
  {
@@ -401,7 +1990,7 @@ index e7be2fff5e8..6eebd5e4174 100644
                    offset, size, pValues);
  }
 diff --git a/src/virtio/vulkan/vn_command_buffer.h b/src/virtio/vulkan/vn_command_buffer.h
-index a5099e9236d..3b2ffd7725c 100644
+index a5099e9236d..4cf256d1af0 100644
 --- a/src/virtio/vulkan/vn_command_buffer.h
 +++ b/src/virtio/vulkan/vn_command_buffer.h
 @@ -13,6 +13,8 @@
@@ -424,6 +2013,22 @@ index a5099e9236d..3b2ffd7725c 100644
  };
  
  struct vn_query_feedback_cmd;
+@@ -125,4 +131,15 @@ vn_cmd_pool_free_query_records(struct vn_command_pool *cmd_pool,
+    list_splicetail(query_records, &cmd_pool->free_query_records);
+ }
+ 
++/* ASTC emulation: enqueue a plain vkCmdCopyBufferToImage even when dstImage is
++ * an emulated image (the public vn_CmdCopyBufferToImage would recurse).
++ */
++VKAPI_ATTR void VKAPI_CALL
++vn_cmd_copy_buffer_to_image_raw(VkCommandBuffer commandBuffer,
++                                VkBuffer srcBuffer,
++                                VkImage dstImage,
++                                VkImageLayout dstImageLayout,
++                                uint32_t regionCount,
++                                const VkBufferImageCopy *pRegions);
++
+ #endif /* VN_COMMAND_BUFFER_H */
 diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
 index 603cf3f8b34..d5524676a17 100644
 --- a/src/virtio/vulkan/vn_common.c
@@ -937,7 +2542,7 @@ index d2b74b297fe..c835f374893 100644
     struct vn_image *dedicated_img;
  };
 diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
-index 5d4f9168e47..6838fdaf5cd 100644
+index 5d4f9168e47..5f50f704c3e 100644
 --- a/src/virtio/vulkan/vn_image.c
 +++ b/src/virtio/vulkan/vn_image.c
 @@ -8,8 +8,11 @@
@@ -952,7 +2557,7 @@ index 5d4f9168e47..6838fdaf5cd 100644
  #include "venus-protocol/vn_protocol_driver_image.h"
  #include "venus-protocol/vn_protocol_driver_image_view.h"
  #include "venus-protocol/vn_protocol_driver_sampler.h"
-@@ -606,7 +609,36 @@ vn_CreateImage(VkDevice device,
+@@ -606,7 +609,52 @@ vn_CreateImage(VkDevice device,
              pCreateInfo, renderer_handle_type, &local_info);
        }
  
@@ -960,47 +2565,67 @@ index 5d4f9168e47..6838fdaf5cd 100644
 +       * NVIDIA returns FORMAT_NOT_SUPPORTED for that). Uploads are decoded
 +       * by compute (vn_astc_emu.c). Only plain 2D non-external OPTIMAL
 +       * images are emulated.
++       *
++       * With debug.mesa.vn.astc.bc1 the backing format for 4x4 ASTC is BC1
++       * instead (0.5 B/texel); BC1 has no STORAGE_IMAGE, so that backing
++       * needs neither STORAGE usage nor MUTABLE_FORMAT.
 +       */
 +      VkImageCreateInfo astc_local_info;
++      const bool astc_emu_ok = dev->physical_device->emu_astc_ldr &&
++                               !external_info &&
++                               pCreateInfo->imageType == VK_IMAGE_TYPE_2D;
++      const VkFormat astc_bc1_format =
++         astc_emu_ok && vn_astc_emu_bc1_enabled(dev)
++            ? vn_astc_emu_bc1_format(pCreateInfo->format)
++            : VK_FORMAT_UNDEFINED;
 +      const VkFormat astc_rgba_format =
-+         dev->physical_device->emu_astc_ldr && !external_info &&
-+               pCreateInfo->imageType == VK_IMAGE_TYPE_2D
++         astc_emu_ok && astc_bc1_format == VK_FORMAT_UNDEFINED
 +            ? vn_astc_emu_get_rgba_format(pCreateInfo->format)
 +            : VK_FORMAT_UNDEFINED;
++      const VkFormat astc_backing_format =
++         astc_bc1_format != VK_FORMAT_UNDEFINED ? astc_bc1_format
++                                                : astc_rgba_format;
 +      const VkFormat astc_orig_format = pCreateInfo->format;
 +      const VkImageUsageFlags astc_app_usage = pCreateInfo->usage;
-+      if (astc_rgba_format != VK_FORMAT_UNDEFINED) {
++      if (astc_backing_format != VK_FORMAT_UNDEFINED) {
 +         astc_local_info = *pCreateInfo;
-+         astc_local_info.format = astc_rgba_format;
-+         astc_local_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++         astc_local_info.format = astc_backing_format;
 +         astc_local_info.flags &= ~VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
-+         astc_local_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
-+                                  VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
++         if (astc_bc1_format == VK_FORMAT_UNDEFINED) {
++            astc_local_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++            astc_local_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
++                                     VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
++         }
 +         pCreateInfo = &astc_local_info;
 +      }
 +
        result = vn_image_create(dev, pCreateInfo, alloc, &img);
 +
-+      if (result == VK_SUCCESS && astc_rgba_format != VK_FORMAT_UNDEFINED) {
++      if (result == VK_SUCCESS && astc_backing_format != VK_FORMAT_UNDEFINED) {
 +         img->astc_emulated = true;
 +         img->astc_emu_format = astc_orig_format;
 +         img->astc_app_usage = astc_app_usage;
++         img->astc_bc1 = astc_bc1_format != VK_FORMAT_UNDEFINED;
 +      }
     }
  
     if (result != VK_SUCCESS)
-@@ -820,6 +852,34 @@ vn_CreateImageView(VkDevice device,
+@@ -820,6 +868,38 @@ vn_CreateImageView(VkDevice device,
        assert(pCreateInfo->format != VK_FORMAT_UNDEFINED);
     }
  
-+   /* ASTC emulation: the host image is RGBA UNORM. App ASTC / SRGB views
-+    * are rewritten; UINT storage views (decode) keep STORAGE usage.
++   /* ASTC emulation: the host image is RGBA UNORM (or BC1 with the retarget).
++    * App ASTC / SRGB views are rewritten; UINT storage views (decode) keep
++    * STORAGE usage. The decode pass still needs an RGBA8_UINT view even when
++    * the image itself is BC1, so the UINT format is not part of the mapping.
 +    */
 +   VkImageViewUsageCreateInfo astc_usage_info;
 +   if (img->astc_emulated) {
 +      VkFormat view_fmt = pCreateInfo->format;
-+      if (vn_astc_emu_format(view_fmt))
-+         view_fmt = vn_astc_emu_get_rgba_format(view_fmt);
++      if (vn_astc_emu_format(view_fmt)) {
++         view_fmt = img->astc_bc1 ? vn_astc_emu_bc1_format(view_fmt)
++                                  : vn_astc_emu_get_rgba_format(view_fmt);
++      }
 +      const bool need_usage =
 +         !vk_find_struct_const(pCreateInfo->pNext,
 +                               IMAGE_VIEW_USAGE_CREATE_INFO);
@@ -1025,10 +2650,10 @@ index 5d4f9168e47..6838fdaf5cd 100644
        vk_zalloc(alloc, sizeof(*view), VN_DEFAULT_ALIGN,
                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
 diff --git a/src/virtio/vulkan/vn_image.h b/src/virtio/vulkan/vn_image.h
-index 74bdeeda3b9..43af19701db 100644
+index 74bdeeda3b9..7b633096f97 100644
 --- a/src/virtio/vulkan/vn_image.h
 +++ b/src/virtio/vulkan/vn_image.h
-@@ -59,6 +59,12 @@ struct vn_image {
+@@ -59,6 +59,14 @@ struct vn_image {
        /* memory backing the prime blit dst buffer */
        struct vn_device_memory *blit_mem;
     } wsi;
@@ -1038,6 +2663,8 @@ index 74bdeeda3b9..43af19701db 100644
 +   bool astc_emulated;
 +   VkFormat astc_emu_format;
 +   VkImageUsageFlags astc_app_usage;
++   /* the backing image is BC1 rather than RGBA8 (debug.mesa.vn.astc.bc1) */
++   bool astc_bc1;
  };
  VK_DEFINE_NONDISP_HANDLE_CASTS(vn_image,
                                 base.vk.base,
